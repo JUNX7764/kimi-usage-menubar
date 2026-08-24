@@ -162,6 +162,47 @@ enum ISO {
 
 enum Fetcher {
 
+    /// 用 refreshToken 自刷新 web token（GET /api/auth/token/refresh，Bearer 带 refreshToken）。
+    /// 服务端每次会轮换 refresh_token，必须把新 token 对写回 config.json，否则刷新链会断。
+    /// 成功返回新 accessToken（寿命 ~30 天），失败返回 nil。
+    static func refreshWebToken(completion: @escaping (String?) -> Void) {
+        let path = CredStore.configPath
+        guard let data = FileManager.default.contents(atPath: path),
+              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var cred = obj["credentials"] as? [String: Any],
+              var web = cred["kimiWeb"] as? [String: Any],
+              let rt = web["refreshToken"] as? String, !rt.isEmpty else {
+            completion(nil); return
+        }
+        guard let url = URL(string: "https://www.kimi.com/api/auth/token/refresh") else {
+            completion(nil); return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(rt)", forHTTPHeaderField: "Authorization")
+        req.setValue("mac", forHTTPHeaderField: "x-msh-platform")
+        req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
+        req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            guard err == nil, let data = data,
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let at = body["access_token"] as? String else {
+                completion(nil); return
+            }
+            web["accessToken"] = at
+            if let newRt = body["refresh_token"] as? String { web["refreshToken"] = newRt }
+            web["updatedAt"] = ISO8601DateFormatter().string(from: Date())
+            cred["kimiWeb"] = web
+            obj["credentials"] = cred
+            if let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
+                try? out.write(to: URL(fileURLWithPath: path))
+            }
+            NSLog("[KimiUsage] web token self-refresh OK")
+            completion(at)
+        }.resume()
+    }
+
     /// 5 小时 + 7 天窗口：kimi-code 用量接口
     static func fetchCodeUsage(apiKey: String, completion: @escaping (UsageData) -> Void) {
         var result = UsageData()
@@ -320,12 +361,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var usage = UsageData()
     private let launchAgentLabel = "com.local.kimi-usage"
-    // 月度接口的 accessToken 只有 ~15 分钟寿命，靠 Kimi 桌面端刷新；
-    // 桌面端没在跑时接口会 401，此时静默保留旧值会把数据"冻"住（曾冻在 99.95% 一周）。
-    // 记录最后一次月度拉取成功时间，用于菜单标注 + 触发自动恢复。
+    // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
+    // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
+    // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
     private var lastMonthSuccessAt: Date?
-    private var lastKimiRelaunchAt: Date?
-    private var monthFailCount = 0   // 月度拉取连续失败次数（Kimi.app 续 token 有约 1 分钟空窗，偶发失败不算故障）
+    private var monthFailCount = 0   // 月度拉取连续失败次数（偶发网络抖动不算故障）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[KimiUsage] launched, creating status item")
@@ -362,10 +402,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let token = cred.webToken, !token.isEmpty {
             group.enter()
             Fetcher.fetchMonthUsage(webToken: token) { r in
-                merged.monthUsed = r.monthUsed
-                merged.monthReset = r.monthReset
-                merged.monthError = r.monthError
-                group.leave()
+                if let err = r.monthError, err.contains("401") {
+                    // accessToken 过期：自己用 refreshToken 续期后重试，不再唤起 Kimi 桌面端
+                    Fetcher.refreshWebToken { newToken in
+                        if let newToken = newToken {
+                            Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
+                                merged.monthUsed = r2.monthUsed
+                                merged.monthReset = r2.monthReset
+                                merged.monthError = r2.monthError
+                                group.leave()
+                            }
+                        } else {
+                            merged.monthError = "HTTP 401（自刷新失败，请打开一次 Kimi 桌面端重新登录）"
+                            group.leave()
+                        }
+                    }
+                } else {
+                    merged.monthUsed = r.monthUsed
+                    merged.monthReset = r.monthReset
+                    merged.monthError = r.monthError
+                    group.leave()
+                }
             }
         } else {
             merged.monthError = "no web token"
@@ -411,35 +468,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             self.renderBar()
             self.rebuildMenu()
-            // 月度接口 401 = accessToken 过期。Kimi.app 在跑时它会自动续 token（有 ~1 分钟空窗），
-            // 只有桌面端没在跑才拉起它重试；连续失败 ≥3 次才认为是真故障
-            if let err = merged.monthError, err.contains("401"), self.monthFailCount >= 3 {
-                self.relaunchKimiDesktopAndRetry()
-            }
-        }
-    }
-
-    // 自动恢复：后台唤起 Kimi.app（其 daimon 会刷新 config.json 里的 token），25 秒后重试
-    private func relaunchKimiDesktopAndRetry() {
-        let now = Date()
-        // 10 分钟内不重复唤起，避免每分钟的轮询把桌面端反复拉起
-        if let last = lastKimiRelaunchAt, now.timeIntervalSince(last) < 600 { return }
-        lastKimiRelaunchAt = now
-        let url = URL(fileURLWithPath: "/Applications/Kimi.app")
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        // Kimi.app 已在运行时它自己会续 token（过期后 ~1 分钟内），无需重复唤起
-        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.moonshot.kimichat").isEmpty {
-            NSLog("[KimiUsage] Kimi.app already running, skip relaunch")
-            return
-        }
-        NSLog("[KimiUsage] month token 401, relaunching Kimi.app to refresh token")
-        let conf = NSWorkspace.OpenConfiguration()
-        conf.activates = false
-        NSWorkspace.shared.openApplication(at: url, configuration: conf) { _, err in
-            if let err = err { NSLog("[KimiUsage] relaunch Kimi.app failed: \(err)") }
-        }
-        Timer.scheduledTimer(withTimeInterval: 25, repeats: false) { [weak self] _ in
-            self?.refresh()
         }
     }
 
@@ -633,10 +661,26 @@ if CommandLine.arguments.contains("--once") {
     if let token = cred.webToken {
         group.enter()
         Fetcher.fetchMonthUsage(webToken: token) { r in
-            merged.monthUsed = r.monthUsed
-            merged.monthReset = r.monthReset
-            merged.monthError = r.monthError
-            group.leave()
+            if let err = r.monthError, err.contains("401") {
+                Fetcher.refreshWebToken { newToken in
+                    if let newToken = newToken {
+                        Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
+                            merged.monthUsed = r2.monthUsed
+                            merged.monthReset = r2.monthReset
+                            merged.monthError = r2.monthError
+                            group.leave()
+                        }
+                    } else {
+                        merged.monthError = "HTTP 401（自刷新失败）"
+                        group.leave()
+                    }
+                }
+            } else {
+                merged.monthUsed = r.monthUsed
+                merged.monthReset = r.monthReset
+                merged.monthError = r.monthError
+                group.leave()
+            }
         }
     } else { print("no kimiWeb token found") }
     _ = group.wait(timeout: .now() + 20)

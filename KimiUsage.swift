@@ -320,6 +320,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var usage = UsageData()
     private let launchAgentLabel = "com.local.kimi-usage"
+    // 月度接口的 accessToken 只有 ~15 分钟寿命，靠 Kimi 桌面端刷新；
+    // 桌面端没在跑时接口会 401，此时静默保留旧值会把数据"冻"住（曾冻在 99.95% 一周）。
+    // 记录最后一次月度拉取成功时间，用于菜单标注 + 触发自动恢复。
+    private var lastMonthSuccessAt: Date?
+    private var lastKimiRelaunchAt: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[KimiUsage] launched, creating status item")
@@ -397,8 +402,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.monthReset = old.monthReset
             }
             self.usage = merged
+            if merged.monthUsed != nil && merged.monthError == nil {
+                self.lastMonthSuccessAt = Date()
+            }
             self.renderBar()
             self.rebuildMenu()
+            // 月度接口 401 = accessToken 过期：尝试拉起 Kimi 桌面端刷新 token 后重试一次
+            if let err = merged.monthError, err.contains("401") {
+                self.relaunchKimiDesktopAndRetry()
+            }
+        }
+    }
+
+    // 自动恢复：后台唤起 Kimi.app（其 daimon 会刷新 config.json 里的 token），25 秒后重试
+    private func relaunchKimiDesktopAndRetry() {
+        let now = Date()
+        // 10 分钟内不重复唤起，避免每分钟的轮询把桌面端反复拉起
+        if let last = lastKimiRelaunchAt, now.timeIntervalSince(last) < 600 { return }
+        lastKimiRelaunchAt = now
+        NSLog("[KimiUsage] month token 401, relaunching Kimi.app to refresh token")
+        let url = URL(fileURLWithPath: "/Applications/Kimi.app")
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        let conf = NSWorkspace.OpenConfiguration()
+        conf.activates = false
+        NSWorkspace.shared.openApplication(at: url, configuration: conf) { _, err in
+            if let err = err { NSLog("[KimiUsage] relaunch Kimi.app failed: \(err)") }
+        }
+        Timer.scheduledTimer(withTimeInterval: 25, repeats: false) { [weak self] _ in
+            self?.refresh()
         }
     }
 
@@ -470,8 +501,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + (usage.fiveHourReset != nil ? "（\(Fmt.time(usage.fiveHourReset)) 重置）" : "")
         let d7 = "7 天余额：\(Fmt.pctLong(remaining(usage.sevenDayUsed)))"
             + (usage.sevenDayReset != nil ? "（\(Fmt.dayTime(usage.sevenDayReset)) 重置）" : "")
-        let m30 = "本月总额度余额：\(Fmt.pctLong(remaining(usage.monthUsed)))"
+        var m30 = "本月总额度余额：\(Fmt.pctLong(remaining(usage.monthUsed)))"
             + (usage.monthReset != nil ? "（\(Fmt.dayTime(usage.monthReset)) 重置）" : "")
+        // 月度值是拉取失败时保留的旧值：标注真实数据时间，避免显示过期数字而不自知
+        if usage.monthUsed != nil, let err = usage.monthError {
+            let at = lastMonthSuccessAt.map { Fmt.dayTime($0) } ?? "更早"
+            m30 += " ⚠️ 刷新失败（\(err)），数据停留在 \(at)"
+        }
         menu.addItem(info(h5))
         menu.addItem(info(d7))
         menu.addItem(info(m30))

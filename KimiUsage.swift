@@ -325,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 记录最后一次月度拉取成功时间，用于菜单标注 + 触发自动恢复。
     private var lastMonthSuccessAt: Date?
     private var lastKimiRelaunchAt: Date?
+    private var monthFailCount = 0   // 月度拉取连续失败次数（Kimi.app 续 token 有约 1 分钟空窗，偶发失败不算故障）
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[KimiUsage] launched, creating status item")
@@ -402,13 +403,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.monthReset = old.monthReset
             }
             self.usage = merged
-            if merged.monthUsed != nil && merged.monthError == nil {
+            if merged.monthError == nil && merged.monthUsed != nil {
                 self.lastMonthSuccessAt = Date()
+                self.monthFailCount = 0
+            } else if merged.monthError != nil {
+                self.monthFailCount += 1
             }
             self.renderBar()
             self.rebuildMenu()
-            // 月度接口 401 = accessToken 过期：尝试拉起 Kimi 桌面端刷新 token 后重试一次
-            if let err = merged.monthError, err.contains("401") {
+            // 月度接口 401 = accessToken 过期。Kimi.app 在跑时它会自动续 token（有 ~1 分钟空窗），
+            // 只有桌面端没在跑才拉起它重试；连续失败 ≥3 次才认为是真故障
+            if let err = merged.monthError, err.contains("401"), self.monthFailCount >= 3 {
                 self.relaunchKimiDesktopAndRetry()
             }
         }
@@ -420,9 +425,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 10 分钟内不重复唤起，避免每分钟的轮询把桌面端反复拉起
         if let last = lastKimiRelaunchAt, now.timeIntervalSince(last) < 600 { return }
         lastKimiRelaunchAt = now
-        NSLog("[KimiUsage] month token 401, relaunching Kimi.app to refresh token")
         let url = URL(fileURLWithPath: "/Applications/Kimi.app")
         guard FileManager.default.fileExists(atPath: url.path) else { return }
+        // Kimi.app 已在运行时它自己会续 token（过期后 ~1 分钟内），无需重复唤起
+        if !NSRunningApplication.runningApplications(withBundleIdentifier: "com.moonshot.kimichat").isEmpty {
+            NSLog("[KimiUsage] Kimi.app already running, skip relaunch")
+            return
+        }
+        NSLog("[KimiUsage] month token 401, relaunching Kimi.app to refresh token")
         let conf = NSWorkspace.OpenConfiguration()
         conf.activates = false
         NSWorkspace.shared.openApplication(at: url, configuration: conf) { _, err in
@@ -457,6 +467,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "line1": line1,
             "line2": line2,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
+            "month": [
+                "remaining": remaining(usage.monthUsed) ?? -1,
+                "error": usage.monthError ?? "",
+                "failCount": monthFailCount,
+                "lastSuccessAt": lastMonthSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+            ],
             "imageSize": [
                 "w": statusItem.button?.image?.size.width ?? -1,
                 "h": statusItem.button?.image?.size.height ?? -1
@@ -503,8 +519,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             + (usage.sevenDayReset != nil ? "（\(Fmt.dayTime(usage.sevenDayReset)) 重置）" : "")
         var m30 = "本月总额度余额：\(Fmt.pctLong(remaining(usage.monthUsed)))"
             + (usage.monthReset != nil ? "（\(Fmt.dayTime(usage.monthReset)) 重置）" : "")
-        // 月度值是拉取失败时保留的旧值：标注真实数据时间，避免显示过期数字而不自知
-        if usage.monthUsed != nil, let err = usage.monthError {
+        // 月度值是拉取失败时保留的旧值：连续失败 ≥3 次才标注，避免续 token 空窗期抖动
+        if usage.monthUsed != nil, let err = usage.monthError, monthFailCount >= 3 {
             let at = lastMonthSuccessAt.map { Fmt.dayTime($0) } ?? "更早"
             m30 += " ⚠️ 刷新失败（\(err)），数据停留在 \(at)"
         }

@@ -52,7 +52,14 @@ struct UsageData {
     var updatedAt: Date = Date()
 }
 
-// MARK: - 本地会话 token 统计（扫描 daimon wire.jsonl）
+// MARK: - 本地会话 token 统计（增量扫描 daimon wire.jsonl）
+//
+// 能耗优化（2026-09-15）：旧实现每 60s 全量读全部 jsonl（当时约 891 个文件 / 583MB），
+// 单次扫描 ~17s CPU，常驻每天烧掉数小时 CPU。现改为增量扫描：
+// 每个文件记录字节偏移 + 按日（本地时区 yyyy-MM-dd）聚合的 input/output，
+// 持久化到 ~/Library/Application Support/KimiUsage/scan-state.json；
+// 每次刷新未变化的文件只做一次 stat，有追加才读增量字节，
+// 今日/近7天/近30天窗口由按日聚合即时求和（与旧逻辑等值）。
 
 enum TokenAggregator {
     static let sessionsRoot = NSHomeDirectory()
@@ -66,6 +73,30 @@ enum TokenAggregator {
         NSHomeDirectory() + "/.claude/projects"
     ]
 
+    // 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
+    struct FileScanState: Codable {
+        var offset: UInt64 = 0
+        var days: [String: [Double]] = [:]
+    }
+    struct ScanState: Codable {
+        var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
+        var cli: [String: FileScanState] = [:]    // API 客户端（仅 Kimi 模型）
+    }
+
+    static let statePath = NSHomeDirectory()
+        + "/Library/Application Support/KimiUsage/scan-state.json"
+    private static var state: ScanState?
+    private static let lock = NSLock()
+
+    // 只关心近 30 天窗口，日聚合保留 31 天余量
+    private static let retainSeconds: TimeInterval = 31 * 86400
+
+    static let dayFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"   // 本地时区，与旧逻辑 Calendar.current 一致
+        return f
+    }()
+
     /// Claude SDK 客户端可经 ccswitch 接多家 API，按 model 字段甄别 Kimi；
     /// 无 model 字段的行默认计入（kimi-code 自有格式部分行无 model，且该客户端只接 Kimi）
     static func isKimiModel(_ model: String?) -> Bool {
@@ -74,73 +105,160 @@ enum TokenAggregator {
         return m.hasPrefix("k") && m.count > 1 && m[m.index(after: m.startIndex)].isNumber
     }
 
+    private static func loadState() -> ScanState {
+        if let s = state { return s }
+        if let data = FileManager.default.contents(atPath: statePath),
+           let s = try? JSONDecoder().decode(ScanState.self, from: data) {
+            state = s
+            return s
+        }
+        let s = ScanState()
+        state = s
+        return s
+    }
+
+    private static func saveState() {
+        guard let s = state,
+              let data = try? JSONEncoder().encode(s) else { return }
+        try? FileManager.default.createDirectory(
+            atPath: (statePath as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true)
+        try? data.write(to: URL(fileURLWithPath: statePath), options: [.atomic])
+    }
+
     /// Kimi Work 本地会话统计
     static func aggregate() -> (TokenStat, TokenStat, TokenStat) {
-        aggregate(roots: [sessionsRoot])
+        lock.lock(); defer { lock.unlock() }
+        var st = loadState()
+        scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
+        state = st
+        saveState()
+        return buckets(st.work)
     }
 
     /// API 客户端（CLI / Proma / Claude Code）中的 Kimi 用量统计
     static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
-        aggregate(roots: apiSessionsRoots, kimiOnly: true)
+        lock.lock(); defer { lock.unlock() }
+        var st = loadState()
+        scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
+        state = st
+        saveState()
+        return buckets(st.cli)
     }
 
-    /// 返回 (今日, 近7天, 近30天)；无数据时各桶为 0
-    static func aggregate(roots: [String], kimiOnly: Bool = false) -> (TokenStat, TokenStat, TokenStat) {
-        var today = TokenStat(), week = TokenStat(), month = TokenStat()
+    /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节
+    private static func scan(roots: [String], kimiOnly: Bool,
+                             into files: inout [String: FileScanState]) {
         let now = Date()
-        let todayStart = Calendar.current.startOfDay(for: now)
-        let d7 = now.addingTimeInterval(-7 * 86400)
-        let d30 = now.addingTimeInterval(-30 * 86400)
+        let cutoff = now.addingTimeInterval(-retainSeconds)
+        let cutoffKey = dayFmt.string(from: cutoff)
 
         for root in roots {
             let rootURL = URL(fileURLWithPath: root)
             guard let enumerator = FileManager.default.enumerator(
-                at: rootURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+                at: rootURL,
+                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                options: [.skipsHiddenFiles])
             else { continue }
 
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
-                guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-                for line in text.split(separator: "\n", omittingEmptySubsequences: true)
-                where line.contains("\"usage\"") {
-                    guard let data = line.data(using: .utf8),
-                          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                    else { continue }
-                    // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)
-                    let t: Date
-                    if let ms = obj["time"] as? Double {
-                        t = Date(timeIntervalSince1970: ms / 1000)
-                    } else if let ts = ISO.parse(obj["timestamp"] as? String) {
-                        t = ts
-                    } else { continue }
-                    // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
-                    let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
-                        ?? obj["usage"] as? [String: Any]
-                        ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
-                    guard let usage = usage else { continue }
-                    // 混接客户端只统计 Kimi 模型的行
-                    if kimiOnly {
-                        let model = (obj["message"] as? [String: Any])?["model"] as? String
-                            ?? obj["model"] as? String
-                        guard isKimiModel(model) else { continue }
-                    }
-                    // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
-                    var input: Double = 0
-                    for k in ["inputOther", "inputCacheRead", "inputCacheCreation",
-                              "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
-                              "input", "cacheRead", "cacheWrite"] {
-                        if let v = usage[k] as? Double { input += v }
-                        else if let v = usage[k] as? Int { input += Double(v) }
-                    }
-                    var output: Double = 0
-                    for k in ["output", "output_tokens"] {
-                        if let v = usage[k] as? Double { output += v }
-                        else if let v = usage[k] as? Int { output += Double(v) }
-                    }
-
-                    if t >= d30 { month.input += input; month.output += output }
-                    if t >= d7 { week.input += input; week.output += output }
-                    if t >= todayStart { today.input += input; today.output += output }
+                let path = url.path
+                guard let vals = try? url.resourceValues(
+                        forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                      let size = vals.fileSize
+                else { continue }
+                let sizeU = UInt64(size)
+                var st = files[path] ?? FileScanState()
+                // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
+                if st.offset == sizeU { files[path] = st; continue }
+                // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
+                if st.offset == 0, st.days.isEmpty,
+                   let mtime = vals.contentModificationDate, mtime < cutoff {
+                    st.offset = sizeU; files[path] = st; continue
                 }
+                // 截断/轮换：该文件的旧聚合已不可信，清零重扫
+                if sizeU < st.offset { st = FileScanState() }
+
+                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                fh.seek(toFileOffset: st.offset)
+                let data = fh.readDataToEndOfFile()
+                try? fh.close()
+                // 只消费到最后一个完整换行：正在被写入的残缺行留给下次
+                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
+                let consumed = st.offset + UInt64(lastNL + 1)
+                if let text = String(data: data[..<lastNL], encoding: .utf8) {
+                    parseLines(text, kimiOnly: kimiOnly, cutoffKey: cutoffKey, into: &st)
+                }
+                st.offset = consumed
+                st.days = st.days.filter { $0.key >= cutoffKey }
+                files[path] = st
+            }
+        }
+    }
+
+    /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
+    private static func parseLines(_ text: String, kimiOnly: Bool,
+                                   cutoffKey: String, into st: inout FileScanState) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true)
+        where line.contains("\"usage\"") {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)
+            let t: Date
+            if let ms = obj["time"] as? Double {
+                t = Date(timeIntervalSince1970: ms / 1000)
+            } else if let ts = ISO.parse(obj["timestamp"] as? String) {
+                t = ts
+            } else { continue }
+            // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
+            let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
+                ?? obj["usage"] as? [String: Any]
+                ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
+            guard let usage = usage else { continue }
+            // 混接客户端只统计 Kimi 模型的行
+            if kimiOnly {
+                let model = (obj["message"] as? [String: Any])?["model"] as? String
+                    ?? obj["model"] as? String
+                guard isKimiModel(model) else { continue }
+            }
+            // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
+            var input: Double = 0
+            for k in ["inputOther", "inputCacheRead", "inputCacheCreation",
+                      "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                      "input", "cacheRead", "cacheWrite"] {
+                if let v = usage[k] as? Double { input += v }
+                else if let v = usage[k] as? Int { input += Double(v) }
+            }
+            var output: Double = 0
+            for k in ["output", "output_tokens"] {
+                if let v = usage[k] as? Double { output += v }
+                else if let v = usage[k] as? Int { output += Double(v) }
+            }
+
+            let dayKey = dayFmt.string(from: t)
+            if dayKey >= cutoffKey {
+                var day = st.days[dayKey] ?? [0, 0]
+                day[0] += input
+                day[1] += output
+                st.days[dayKey] = day
+            }
+        }
+    }
+
+    /// 按日聚合 → 今日/近7天/近30天三个窗口
+    private static func buckets(_ files: [String: FileScanState])
+        -> (TokenStat, TokenStat, TokenStat) {
+        let now = Date()
+        let todayKey = dayFmt.string(from: now)
+        let d7Key = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
+        let d30Key = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
+        var today = TokenStat(), week = TokenStat(), month = TokenStat()
+        for (_, st) in files {
+            for (day, v) in st.days where day >= d30Key {
+                month.input += v[0]; month.output += v[1]
+                if day >= d7Key { week.input += v[0]; week.output += v[1] }
+                if day >= todayKey { today.input += v[0]; today.output += v[1] }
             }
         }
         return (today, week, month)
@@ -148,13 +266,20 @@ enum TokenAggregator {
 }
 
 enum ISO {
-    static func parse(_ s: String?) -> Date? {
-        guard let s = s else { return nil }
+    // formatter 创建有开销，复用静态实例（旧实现每次调用新建，全量扫描时是热点）
+    private static let frac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = f.date(from: s) { return d }
+        return f
+    }()
+    private static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
-        return f.date(from: s)
+        return f
+    }()
+    static func parse(_ s: String?) -> Date? {
+        guard let s = s else { return nil }
+        return frac.date(from: s) ?? plain.date(from: s)
     }
 }
 

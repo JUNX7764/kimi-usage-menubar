@@ -146,12 +146,15 @@ enum TokenAggregator {
         return buckets(st.cli)
     }
 
-    /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节
+    /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
+    /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）
     private static func scan(roots: [String], kimiOnly: Bool,
                              into files: inout [String: FileScanState]) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
+        var seen = Set<String>()
+        var enumedRoots: [String] = []
 
         for root in roots {
             let rootURL = URL(fileURLWithPath: root)
@@ -160,9 +163,11 @@ enum TokenAggregator {
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles])
             else { continue }
+            enumedRoots.append(root)
 
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 let path = url.path
+                seen.insert(path)
                 guard let vals = try? url.resourceValues(
                         forKeys: [.fileSizeKey, .contentModificationDateKey]),
                       let size = vals.fileSize
@@ -193,6 +198,13 @@ enum TokenAggregator {
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 files[path] = st
             }
+        }
+
+        // 枚举成功的 root 里已不存在的文件：从状态剔除，停止计入窗口
+        // （枚举失败的 root 不动，避免目录临时不可用时误清状态）
+        for path in files.keys where !seen.contains(path)
+            && enumedRoots.contains(where: { path.hasPrefix($0 + "/") }) {
+            files.removeValue(forKey: path)
         }
     }
 

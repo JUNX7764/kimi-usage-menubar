@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import SQLite3
 
 // MARK: - 凭证读取（与 Kimi 桌面端共用本地配置）
 
@@ -65,11 +66,12 @@ enum TokenAggregator {
     static let sessionsRoot = NSHomeDirectory()
         + "/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions"
     // API 客户端会话目录：独立 Kimi Code CLI + Proma / Claude Code（Claude SDK 可混接多家 API）
-    // 注意：Proma 新版（≈2026-07）把 SDK 级会话日志从 sdk-config/projects 移到 sdk-config/sessions
+    // 注意：Proma 会话日志位置两度迁移：sdk-config/projects →（≈2026-07）sdk-config/sessions →（≈2026-08-26）agent-sessions
     static let apiSessionsRoots = [
         NSHomeDirectory() + "/.kimi-code/sessions",
         NSHomeDirectory() + "/.proma/sdk-config/projects",
         NSHomeDirectory() + "/.proma/sdk-config/sessions",
+        NSHomeDirectory() + "/.proma/agent-sessions",
         NSHomeDirectory() + "/.claude/projects"
     ]
 
@@ -81,6 +83,13 @@ enum TokenAggregator {
     struct ScanState: Codable {
         var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
         var cli: [String: FileScanState] = [:]    // API 客户端（仅 Kimi 模型）
+        var hermes: HermesState?                  // hermes（sqlite 快照差分）
+    }
+    /// hermes session_model_usage 是 (session,model,...) 级累计行：rows 存上次快照，
+    /// 每次刷新做差，delta 按行的 last_seen 归入当日 days
+    struct HermesState: Codable {
+        var rows: [String: [Double]] = [:]   // rowKey -> [累计input, 累计output]
+        var days: [String: [Double]] = [:]   // dayKey -> [input, output]
     }
 
     static let statePath = NSHomeDirectory()
@@ -136,14 +145,15 @@ enum TokenAggregator {
         return buckets(st.work)
     }
 
-    /// API 客户端（CLI / Proma / Claude Code）中的 Kimi 用量统计
+    /// API 客户端（CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
     static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
         lock.lock(); defer { lock.unlock() }
         var st = loadState()
         scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
+        scanHermes(into: &st)
         state = st
         saveState()
-        return buckets(st.cli)
+        return buckets(st.cli, extraDays: st.hermes?.days)
     }
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
@@ -208,6 +218,61 @@ enum TokenAggregator {
         }
     }
 
+    // hermes 用量库（sqlite，只读打开，绝不写入）
+    private static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
+
+    /// hermes 的 Kimi 用量：只读查询 billing_base_url 指向 kimi.com / moonshot 的累计行
+    /// （全表仅千余行、命中百余行，每次刷新一次查询开销可忽略，不新增定时器）；
+    /// 与持久化的上次快照做差，delta 按 last_seen 归日。首次运行会把存量行的累计值
+    /// 归入各自 last_seen 当天，相当于自动回填近 30 天窗口。
+    private static func scanHermes(into st: inout ScanState) {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(hermesDBPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        else { return }
+        defer { sqlite3_close(db) }
+        let sql = """
+            SELECT session_id, model, billing_provider, billing_base_url, billing_mode, task,
+                   input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, last_seen
+            FROM session_model_usage
+            WHERE billing_base_url LIKE '%kimi.com%' OR billing_base_url LIKE '%moonshot%'
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
+        var hs = st.hermes ?? HermesState()
+        var alive = Set<String>()
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            func col(_ i: Int32) -> String {
+                sqlite3_column_text(stmt, i).map { String(cString: $0) } ?? ""
+            }
+            let key = (0...5).map { col(Int32($0)) }.joined(separator: "|")
+            alive.insert(key)
+            // 与文件来源口径一致：input 含 cache read/write
+            let cumIn = Double(sqlite3_column_int64(stmt, 6))
+                + Double(sqlite3_column_int64(stmt, 8))
+                + Double(sqlite3_column_int64(stmt, 9))
+            let cumOut = Double(sqlite3_column_int64(stmt, 7))
+            let lastSeen = sqlite3_column_double(stmt, 10)
+            let old = hs.rows[key] ?? [0, 0]
+            var dIn = cumIn - old[0], dOut = cumOut - old[1]
+            if dIn < 0 || dOut < 0 { dIn = max(dIn, 0); dOut = max(dOut, 0) }  // 计数被重置：rebase，不倒扣
+            hs.rows[key] = [cumIn, cumOut]
+            guard dIn > 0 || dOut > 0, lastSeen > 0 else { continue }
+            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+            if dayKey >= cutoffKey {
+                var day = hs.days[dayKey] ?? [0, 0]
+                day[0] += dIn; day[1] += dOut
+                hs.days[dayKey] = day
+            }
+        }
+        // 会话被 hermes 删除（ON DELETE CASCADE）的行：移出快照，停止计入
+        hs.rows = hs.rows.filter { alive.contains($0.key) }
+        hs.days = hs.days.filter { $0.key >= cutoffKey }
+        st.hermes = hs
+    }
+
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
     private static func parseLines(_ text: String, kimiOnly: Bool,
                                    cutoffKey: String, into st: inout FileScanState) {
@@ -216,12 +281,17 @@ enum TokenAggregator {
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)
+            // Proma result 行的 modelUsage / 顶层 usage 是全会话累计汇总，
+            // 逐条 assistant 行（message.usage）已含每次调用，跳过汇总行避免双算
+            if obj["modelUsage"] != nil { continue }
+            // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
             let t: Date
             if let ms = obj["time"] as? Double {
                 t = Date(timeIntervalSince1970: ms / 1000)
             } else if let ts = ISO.parse(obj["timestamp"] as? String) {
                 t = ts
+            } else if let ms = obj["_createdAt"] as? Double {
+                t = Date(timeIntervalSince1970: ms / 1000)
             } else { continue }
             // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
             let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
@@ -258,20 +328,34 @@ enum TokenAggregator {
         }
     }
 
-    /// 按日聚合 → 今日/近7天/近30天三个窗口
-    private static func buckets(_ files: [String: FileScanState])
+    /// 按日聚合 → 今日/近7天/近30天三个窗口；extraDays 用于合并非文件来源（hermes）
+    private static func buckets(_ files: [String: FileScanState],
+                                extraDays: [String: [Double]]? = nil)
         -> (TokenStat, TokenStat, TokenStat) {
         let now = Date()
         let todayKey = dayFmt.string(from: now)
         let d7Key = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
         let d30Key = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
         var today = TokenStat(), week = TokenStat(), month = TokenStat()
+        var allDays: [String: [Double]] = [:]
         for (_, st) in files {
-            for (day, v) in st.days where day >= d30Key {
-                month.input += v[0]; month.output += v[1]
-                if day >= d7Key { week.input += v[0]; week.output += v[1] }
-                if day >= todayKey { today.input += v[0]; today.output += v[1] }
+            for (day, v) in st.days {
+                var a = allDays[day] ?? [0, 0]
+                a[0] += v[0]; a[1] += v[1]
+                allDays[day] = a
             }
+        }
+        if let extra = extraDays {
+            for (day, v) in extra {
+                var a = allDays[day] ?? [0, 0]
+                a[0] += v[0]; a[1] += v[1]
+                allDays[day] = a
+            }
+        }
+        for (day, v) in allDays where day >= d30Key {
+            month.input += v[0]; month.output += v[1]
+            if day >= d7Key { week.input += v[0]; week.output += v[1] }
+            if day >= todayKey { today.input += v[0]; today.output += v[1] }
         }
         return (today, week, month)
     }
@@ -704,7 +788,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(tokenLine("近 7 天", usage.tokens7d)))
         menu.addItem(info(tokenLine("近 30 天", usage.tokens30d)))
 
-        // Token 用量（API 客户端：Kimi Code CLI / Proma 等，API key 直连）
+        // Token 用量（API 客户端：Kimi Code CLI / Proma / Claude Code / hermes 中的 Kimi 用量）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（API 客户端 · 仅 Kimi 模型）"))
         menu.addItem(info(tokenLine("今日", usage.cliTokensToday)))

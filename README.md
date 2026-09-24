@@ -7,7 +7,7 @@
 - **配额用量**：5 小时窗口 / 7 天 / 月度配额的使用比例与重置时间
 - **Token 统计**：扫描本地会话日志，统计今天 / 近 7 天 / 近 30 天的 input/output token 消耗
   - Kimi Work 本地会话（kimi-desktop daimon）
-  - API 客户端会话：独立 Kimi Code CLI、Proma / Claude Code（按 model 字段甄别 Kimi 系模型）
+  - API 客户端会话：独立 Kimi Code CLI、Proma（sdk-config + agent-sessions）/ Claude Code（按 model 字段甄别 Kimi 系模型）+ hermes（state.db 快照差分，按 base_url 甄别 kimi.com / moonshot）
 - 菜单栏常驻，纯本地运行，数据不上传
 
 ## 原理

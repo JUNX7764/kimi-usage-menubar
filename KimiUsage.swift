@@ -587,6 +587,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
     private var lastMonthSuccessAt: Date?
     private var monthFailCount = 0   // 月度拉取连续失败次数（偶发网络抖动不算故障）
+    // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
+    private let quotaStaleAfter: TimeInterval = 600
+    private let tokensStaleAfter: TimeInterval = 1800
+    // 两组数据各自的最后成功时间（5H/7D 服务端额度共用 quotaLastOK；token 统计本地扫描共用 tokensLastOK）
+    private var quotaLastOK: Date?
+    private var tokensLastOK: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[KimiUsage] launched, creating status item")
@@ -665,6 +671,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
+            // 必须在旧值回填之前判定：本次新拉/新算到的值非 nil 才算成功、才推进 lastOK，
+            // 由旧值回填得来的数据绝不更新 lastOK（否则断网时过期数据会被误标为新鲜）
+            if merged.fiveHourUsed != nil || merged.sevenDayUsed != nil {
+                self.quotaLastOK = Date()
+            }
+            // 会员月额度同样走网络拉取，lastMonthSuccessAt 即其 lastOK（口径同前，仅对齐到回填前）
+            if merged.monthError == nil && merged.monthUsed != nil {
+                self.lastMonthSuccessAt = Date()
+                self.monthFailCount = 0
+            } else if merged.monthError != nil {
+                self.monthFailCount += 1
+            }
+            // token 统计为本地计算：后台扫描块每次刷新必回填，tokensToday 非 nil 即本次新算成功
+            if merged.tokensToday != nil {
+                self.tokensLastOK = Date()
+            }
             // 网络瞬断（如睡眠唤醒）导致本次拉取失败时，保留上次成功的数据，
             // 避免菜单栏闪 "--"；错误提示逻辑已判断值为 nil 才显示，无需另清。
             let old = self.usage
@@ -681,15 +703,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.monthReset = old.monthReset
             }
             self.usage = merged
-            if merged.monthError == nil && merged.monthUsed != nil {
-                self.lastMonthSuccessAt = Date()
-                self.monthFailCount = 0
-            } else if merged.monthError != nil {
-                self.monthFailCount += 1
-            }
             self.renderBar()
             self.rebuildMenu()
         }
+    }
+
+    // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
+    // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
+    private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
+        guard hasData else { return false }
+        guard let t = lastOK else { return true }
+        return Date().timeIntervalSince(t) > after
+    }
+    private var quotaStale: Bool {
+        isStale(quotaLastOK, hasData: usage.fiveHourUsed != nil || usage.sevenDayUsed != nil,
+                after: quotaStaleAfter)
+    }
+    private var tokensStale: Bool {
+        isStale(tokensLastOK, hasData: usage.tokensToday != nil || usage.tokens7d != nil
+            || usage.tokens30d != nil || usage.cliTokensToday != nil
+            || usage.cliTokens7d != nil || usage.cliTokens30d != nil, after: tokensStaleAfter)
     }
 
     // 已用量 → 余额（剩余比例）
@@ -698,13 +731,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return max(0, min(1, 1 - used))
     }
 
-    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）
+    // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；额度过期时两行加 ⚠️ 前缀
+    // （5H/7D 同属服务端额度组，整组标注；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
-        let line1 = "5H \(Fmt.pct(remaining(usage.fiveHourUsed)))"
-        let line2 = "7D \(Fmt.pct(remaining(usage.sevenDayUsed)))"
+        let staleQuota = quotaStale
+        let line1 = (staleQuota ? "⚠️ " : "") + "5H \(Fmt.pct(remaining(usage.fiveHourUsed)))"
+        let line2 = (staleQuota ? "⚠️ " : "") + "7D \(Fmt.pct(remaining(usage.sevenDayUsed)))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
-        statusItem.button?.toolTip = "Kimi 余额 · 更新于 \(Fmt.time(usage.updatedAt))"
+        // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
+        statusItem.button?.toolTip = "Kimi 余额 · 额度最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"
+            + " · Token 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"
         writeStatus(line1: line1, line2: line2)
     }
 
@@ -716,6 +753,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "line1": line1,
             "line2": line2,
             "updatedAt": ISO8601DateFormatter().string(from: Date()),
+            // 两组数据的最后成功时间（ISO8601，无则空串）与过期标记
+            "quotaLastOK": quotaLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+            "tokensLastOK": tokensLastOK.map { ISO8601DateFormatter().string(from: $0) } ?? "",
+            "quotaStale": quotaStale,
+            "tokensStale": tokensStale,
             "month": [
                 "remaining": remaining(usage.monthUsed) ?? -1,
                 "error": usage.monthError ?? "",
@@ -800,6 +842,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if let e = usage.monthError, usage.monthUsed == nil {
             menu.addItem(info("月度获取失败：\(e)"))
+        }
+
+        // 数据过期提示：仅对应组过期时显示，紧贴更新时间行（两组独立判定）
+        if quotaStale {
+            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(quotaLastOK.map { Fmt.time($0) } ?? "--")"))
+        }
+        if tokensStale {
+            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(tokensLastOK.map { Fmt.time($0) } ?? "--")"))
         }
 
         menu.addItem(.separator())

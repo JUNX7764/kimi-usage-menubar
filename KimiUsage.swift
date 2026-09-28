@@ -1056,8 +1056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(tokenLine("今日", usage.tokensToday)))
         menu.addItem(info(tokenLine("近 7 天", usage.tokens7d)))
         menu.addItem(info(tokenLine("近 30 天", usage.tokens30d)))
-        menu.addItem(info("Work 扫描最后成功：\(Fmt.lastOK(workTokensLastSuccessAt))"
-            + (tokensStale ? " · ⚠️ 已过期" : "")))
 
         // Token 用量（API 客户端：Kimi Code CLI / Proma / Claude Code / hermes 中的 Kimi 用量）
         menu.addItem(.separator())
@@ -1065,8 +1063,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(tokenLine("今日", usage.cliTokensToday)))
         menu.addItem(info(tokenLine("近 7 天", usage.cliTokens7d)))
         menu.addItem(info(tokenLine("近 30 天", usage.cliTokens30d)))
-        menu.addItem(info("API 客户端扫描最后成功：\(Fmt.lastOK(cliTokensLastSuccessAt))"
-            + (cliTokensStale ? " · ⚠️ 已过期" : "")))
+
+        // 扫描状态行仅在数据过期时显示（正常状态保持菜单简洁）
+        if tokensStale {
+            menu.addItem(info("⚠️ Work Token 数据已过期 · 最后成功 \(Fmt.lastOK(workTokensLastSuccessAt))"))
+        }
+        if cliTokensStale {
+            menu.addItem(info("⚠️ API Token 数据已过期 · 最后成功 \(Fmt.lastOK(cliTokensLastSuccessAt))"))
+        }
 
         menu.addItem(.separator())
         menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt))"))
@@ -1281,16 +1285,25 @@ if CommandLine.arguments.contains("--once") {
     // 命令行自检模式：拉一次数据打印后退出
     let cred = CredStore.load()
     let group = DispatchGroup()
+    // 网络回调来自不同线程，与 App 主路径同款经锁合并；避免 wait 超时后边写边读
+    let onceLock = NSLock()
     var merged = UsageData()
+    func applyResult(_ body: (inout UsageData) -> Void, leave: Bool = true) {
+        onceLock.lock()
+        body(&merged)
+        onceLock.unlock()
+        if leave { group.leave() }
+    }
     if let key = cred.codeApiKey {
         group.enter()
         Fetcher.fetchCodeUsage(apiKey: key) { r in
-            merged.fiveHourUsed = r.fiveHourUsed
-            merged.fiveHourReset = r.fiveHourReset
-            merged.sevenDayUsed = r.sevenDayUsed
-            merged.sevenDayReset = r.sevenDayReset
-            merged.fiveHourError = r.fiveHourError
-            group.leave()
+            applyResult { current in
+                current.fiveHourUsed = r.fiveHourUsed
+                current.fiveHourReset = r.fiveHourReset
+                current.sevenDayUsed = r.sevenDayUsed
+                current.sevenDayReset = r.sevenDayReset
+                current.fiveHourError = r.fiveHourError
+            }
         }
     } else { print("no kimiCode apiKey found") }
     if let token = cred.webToken {
@@ -1300,32 +1313,37 @@ if CommandLine.arguments.contains("--once") {
                 Fetcher.refreshWebToken { newToken in
                     if let newToken = newToken {
                         Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
-                            merged.monthUsed = r2.monthUsed
-                            merged.monthReset = r2.monthReset
-                            merged.monthError = r2.monthError
-                            group.leave()
+                            applyResult { current in
+                                current.monthUsed = r2.monthUsed
+                                current.monthReset = r2.monthReset
+                                current.monthError = r2.monthError
+                            }
                         }
                     } else {
-                        merged.monthError = "HTTP 401（自刷新失败）"
-                        group.leave()
+                        applyResult { $0.monthError = "HTTP 401（自刷新失败）" }
                     }
                 }
             } else {
-                merged.monthUsed = r.monthUsed
-                merged.monthReset = r.monthReset
-                merged.monthError = r.monthError
-                group.leave()
+                applyResult { current in
+                    current.monthUsed = r.monthUsed
+                    current.monthReset = r.monthReset
+                    current.monthError = r.monthError
+                }
             }
         }
     } else { print("no kimiWeb token found") }
-    _ = group.wait(timeout: .now() + 20)
+    // 月度 401 时存在 刷新→重试 串行链（每段最长 15s），20s 会截断重试结果
+    _ = group.wait(timeout: .now() + 45)
+    onceLock.lock()
+    let snapshot = merged
+    onceLock.unlock()
     func rem(_ used: Double?) -> Double? { used.map { max(0, min(1, 1 - $0)) } }
     let (work, cli) = TokenAggregator.aggregateBoth()
     let (tt, tw, tm) = work
-    print("menubar: 5H \(Fmt.pct(rem(merged.fiveHourUsed))) / 7D \(Fmt.pct(rem(merged.sevenDayUsed)))")
-    print("5h remaining=\(Fmt.pctLong(rem(merged.fiveHourUsed))) reset=\(Fmt.dayTime(merged.fiveHourReset))")
-    print("7d remaining=\(Fmt.pctLong(rem(merged.sevenDayUsed))) reset=\(Fmt.dayTime(merged.sevenDayReset))")
-    print("month remaining=\(Fmt.pctLong(rem(merged.monthUsed))) reset=\(Fmt.dayTime(merged.monthReset))")
+    print("menubar: 5H \(Fmt.pct(rem(snapshot.fiveHourUsed))) / 7D \(Fmt.pct(rem(snapshot.sevenDayUsed)))")
+    print("5h remaining=\(Fmt.pctLong(rem(snapshot.fiveHourUsed))) reset=\(Fmt.dayTime(snapshot.fiveHourReset))")
+    print("7d remaining=\(Fmt.pctLong(rem(snapshot.sevenDayUsed))) reset=\(Fmt.dayTime(snapshot.sevenDayReset))")
+    print("month remaining=\(Fmt.pctLong(rem(snapshot.monthUsed))) reset=\(Fmt.dayTime(snapshot.monthReset))")
     print("tokens today: in=\(Fmt.tokens(tt.input)) out=\(Fmt.tokens(tt.output)) total=\(Fmt.tokens(tt.total))")
     print("tokens 7d:    in=\(Fmt.tokens(tw.input)) out=\(Fmt.tokens(tw.output)) total=\(Fmt.tokens(tw.total))")
     print("tokens 30d:   in=\(Fmt.tokens(tm.input)) out=\(Fmt.tokens(tm.output)) total=\(Fmt.tokens(tm.total))")
@@ -1333,8 +1351,8 @@ if CommandLine.arguments.contains("--once") {
     print("api tokens today: in=\(Fmt.tokens(ct.input)) out=\(Fmt.tokens(ct.output)) total=\(Fmt.tokens(ct.total))")
     print("api tokens 7d:    in=\(Fmt.tokens(cw.input)) out=\(Fmt.tokens(cw.output)) total=\(Fmt.tokens(cw.total))")
     print("api tokens 30d:   in=\(Fmt.tokens(cm.input)) out=\(Fmt.tokens(cm.output)) total=\(Fmt.tokens(cm.total))")
-    if let e = merged.fiveHourError { print("5h error: \(e)") }
-    if let e = merged.monthError { print("month error: \(e)") }
+    if let e = snapshot.fiveHourError { print("5h error: \(e)") }
+    if let e = snapshot.monthError { print("month error: \(e)") }
     exit(0)
 }
 

@@ -148,7 +148,7 @@ enum CredStore {
     /// Merge only rotated Kimi web credentials into the latest document. If the official client
     /// changed either auth field during the request, keep its values and return the fresh access token.
     static func mergeWebTokens(at path: String, expected: WebTokens,
-                               access: String, refresh: String?) throws -> (access: String, wrote: Bool) {
+                               access: String, refresh: String?, now: Date = Date()) throws -> (access: String, wrote: Bool) {
         guard let data = FileManager.default.contents(atPath: path),
               var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               var credentials = obj["credentials"] as? [String: Any],
@@ -163,6 +163,7 @@ enum CredStore {
         }
         web["accessToken"] = access
         if let refresh = refresh, !refresh.isEmpty { web["refreshToken"] = refresh }
+        web["updatedAt"] = ISO8601DateFormatter().string(from: now)
         credentials["kimiWeb"] = web
         obj["credentials"] = credentials
         let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
@@ -1199,18 +1200,19 @@ enum KimiOfflineRegression {
                                              now: now, after: 50), "old retained value was not marked stale")
 
             let authPath = root.appendingPathComponent("config.json").path
-            func document(_ access: String, _ refresh: String, _ extra: String) -> [String: Any] {
+            func document(_ access: String, _ refresh: String, _ extra: String, _ updatedAt: String) -> [String: Any] {
                 ["untouched": extra,
-                 "credentials": ["kimiWeb": ["accessToken": access, "refreshToken": refresh, "other": "keep"],
+                 "credentials": ["kimiWeb": ["accessToken": access, "refreshToken": refresh,
+                                               "updatedAt": updatedAt, "other": "keep"],
                                  "kimiCode": ["apiKey": "fake-api-key"]]]
             }
-            let initial = try JSONSerialization.data(withJSONObject: document("old-access", "old-refresh", "before"))
+            let initial = try JSONSerialization.data(withJSONObject: document("old-access", "old-refresh", "before", "before-time"))
             try initial.write(to: URL(fileURLWithPath: authPath))
             try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: authPath)
             let expected = CredStore.WebTokens(access: "old-access", refresh: "old-refresh")
 
             // Simulate Kimi changing both tokens while our HTTP request is in flight.
-            let clientUpdate = try JSONSerialization.data(withJSONObject: document("client-access", "client-refresh", "client-change"))
+            let clientUpdate = try JSONSerialization.data(withJSONObject: document("client-access", "client-refresh", "client-change", "client-time"))
             try clientUpdate.write(to: URL(fileURLWithPath: authPath), options: .atomic)
             let beforeConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
             let conflict = try CredStore.mergeWebTokens(at: authPath, expected: expected,
@@ -1219,10 +1221,16 @@ enum KimiOfflineRegression {
             let afterConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
             try expect(afterConflict == beforeConflict,
                        "conflict path modified the latest client document")
+            let conflictDocument = try JSONSerialization.jsonObject(with: afterConflict) as! [String: Any]
+            let conflictWeb = ((conflictDocument["credentials"] as! [String: Any])["kimiWeb"] as! [String: Any])
+            try expect(conflictWeb["updatedAt"] as? String == "client-time",
+                       "conflict path changed the official client updatedAt")
 
             let latest = CredStore.WebTokens(access: "client-access", refresh: "client-refresh")
+            let rotationTime = Date(timeIntervalSince1970: 1_800_000_000)
             let success = try CredStore.mergeWebTokens(at: authPath, expected: latest,
-                                                       access: "rotated-access", refresh: "rotated-refresh")
+                                                       access: "rotated-access", refresh: "rotated-refresh",
+                                                       now: rotationTime)
             try expect(success.wrote && success.access == "rotated-access", "credential rotation did not write")
             let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: authPath))) as! [String: Any]
             let savedCredentials = saved["credentials"] as! [String: Any]
@@ -1231,6 +1239,8 @@ enum KimiOfflineRegression {
             try expect(savedWeb["other"] as? String == "keep", "unrelated Kimi web field was lost")
             try expect(savedWeb["accessToken"] as? String == "rotated-access"
                        && savedWeb["refreshToken"] as? String == "rotated-refresh", "rotated auth values not saved")
+            try expect(savedWeb["updatedAt"] as? String == ISO8601DateFormatter().string(from: rotationTime),
+                       "successful rotation did not update credentials.kimiWeb.updatedAt")
             let permissions = try FileManager.default.attributesOfItem(atPath: authPath)[.posixPermissions] as! NSNumber
             try expect(permissions.intValue & 0o077 == 0, "credential file gained group/other access")
 

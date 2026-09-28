@@ -5,6 +5,11 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="$DIR/KimiUsage.app"
 
+# All three Usage apps share the same flat icon generator.
+if [ ! -f "$DIR/AppIcon.icns" ]; then
+    (cd "$DIR" && swift scripts/icon_gen.swift)
+fi
+
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。

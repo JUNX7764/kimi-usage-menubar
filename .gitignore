@@ -1,3 +1,8 @@
 .DS_Store
 KimiUsage.app/
 KimiUsage-bin
+# 压缩包构建产物
+*.zip
+# 图标生成中间产物（保留 icns 成品）
+AppIcon.iconset/
+icon_1024x1024.png

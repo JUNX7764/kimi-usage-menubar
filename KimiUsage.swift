@@ -1,6 +1,111 @@
 import Cocoa
 import Foundation
 import SQLite3
+import CoreFoundation
+import Darwin
+
+enum UsageNumber {
+    static func finite(_ value: Any?) -> Double? {
+        if let text = value as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, let number = Double(trimmed), number.isFinite else { return nil }
+            return number
+        }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+        let result = number.doubleValue
+        return result.isFinite ? result : nil
+    }
+
+    static func unitRatio(_ value: Any?) -> Double? {
+        guard let number = finite(value), (0...1).contains(number) else { return nil }
+        return number
+    }
+}
+
+enum AtomicJSONFile {
+    static func replace(_ data: Data, at path: String, mode: Int16? = nil) throws {
+        let directory = (path as NSString).deletingLastPathComponent
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        let existingMode = (try? FileManager.default.attributesOfItem(atPath: path)[.posixPermissions] as? NSNumber)
+            .map { Int16(truncating: $0) }
+        let requested = mode ?? existingMode ?? 0o600
+        let safeMode = requested & 0o600 == 0 ? 0o600 : requested & 0o600
+        let temp = directory + "/." + (path as NSString).lastPathComponent + "." + UUID().uuidString + ".tmp"
+        let fd = open(temp, O_WRONLY | O_CREAT | O_EXCL, mode_t(0o600))
+        guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        var fdOpen = true
+        var shouldRemove = true
+        defer {
+            if fdOpen { _ = close(fd) }
+            if shouldRemove { _ = unlink(temp) }
+        }
+        var offset = 0
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < data.count {
+                let count = write(fd, base.advanced(by: offset), data.count - offset)
+                if count < 0 {
+                    if errno == EINTR { continue }
+                    throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                }
+                guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO)) }
+                offset += count
+            }
+        }
+        guard fchmod(fd, mode_t(safeMode)) == 0, fsync(fd) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        guard close(fd) == 0 else {
+            fdOpen = false
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        fdOpen = false
+        guard rename(temp, path) == 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        shouldRemove = false
+    }
+}
+
+/// One refresh at a time. A timer request during a refresh is dropped; manual requests coalesce
+/// into at most one full follow-up round.
+final class RefreshGate {
+    private let lock = NSLock()
+    private var active = false
+    private var queuedManual = false
+
+    func begin(manual: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !active else { if manual { queuedManual = true }; return false }
+        active = true
+        return true
+    }
+
+    /// Returns true when the caller must immediately run the queued manual round.
+    func finish() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if queuedManual { queuedManual = false; return true }
+        active = false
+        return false
+    }
+}
+
+enum RefreshSchedule {
+    static func shouldRunSlow(manual: Bool, lastAttempt: Date?, now: Date) -> Bool {
+        manual || lastAttempt.map { now.timeIntervalSince($0) >= 300 } ?? true
+    }
+}
+
+enum DataFreshness {
+    static func updated(_ previous: Date?, succeeded: Bool, at: Date) -> Date? {
+        succeeded ? at : previous
+    }
+
+    static func isStale(lastSuccess: Date?, hasData: Bool, now: Date, after: TimeInterval) -> Bool {
+        guard hasData else { return false }
+        guard let lastSuccess = lastSuccess else { return true }
+        return now.timeIntervalSince(lastSuccess) > after
+    }
+}
 
 // MARK: - 凭证读取（与 Kimi 桌面端共用本地配置）
 
@@ -23,6 +128,46 @@ enum CredStore {
         let web = cred["kimiWeb"] as? [String: Any]
         return Credentials(codeApiKey: code?["apiKey"] as? String,
                            webToken: web?["accessToken"] as? String)
+    }
+
+    struct WebTokens {
+        var access: String
+        var refresh: String
+    }
+
+    static func webTokens(at path: String) -> WebTokens? {
+        guard let data = FileManager.default.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let credentials = obj["credentials"] as? [String: Any],
+              let web = credentials["kimiWeb"] as? [String: Any],
+              let access = web["accessToken"] as? String, !access.isEmpty,
+              let refresh = web["refreshToken"] as? String, !refresh.isEmpty else { return nil }
+        return WebTokens(access: access, refresh: refresh)
+    }
+
+    /// Merge only rotated Kimi web credentials into the latest document. If the official client
+    /// changed either auth field during the request, keep its values and return the fresh access token.
+    static func mergeWebTokens(at path: String, expected: WebTokens,
+                               access: String, refresh: String?) throws -> (access: String, wrote: Bool) {
+        guard let data = FileManager.default.contents(atPath: path),
+              var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var credentials = obj["credentials"] as? [String: Any],
+              var web = credentials["kimiWeb"] as? [String: Any],
+              let latestAccess = web["accessToken"] as? String,
+              let latestRefresh = web["refreshToken"] as? String else {
+            throw NSError(domain: "KimiUsage.CredStore", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "credential document missing required Kimi web fields"])
+        }
+        guard latestAccess == expected.access, latestRefresh == expected.refresh else {
+            return (latestAccess, false)
+        }
+        web["accessToken"] = access
+        if let refresh = refresh, !refresh.isEmpty { web["refreshToken"] = refresh }
+        credentials["kimiWeb"] = web
+        obj["credentials"] = credentials
+        let updated = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys])
+        try AtomicJSONFile.replace(updated, at: path)
+        return (access, true)
     }
 }
 
@@ -49,8 +194,25 @@ struct UsageData {
     var cliTokens7d: TokenStat?
     var cliTokens30d: TokenStat?
     var fiveHourError: String?
+    var sevenDayError: String?
     var monthError: String?
     var updatedAt: Date = Date()
+}
+
+enum ScanStateFile {
+    static func encoded<T: Encodable>(_ state: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(state)
+    }
+
+    /// Content-stable cache persistence: unchanged bytes are not rewritten.
+    @discardableResult
+    static func writeIfChanged(_ data: Data, to path: String) throws -> Bool {
+        if let old = FileManager.default.contents(atPath: path), old == data { return false }
+        try AtomicJSONFile.replace(data, at: path)
+        return true
+    }
 }
 
 // MARK: - 本地会话 token 统计（增量扫描 daimon wire.jsonl）
@@ -126,34 +288,29 @@ enum TokenAggregator {
         return s
     }
 
-    private static func saveState() {
-        guard let s = state,
-              let data = try? JSONEncoder().encode(s) else { return }
-        try? FileManager.default.createDirectory(
-            atPath: (statePath as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true)
-        try? data.write(to: URL(fileURLWithPath: statePath), options: [.atomic])
+    private static func saveState(_ s: ScanState) {
+        do { try ScanStateFile.writeIfChanged(ScanStateFile.encoded(s), to: statePath) }
+        catch { NSLog("[KimiUsage] scan cache save failed: %@", error.localizedDescription) }
     }
 
     /// Kimi Work 本地会话统计
-    static func aggregate() -> (TokenStat, TokenStat, TokenStat) {
+    static func aggregateBoth() -> (work: (TokenStat, TokenStat, TokenStat), cli: (TokenStat, TokenStat, TokenStat)) {
         lock.lock(); defer { lock.unlock() }
         var st = loadState()
         scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
-        state = st
-        saveState()
-        return buckets(st.work)
-    }
-
-    /// API 客户端（CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
-    static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
-        lock.lock(); defer { lock.unlock() }
-        var st = loadState()
         scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
         scanHermes(into: &st)
         state = st
-        saveState()
-        return buckets(st.cli, extraDays: st.hermes?.days)
+        saveState(st)
+        return (buckets(st.work), buckets(st.cli, extraDays: st.hermes?.days))
+    }
+
+    /// 兼容既有调用；主刷新使用 aggregateBoth 合并扫描和缓存写入。
+    static func aggregate() -> (TokenStat, TokenStat, TokenStat) { aggregateBoth().work }
+
+    /// API 客户端（CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
+    static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
+        aggregateBoth().cli
     }
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
@@ -388,19 +545,14 @@ enum Fetcher {
     /// 成功返回新 accessToken（寿命 ~30 天），失败返回 nil。
     static func refreshWebToken(completion: @escaping (String?) -> Void) {
         let path = CredStore.configPath
-        guard let data = FileManager.default.contents(atPath: path),
-              var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              var cred = obj["credentials"] as? [String: Any],
-              var web = cred["kimiWeb"] as? [String: Any],
-              let rt = web["refreshToken"] as? String, !rt.isEmpty else {
-            completion(nil); return
-        }
+        // Re-read immediately before the request because the official desktop client may rotate tokens.
+        guard let expected = CredStore.webTokens(at: path) else { completion(nil); return }
         guard let url = URL(string: "https://www.kimi.com/api/auth/token/refresh") else {
             completion(nil); return
         }
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "GET"
-        req.setValue("Bearer \(rt)", forHTTPHeaderField: "Authorization")
+        req.setValue("Bearer \(expected.refresh)", forHTTPHeaderField: "Authorization")
         req.setValue("mac", forHTTPHeaderField: "x-msh-platform")
         req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
@@ -408,26 +560,74 @@ enum Fetcher {
             guard err == nil, let data = data,
                   let http = resp as? HTTPURLResponse, http.statusCode == 200,
                   let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let at = body["access_token"] as? String else {
+                  let at = body["access_token"] as? String, !at.isEmpty else {
                 completion(nil); return
             }
-            web["accessToken"] = at
-            if let newRt = body["refresh_token"] as? String { web["refreshToken"] = newRt }
-            web["updatedAt"] = ISO8601DateFormatter().string(from: Date())
-            cred["kimiWeb"] = web
-            obj["credentials"] = cred
-            if let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]) {
-                try? out.write(to: URL(fileURLWithPath: path))
+            do {
+                let write = try CredStore.mergeWebTokens(at: path, expected: expected,
+                    access: at, refresh: body["refresh_token"] as? String)
+                if write.wrote { NSLog("[KimiUsage] web token self-refresh saved") }
+                else { NSLog("[KimiUsage] web token changed by Kimi client during refresh; kept latest credentials") }
+                completion(write.access)
+            } catch {
+                NSLog("[KimiUsage] web token refresh write failed: %@", error.localizedDescription)
+                completion(nil)
             }
-            NSLog("[KimiUsage] web token self-refresh OK")
-            completion(at)
         }.resume()
     }
 
     /// 5 小时 + 7 天窗口：kimi-code 用量接口
+    static func parseCodeUsagePayload(_ obj: [String: Any]) -> UsageData {
+        var result = UsageData()
+        if let usage = obj["usage"] as? [String: Any],
+           let limit = UsageNumber.finite(usage["limit"]), limit > 0,
+           let remaining = UsageNumber.finite(usage["remaining"]), remaining >= 0,
+           remaining <= limit {
+            result.sevenDayUsed = (limit - remaining) / limit
+            result.sevenDayReset = ISO.parse(usage["resetTime"] as? String)
+        } else {
+            result.sevenDayError = "missing or invalid 7D usage limit/remaining"
+        }
+
+        var sawFiveHour = false
+        if let limits = obj["limits"] as? [[String: Any]] {
+            for entry in limits {
+                guard let window = entry["window"] as? [String: Any],
+                      let detail = entry["detail"] as? [String: Any] else { continue }
+                let dur = window["duration"] as? Int ?? 0
+                let unit = window["timeUnit"] as? String ?? ""
+                let isFiveHour = (unit == "TIME_UNIT_MINUTE" && dur == 300)
+                    || (unit == "TIME_UNIT_HOUR" && dur == 5)
+                guard isFiveHour else { continue }
+                sawFiveHour = true
+                guard let limit = UsageNumber.finite(detail["limit"]), limit > 0 else { continue }
+                let ratio: Double?
+                if detail["used"] != nil {
+                    if let used = UsageNumber.finite(detail["used"]), used >= 0, used <= limit {
+                        ratio = used / limit
+                    } else { ratio = nil }
+                } else if let remaining = UsageNumber.finite(detail["remaining"]),
+                          remaining >= 0, remaining <= limit {
+                    ratio = (limit - remaining) / limit
+                } else { ratio = nil }
+                guard let validRatio = ratio else { continue }
+                result.fiveHourUsed = validRatio
+                result.fiveHourReset = ISO.parse(detail["resetTime"] as? String)
+                break
+            }
+        }
+        if result.fiveHourUsed == nil {
+            result.fiveHourError = sawFiveHour ? "invalid 5H usage limit/used/remaining" : "missing 5H window"
+        }
+        return result
+    }
+
     static func fetchCodeUsage(apiKey: String, completion: @escaping (UsageData) -> Void) {
         var result = UsageData()
-        guard let url = URL(string: "https://api.kimi.com/coding/v1/usages") else { return }
+        guard let url = URL(string: "https://api.kimi.com/coding/v1/usages") else {
+            result.fiveHourError = "bad url"; result.sevenDayError = "bad url"
+            completion(result); return
+        }
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
@@ -436,53 +636,38 @@ enum Fetcher {
             defer { completion(result) }
             guard err == nil, let data = data,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                result.fiveHourError = err?.localizedDescription ?? "bad response"
+                let reason = err?.localizedDescription ?? "bad response"
+                result.fiveHourError = reason
+                result.sevenDayError = reason
                 return
             }
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 result.fiveHourError = "HTTP \(http.statusCode)"
+                result.sevenDayError = "HTTP \(http.statusCode)"
                 return
             }
-            // 7 天窗口：usage.limit / remaining
-            if let usage = obj["usage"] as? [String: Any] {
-                let limit = Double(usage["limit"] as? String ?? "") ?? 0
-                let remaining = Double(usage["remaining"] as? String ?? "") ?? 0
-                if limit > 0 {
-                    result.sevenDayUsed = max(0, min(1, (limit - remaining) / limit))
-                    result.sevenDayReset = ISO.parse(usage["resetTime"] as? String)
-                }
-            }
-            // 5 小时窗口：limits[] 中 window.duration == 300 分钟
-            if let limits = obj["limits"] as? [[String: Any]] {
-                for entry in limits {
-                    guard let window = entry["window"] as? [String: Any],
-                          let detail = entry["detail"] as? [String: Any] else { continue }
-                    let dur = window["duration"] as? Int ?? 0
-                    let unit = window["timeUnit"] as? String ?? ""
-                    let isFiveHour = (unit == "TIME_UNIT_MINUTE" && dur == 300)
-                        || (unit == "TIME_UNIT_HOUR" && dur == 5)
-                    guard isFiveHour else { continue }
-                    let limit = Double(detail["limit"] as? String ?? "") ?? 0
-                    let used = Double(detail["used"] as? String ?? "") ?? 0
-                    let remaining = Double(detail["remaining"] as? String ?? "") ?? 0
-                    if limit > 0 {
-                        let ratio = used > 0 ? used / limit : max(0, (limit - remaining) / limit)
-                        result.fiveHourUsed = max(0, min(1, ratio))
-                        result.fiveHourReset = ISO.parse(detail["resetTime"] as? String)
-                    }
-                }
-            }
-            if result.fiveHourUsed == nil && result.sevenDayUsed == nil {
-                result.fiveHourError = "unexpected payload"
-            }
+            result = parseCodeUsagePayload(obj)
         }.resume()
     }
 
     /// 本月总额度：Kimi 订阅接口（OMNI 余额）
+    static func parseMonthUsagePayload(_ obj: [String: Any]) -> UsageData {
+        var result = UsageData()
+        if let balances = obj["balances"] as? [[String: Any]],
+           let balance = balances.first(where: { ($0["feature"] as? String) == "FEATURE_OMNI" }) {
+            result.monthUsed = UsageNumber.unitRatio(balance["amountUsedRatio"])
+            result.monthReset = ISO.parse(balance["expireTime"] as? String)
+            if result.monthUsed == nil { result.monthError = "invalid amountUsedRatio" }
+        } else {
+            result.monthError = "no omni balance"
+        }
+        return result
+    }
+
     static func fetchMonthUsage(webToken: String, completion: @escaping (UsageData) -> Void) {
         var result = UsageData()
         let urlStr = "https://www.kimi.com/apiv2/kimi.gateway.membership.v2.MembershipService/GetSubscription"
-        guard let url = URL(string: urlStr) else { return }
+        guard let url = URL(string: urlStr) else { result.monthError = "bad url"; completion(result); return }
         var req = URLRequest(url: url, timeoutInterval: 15)
         req.httpMethod = "POST"
         req.httpBody = "{}".data(using: .utf8)
@@ -503,15 +688,7 @@ enum Fetcher {
                 result.monthError = "HTTP \(http.statusCode)"
                 return
             }
-            if let balances = obj["balances"] as? [[String: Any]] {
-                for b in balances where (b["feature"] as? String) == "FEATURE_OMNI" {
-                    result.monthUsed = b["amountUsedRatio"] as? Double
-                    result.monthReset = ISO.parse(b["expireTime"] as? String)
-                }
-            }
-            if result.monthUsed == nil {
-                result.monthError = "no omni balance"
-            }
+            result = parseMonthUsagePayload(obj)
         }.resume()
     }
 }
@@ -589,18 +766,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var usage = UsageData()
+    private let refreshGate = RefreshGate()
     private let launchAgentLabel = "com.local.kimi-usage"
     // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
     // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
     // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
     private var lastMonthSuccessAt: Date?
-    private var monthFailCount = 0   // 月度拉取连续失败次数（偶发网络抖动不算故障）
+    private var lastFiveHourSuccessAt: Date?
+    private var lastSevenDaySuccessAt: Date?
+    private var workTokensLastSuccessAt: Date?
+    private var cliTokensLastSuccessAt: Date?
+    private var lastAttemptAt = Date()
+    private var lastSlowAttemptAt: Date?
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
-    // 两组数据各自的最后成功时间（5H/7D 服务端额度共用 quotaLastOK；token 统计本地扫描共用 tokensLastOK）
-    private var quotaLastOK: Date?
-    private var tokensLastOK: Date?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("[KimiUsage] launched, creating status item")
@@ -608,129 +788,145 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         rebuildMenu()
         renderBar()
-        refresh()
+        refresh(manual: true)
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        timer?.tolerance = 6
     }
 
-    // 拉取数据
-    private func refresh() {
+    // 额度每分钟刷新；月度和本地扫描按上次尝试时间每 5 分钟刷新。
+    private func refresh(manual: Bool = false) {
+        guard refreshGate.begin(manual: manual) else { return }
+        let now = Date()
+        let includeSlow = RefreshSchedule.shouldRunSlow(manual: manual, lastAttempt: lastSlowAttemptAt, now: now)
+        if includeSlow { lastSlowAttemptAt = now }
+        performRefresh(includeSlow: includeSlow)
+    }
+
+    // 本轮所有来源都汇合到一份结果；锁保护并发网络回调，group.leave 前先解锁。
+    private func performRefresh(includeSlow: Bool) {
+        lastAttemptAt = Date()
+        if includeSlow { lastSlowAttemptAt = lastAttemptAt }
+        renderBar()
+        rebuildMenu()
         let cred = CredStore.load()
         var merged = UsageData()
         let group = DispatchGroup()
+        let mergeLock = NSLock()
 
         if let key = cred.codeApiKey, !key.isEmpty {
             group.enter()
             Fetcher.fetchCodeUsage(apiKey: key) { r in
+                mergeLock.lock()
                 merged.fiveHourUsed = r.fiveHourUsed
                 merged.fiveHourReset = r.fiveHourReset
                 merged.sevenDayUsed = r.sevenDayUsed
                 merged.sevenDayReset = r.sevenDayReset
                 merged.fiveHourError = r.fiveHourError
+                merged.sevenDayError = r.sevenDayError
+                mergeLock.unlock()
                 group.leave()
             }
         } else {
             merged.fiveHourError = "no api key"
+            merged.sevenDayError = "no api key"
         }
 
-        if let token = cred.webToken, !token.isEmpty {
+        if includeSlow, let token = CredStore.load().webToken, !token.isEmpty {
             group.enter()
             Fetcher.fetchMonthUsage(webToken: token) { r in
                 if let err = r.monthError, err.contains("401") {
-                    // accessToken 过期：自己用 refreshToken 续期后重试，不再唤起 Kimi 桌面端
                     Fetcher.refreshWebToken { newToken in
                         if let newToken = newToken {
                             Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
+                                mergeLock.lock()
                                 merged.monthUsed = r2.monthUsed
                                 merged.monthReset = r2.monthReset
                                 merged.monthError = r2.monthError
+                                mergeLock.unlock()
                                 group.leave()
                             }
                         } else {
+                            mergeLock.lock()
                             merged.monthError = "HTTP 401（自刷新失败，请打开一次 Kimi 桌面端重新登录）"
+                            mergeLock.unlock()
                             group.leave()
                         }
                     }
                 } else {
+                    mergeLock.lock()
                     merged.monthUsed = r.monthUsed
                     merged.monthReset = r.monthReset
                     merged.monthError = r.monthError
+                    mergeLock.unlock()
                     group.leave()
                 }
             }
-        } else {
+        } else if includeSlow {
             merged.monthError = "no web token"
         }
 
-        // 本地会话 token 统计（后台线程扫描 wire.jsonl）：Kimi Work + 独立 CLI
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            let (t, w, m) = TokenAggregator.aggregate()
-            merged.tokensToday = t
-            merged.tokens7d = w
-            merged.tokens30d = m
-            let (ct, cw, cm) = TokenAggregator.aggregateCLI()
-            merged.cliTokensToday = ct
-            merged.cliTokens7d = cw
-            merged.cliTokens30d = cm
-            group.leave()
+        if includeSlow {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                let (work, cli) = TokenAggregator.aggregateBoth()
+                mergeLock.lock()
+                merged.tokensToday = work.0; merged.tokens7d = work.1; merged.tokens30d = work.2
+                merged.cliTokensToday = cli.0; merged.cliTokens7d = cli.1; merged.cliTokens30d = cli.2
+                mergeLock.unlock()
+                group.leave()
+            }
         }
 
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
-            // 必须在旧值回填之前判定：本次新拉/新算到的值非 nil 才算成功、才推进 lastOK，
-            // 由旧值回填得来的数据绝不更新 lastOK（否则断网时过期数据会被误标为新鲜）
-            if merged.fiveHourUsed != nil || merged.sevenDayUsed != nil {
-                self.quotaLastOK = Date()
+            let completedAt = Date()
+            self.lastFiveHourSuccessAt = DataFreshness.updated(self.lastFiveHourSuccessAt,
+                succeeded: merged.fiveHourUsed != nil, at: completedAt)
+            self.lastSevenDaySuccessAt = DataFreshness.updated(self.lastSevenDaySuccessAt,
+                succeeded: merged.sevenDayUsed != nil, at: completedAt)
+            if includeSlow {
+                self.lastMonthSuccessAt = DataFreshness.updated(self.lastMonthSuccessAt,
+                    succeeded: merged.monthError == nil && merged.monthUsed != nil, at: completedAt)
+                self.workTokensLastSuccessAt = DataFreshness.updated(self.workTokensLastSuccessAt,
+                    succeeded: merged.tokensToday != nil, at: completedAt)
+                self.cliTokensLastSuccessAt = DataFreshness.updated(self.cliTokensLastSuccessAt,
+                    succeeded: merged.cliTokensToday != nil, at: completedAt)
             }
-            // 会员月额度同样走网络拉取，lastMonthSuccessAt 即其 lastOK（口径同前，仅对齐到回填前）
-            if merged.monthError == nil && merged.monthUsed != nil {
-                self.lastMonthSuccessAt = Date()
-                self.monthFailCount = 0
-            } else if merged.monthError != nil {
-                self.monthFailCount += 1
-            }
-            // token 统计为本地计算：后台扫描块每次刷新必回填，tokensToday 非 nil 即本次新算成功
-            if merged.tokensToday != nil {
-                self.tokensLastOK = Date()
-            }
-            // 网络瞬断（如睡眠唤醒）导致本次拉取失败时，保留上次成功的数据，
-            // 避免菜单栏闪 "--"；错误提示逻辑已判断值为 nil 才显示，无需另清。
+
             let old = self.usage
-            if merged.fiveHourUsed == nil {
-                merged.fiveHourUsed = old.fiveHourUsed
-                merged.fiveHourReset = old.fiveHourReset
-            }
-            if merged.sevenDayUsed == nil {
-                merged.sevenDayUsed = old.sevenDayUsed
-                merged.sevenDayReset = old.sevenDayReset
-            }
-            if merged.monthUsed == nil {
-                merged.monthUsed = old.monthUsed
-                merged.monthReset = old.monthReset
+            if merged.fiveHourUsed == nil { merged.fiveHourUsed = old.fiveHourUsed; merged.fiveHourReset = old.fiveHourReset }
+            if merged.sevenDayUsed == nil { merged.sevenDayUsed = old.sevenDayUsed; merged.sevenDayReset = old.sevenDayReset }
+            if !includeSlow {
+                merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset; merged.monthError = old.monthError
+                merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
+                merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
+            } else if merged.monthUsed == nil {
+                merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset
             }
             self.usage = merged
             self.renderBar()
             self.rebuildMenu()
+            if self.refreshGate.finish() { self.performRefresh(includeSlow: true) }
         }
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
     // 无数据不算过期——菜单里本就显示"暂无数据"，无需再标注。
     private func isStale(_ lastOK: Date?, hasData: Bool, after: TimeInterval) -> Bool {
-        guard hasData else { return false }
-        guard let t = lastOK else { return true }
-        return Date().timeIntervalSince(t) > after
+        DataFreshness.isStale(lastSuccess: lastOK, hasData: hasData, now: Date(), after: after)
     }
-    private var quotaStale: Bool {
-        isStale(quotaLastOK, hasData: usage.fiveHourUsed != nil || usage.sevenDayUsed != nil,
-                after: quotaStaleAfter)
-    }
+    private var fiveHourStale: Bool { isStale(lastFiveHourSuccessAt, hasData: usage.fiveHourUsed != nil, after: quotaStaleAfter) }
+    private var sevenDayStale: Bool { isStale(lastSevenDaySuccessAt, hasData: usage.sevenDayUsed != nil, after: quotaStaleAfter) }
+    private var monthStale: Bool { isStale(lastMonthSuccessAt, hasData: usage.monthUsed != nil, after: 600) }
     private var tokensStale: Bool {
-        isStale(tokensLastOK, hasData: usage.tokensToday != nil || usage.tokens7d != nil
-            || usage.tokens30d != nil || usage.cliTokensToday != nil
-            || usage.cliTokens7d != nil || usage.cliTokens30d != nil, after: tokensStaleAfter)
+        isStale(workTokensLastSuccessAt, hasData: usage.tokensToday != nil || usage.tokens7d != nil || usage.tokens30d != nil,
+            after: tokensStaleAfter)
+    }
+    private var cliTokensStale: Bool {
+        isStale(cliTokensLastSuccessAt, hasData: usage.cliTokensToday != nil || usage.cliTokens7d != nil || usage.cliTokens30d != nil,
+            after: tokensStaleAfter)
     }
 
     // 已用量 → 余额（剩余比例）
@@ -742,14 +938,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；额度过期时两行加 ⚠️ 前缀
     // （5H/7D 同属服务端额度组，整组标注；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
-        let staleQuota = quotaStale
-        let line1 = (staleQuota ? "⚠️ " : "") + "5H \(Fmt.pct(remaining(usage.fiveHourUsed)))"
-        let line2 = (staleQuota ? "⚠️ " : "") + "7D \(Fmt.pct(remaining(usage.sevenDayUsed)))"
+        let line1 = (fiveHourStale ? "⚠️ " : "") + "5H \(Fmt.pct(remaining(usage.fiveHourUsed)))"
+        let line2 = (sevenDayStale ? "⚠️ " : "") + "7D \(Fmt.pct(remaining(usage.sevenDayUsed)))"
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
-        statusItem.button?.toolTip = "Kimi 余额 · 额度最后成功 \(Fmt.lastOK(quotaLastOK))"
-            + " · Token 最后成功 \(Fmt.lastOK(tokensLastOK))"
+        statusItem.button?.toolTip = "Kimi 余额 · 5H成功 \(Fmt.lastOK(lastFiveHourSuccessAt)) · 7D成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
+            + " · 月度成功 \(Fmt.lastOK(lastMonthSuccessAt)) · Work扫描成功 \(Fmt.lastOK(workTokensLastSuccessAt))"
+            + " · API扫描成功 \(Fmt.lastOK(cliTokensLastSuccessAt))"
         writeStatus(line1: line1, line2: line2)
     }
 
@@ -757,21 +953,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func writeStatus(line1: String, line2: String) {
         let dir = NSHomeDirectory() + "/Library/Application Support/KimiUsage"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let monthStatus: [String: Any] = [
+            "remaining": remaining(usage.monthUsed) ?? -1.0,
+            "error": usage.monthError ?? "",
+            "lastSuccessAt": lastMonthSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+        ]
         var info: [String: Any] = [
             "line1": line1,
             "line2": line2,
-            "updatedAt": Fmt.iso8601.string(from: Date()),
-            // 两组数据的最后成功时间（ISO8601，无则空串）与过期标记
-            "quotaLastOK": quotaLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
-            "tokensLastOK": tokensLastOK.map { Fmt.iso8601.string(from: $0) } ?? "",
-            "quotaStale": quotaStale,
-            "tokensStale": tokensStale,
-            "month": [
-                "remaining": remaining(usage.monthUsed) ?? -1,
-                "error": usage.monthError ?? "",
-                "failCount": monthFailCount,
-                "lastSuccessAt": lastMonthSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+            "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
+            "lastSuccessAt": [
+                "fiveHour": lastFiveHourSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
+                "sevenDay": lastSevenDaySuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
+                "month": lastMonthSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
+                "workTokens": workTokensLastSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
+                "cliTokens": cliTokensLastSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? ""
             ],
+            "errors": [
+                "fiveHour": usage.fiveHourError ?? "",
+                "sevenDay": usage.sevenDayError ?? "",
+                "month": usage.monthError ?? ""
+            ],
+            "fiveHourStale": fiveHourStale,
+            "sevenDayStale": sevenDayStale,
+            "monthStale": monthStale,
+            "tokensStale": tokensStale,
+            "cliTokensStale": cliTokensStale,
+            "month": monthStatus,
             "imageSize": [
                 "w": statusItem.button?.image?.size.width ?? -1,
                 "h": statusItem.button?.image?.size.height ?? -1
@@ -793,7 +1001,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             info["windowVisible"] = false
         }
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: .prettyPrinted) {
+        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
         }
         NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
@@ -812,17 +1020,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info("Kimi 余额"))
         menu.addItem(.separator())
 
-        let h5 = "5 小时余额：\(Fmt.pctLong(remaining(usage.fiveHourUsed)))"
+        var h5 = "5 小时余额：\(Fmt.pctLong(remaining(usage.fiveHourUsed)))"
             + (usage.fiveHourReset != nil ? "（\(Fmt.time(usage.fiveHourReset)) 重置）" : "")
-        let d7 = "7 天余额：\(Fmt.pctLong(remaining(usage.sevenDayUsed)))"
+        var d7 = "7 天余额：\(Fmt.pctLong(remaining(usage.sevenDayUsed)))"
             + (usage.sevenDayReset != nil ? "（\(Fmt.dayTime(usage.sevenDayReset)) 重置）" : "")
         var m30 = "本月总额度余额：\(Fmt.pctLong(remaining(usage.monthUsed)))"
             + (usage.monthReset != nil ? "（\(Fmt.dayTime(usage.monthReset)) 重置）" : "")
-        // 月度值是拉取失败时保留的旧值：连续失败 ≥3 次才标注，避免续 token 空窗期抖动
-        if usage.monthUsed != nil, let err = usage.monthError, monthFailCount >= 3 {
-            let at = lastMonthSuccessAt.map { Fmt.dayTime($0) } ?? "更早"
-            m30 += " ⚠️ 刷新失败（\(err)），数据停留在 \(at)"
-        }
+        if fiveHourStale { h5 += " ⚠️ 已过期" }
+        if sevenDayStale { d7 += " ⚠️ 已过期" }
+        if monthStale { m30 += " ⚠️ 已过期" }
+        if let err = usage.fiveHourError { h5 += " · 刷新失败：\(err)" }
+        if let err = usage.sevenDayError { d7 += " · 刷新失败：\(err)" }
+        if let err = usage.monthError { m30 += " · 刷新失败：\(err)" }
+        h5 += " · 成功 \(Fmt.lastOK(lastFiveHourSuccessAt))"
+        d7 += " · 成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
+        m30 += " · 成功 \(Fmt.lastOK(lastMonthSuccessAt))"
         menu.addItem(info(h5))
         menu.addItem(info(d7))
         menu.addItem(info(m30))
@@ -837,6 +1049,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(tokenLine("今日", usage.tokensToday)))
         menu.addItem(info(tokenLine("近 7 天", usage.tokens7d)))
         menu.addItem(info(tokenLine("近 30 天", usage.tokens30d)))
+        menu.addItem(info("Work 扫描最后成功：\(Fmt.lastOK(workTokensLastSuccessAt))"
+            + (tokensStale ? " · ⚠️ 已过期" : "")))
 
         // Token 用量（API 客户端：Kimi Code CLI / Proma / Claude Code / hermes 中的 Kimi 用量）
         menu.addItem(.separator())
@@ -844,24 +1058,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info(tokenLine("今日", usage.cliTokensToday)))
         menu.addItem(info(tokenLine("近 7 天", usage.cliTokens7d)))
         menu.addItem(info(tokenLine("近 30 天", usage.cliTokens30d)))
-
-        if let e = usage.fiveHourError, usage.fiveHourUsed == nil {
-            menu.addItem(info("5H/7D 获取失败：\(e)"))
-        }
-        if let e = usage.monthError, usage.monthUsed == nil {
-            menu.addItem(info("月度获取失败：\(e)"))
-        }
+        menu.addItem(info("API 客户端扫描最后成功：\(Fmt.lastOK(cliTokensLastSuccessAt))"
+            + (cliTokensStale ? " · ⚠️ 已过期" : "")))
 
         // 数据过期提示：仅对应组过期时显示，紧贴更新时间行（两组独立判定）
-        if quotaStale {
-            menu.addItem(info("⚠️ 额度数据已过期 · 最后成功 \(Fmt.lastOK(quotaLastOK))"))
-        }
         if tokensStale {
-            menu.addItem(info("⚠️ Token 数据已过期 · 最后成功 \(Fmt.lastOK(tokensLastOK))"))
+            menu.addItem(info("⚠️ Work Token 数据已过期 · 最后成功 \(Fmt.lastOK(workTokensLastSuccessAt))"))
         }
+        if cliTokensStale { menu.addItem(info("⚠️ API Token 数据已过期 · 最后成功 \(Fmt.lastOK(cliTokensLastSuccessAt))")) }
 
         menu.addItem(.separator())
-        menu.addItem(info("更新于 \(Fmt.time(usage.updatedAt))"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt)) · 各项成功时间见上方"))
         menu.addItem(.separator())
 
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")
@@ -914,12 +1121,151 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
-    @objc private func onRefresh() { refresh() }
+    @objc private func onRefresh() { refresh(manual: true) }
 
     @objc private func onQuit() { NSApp.terminate(nil) }
 }
 
+enum KimiOfflineRegression {
+    struct Failure: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    private static func expect(_ value: @autoclosure () -> Bool, _ message: String) throws {
+        if !value() { throw Failure(description: message) }
+    }
+
+    static func run() -> Int32 {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KimiUsage-self-test-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            try expect(UsageNumber.finite(Double.nan) == nil, "NaN accepted")
+            try expect(UsageNumber.finite("Infinity") == nil, "Infinity accepted")
+            try expect(UsageNumber.unitRatio("1.2") == nil, "out-of-range month ratio accepted")
+
+            let absent = Fetcher.parseCodeUsagePayload([:])
+            try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")
+            try expect(absent.sevenDayUsed == nil && absent.sevenDayError != nil, "missing 7D was not rejected")
+
+            let partial = Fetcher.parseCodeUsagePayload([
+                "usage": ["limit": "100", "remaining": "25"],
+                "limits": [["window": ["duration": 300, "timeUnit": "TIME_UNIT_MINUTE"],
+                            "detail": ["limit": "100", "used": "NaN", "remaining": "80"]]]
+            ])
+            try expect(partial.sevenDayUsed == 0.75, "valid 7D window lost when 5H invalid")
+            try expect(partial.fiveHourUsed == nil && partial.fiveHourError != nil,
+                       "invalid 5H fields were treated as zero or accepted")
+
+            let partialReverse = Fetcher.parseCodeUsagePayload([
+                "usage": ["limit": "NaN", "remaining": "0"],
+                "limits": [["window": ["duration": 5, "timeUnit": "TIME_UNIT_HOUR"],
+                            "detail": ["limit": "100", "used": "0"]]]
+            ])
+            try expect(partialReverse.fiveHourUsed == 0, "valid zero-use 5H value rejected")
+            try expect(partialReverse.sevenDayUsed == nil && partialReverse.sevenDayError != nil,
+                       "invalid 7D fields were treated as zero")
+            try expect(Fetcher.parseMonthUsagePayload(["balances": [
+                ["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]
+            ]]).monthUsed == 0.5, "valid monthly ratio rejected")
+            try expect(Fetcher.parseMonthUsagePayload(["balances": [
+                ["feature": "FEATURE_OMNI", "amountUsedRatio": "NaN"]
+            ]]).monthUsed == nil, "invalid monthly ratio accepted")
+
+            let gate = RefreshGate()
+            try expect(gate.begin(manual: false), "initial refresh gate did not open")
+            try expect(!gate.begin(manual: false), "overlapping timer refresh started")
+            try expect(!gate.begin(manual: true) && !gate.begin(manual: true), "manual overlap started immediately")
+            try expect(gate.finish(), "manual refresh was not coalesced into one follow-up")
+            try expect(!gate.begin(manual: false), "gate dropped active follow-up state")
+            try expect(!gate.finish() && gate.begin(manual: false), "gate was not released after follow-up")
+            let now = Date(timeIntervalSince1970: 1_000)
+            try expect(RefreshSchedule.shouldRunSlow(manual: false, lastAttempt: nil, now: now),
+                       "initial slow refresh was not due")
+            try expect(!RefreshSchedule.shouldRunSlow(manual: false, lastAttempt: now, now: now.addingTimeInterval(299)),
+                       "slow refresh ran before five minutes")
+            try expect(RefreshSchedule.shouldRunSlow(manual: false, lastAttempt: now, now: now.addingTimeInterval(300)),
+                       "slow refresh was not due after five minutes")
+            try expect(RefreshSchedule.shouldRunSlow(manual: true, lastAttempt: now, now: now),
+                       "manual refresh did not force slow items")
+            let successTime = Date(timeIntervalSince1970: 900)
+            try expect(DataFreshness.updated(successTime, succeeded: false, at: now) == successTime,
+                       "failed window advanced its last-success time")
+            try expect(DataFreshness.updated(successTime, succeeded: true, at: now) == now,
+                       "successful window did not advance independently")
+            try expect(DataFreshness.isStale(lastSuccess: successTime, hasData: true,
+                                             now: now, after: 50), "old retained value was not marked stale")
+
+            let authPath = root.appendingPathComponent("config.json").path
+            func document(_ access: String, _ refresh: String, _ extra: String) -> [String: Any] {
+                ["untouched": extra,
+                 "credentials": ["kimiWeb": ["accessToken": access, "refreshToken": refresh, "other": "keep"],
+                                 "kimiCode": ["apiKey": "fake-api-key"]]]
+            }
+            let initial = try JSONSerialization.data(withJSONObject: document("old-access", "old-refresh", "before"))
+            try initial.write(to: URL(fileURLWithPath: authPath))
+            try FileManager.default.setAttributes([.posixPermissions: 0o640], ofItemAtPath: authPath)
+            let expected = CredStore.WebTokens(access: "old-access", refresh: "old-refresh")
+
+            // Simulate Kimi changing both tokens while our HTTP request is in flight.
+            let clientUpdate = try JSONSerialization.data(withJSONObject: document("client-access", "client-refresh", "client-change"))
+            try clientUpdate.write(to: URL(fileURLWithPath: authPath), options: .atomic)
+            let beforeConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
+            let conflict = try CredStore.mergeWebTokens(at: authPath, expected: expected,
+                                                        access: "stale-response", refresh: "stale-refresh")
+            try expect(!conflict.wrote && conflict.access == "client-access", "client token rotation was overwritten")
+            let afterConflict = try Data(contentsOf: URL(fileURLWithPath: authPath))
+            try expect(afterConflict == beforeConflict,
+                       "conflict path modified the latest client document")
+
+            let latest = CredStore.WebTokens(access: "client-access", refresh: "client-refresh")
+            let success = try CredStore.mergeWebTokens(at: authPath, expected: latest,
+                                                       access: "rotated-access", refresh: "rotated-refresh")
+            try expect(success.wrote && success.access == "rotated-access", "credential rotation did not write")
+            let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: authPath))) as! [String: Any]
+            let savedCredentials = saved["credentials"] as! [String: Any]
+            let savedWeb = savedCredentials["kimiWeb"] as! [String: Any]
+            try expect(saved["untouched"] as? String == "client-change", "latest unrelated field was lost")
+            try expect(savedWeb["other"] as? String == "keep", "unrelated Kimi web field was lost")
+            try expect(savedWeb["accessToken"] as? String == "rotated-access"
+                       && savedWeb["refreshToken"] as? String == "rotated-refresh", "rotated auth values not saved")
+            let permissions = try FileManager.default.attributesOfItem(atPath: authPath)[.posixPermissions] as! NSNumber
+            try expect(permissions.intValue & 0o077 == 0, "credential file gained group/other access")
+
+            let failedTarget = root.appendingPathComponent("directory-target").path
+            try FileManager.default.createDirectory(atPath: failedTarget, withIntermediateDirectories: false)
+            try Data("marker".utf8).write(to: URL(fileURLWithPath: failedTarget).appendingPathComponent("marker"))
+            var writeFailed = false
+            do { try AtomicJSONFile.replace(Data("new".utf8), at: failedTarget) }
+            catch { writeFailed = true }
+            try expect(writeFailed, "atomic write failure was swallowed")
+
+            let cachePath = root.appendingPathComponent("scan-state.json").path
+            let cache = Data("{\"a\":1}".utf8)
+            let initialWrite = try ScanStateFile.writeIfChanged(cache, to: cachePath)
+            try expect(initialWrite, "initial cache write skipped")
+            let cacheDate = try FileManager.default.attributesOfItem(atPath: cachePath)[.modificationDate] as! Date
+            let secondWrite = try ScanStateFile.writeIfChanged(cache, to: cachePath)
+            try expect(!secondWrite, "unchanged cache was rewritten")
+            let cacheDateAfter = try FileManager.default.attributesOfItem(atPath: cachePath)[.modificationDate] as! Date
+            try expect(cacheDateAfter == cacheDate, "unchanged cache modification time changed")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, refresh gate/schedule, credential merge/permissions/failure, cache no-op)")
+            return 0
+        } catch {
+            fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
+            return 1
+        }
+    }
+}
+
 // MARK: - 入口（支持 --once 命令行自检）
+
+if CommandLine.arguments.contains("--self-test") {
+    exit(KimiOfflineRegression.run())
+}
 
 if CommandLine.arguments.contains("--once") {
     // 命令行自检模式：拉一次数据打印后退出
@@ -964,7 +1310,8 @@ if CommandLine.arguments.contains("--once") {
     } else { print("no kimiWeb token found") }
     _ = group.wait(timeout: .now() + 20)
     func rem(_ used: Double?) -> Double? { used.map { max(0, min(1, 1 - $0)) } }
-    let (tt, tw, tm) = TokenAggregator.aggregate()
+    let (work, cli) = TokenAggregator.aggregateBoth()
+    let (tt, tw, tm) = work
     print("menubar: 5H \(Fmt.pct(rem(merged.fiveHourUsed))) / 7D \(Fmt.pct(rem(merged.sevenDayUsed)))")
     print("5h remaining=\(Fmt.pctLong(rem(merged.fiveHourUsed))) reset=\(Fmt.dayTime(merged.fiveHourReset))")
     print("7d remaining=\(Fmt.pctLong(rem(merged.sevenDayUsed))) reset=\(Fmt.dayTime(merged.sevenDayReset))")
@@ -972,7 +1319,7 @@ if CommandLine.arguments.contains("--once") {
     print("tokens today: in=\(Fmt.tokens(tt.input)) out=\(Fmt.tokens(tt.output)) total=\(Fmt.tokens(tt.total))")
     print("tokens 7d:    in=\(Fmt.tokens(tw.input)) out=\(Fmt.tokens(tw.output)) total=\(Fmt.tokens(tw.total))")
     print("tokens 30d:   in=\(Fmt.tokens(tm.input)) out=\(Fmt.tokens(tm.output)) total=\(Fmt.tokens(tm.total))")
-    let (ct, cw, cm) = TokenAggregator.aggregateCLI()
+    let (ct, cw, cm) = cli
     print("api tokens today: in=\(Fmt.tokens(ct.input)) out=\(Fmt.tokens(ct.output)) total=\(Fmt.tokens(ct.total))")
     print("api tokens 7d:    in=\(Fmt.tokens(cw.input)) out=\(Fmt.tokens(cw.output)) total=\(Fmt.tokens(cw.total))")
     print("api tokens 30d:   in=\(Fmt.tokens(cm.input)) out=\(Fmt.tokens(cm.output)) total=\(Fmt.tokens(cm.total))")

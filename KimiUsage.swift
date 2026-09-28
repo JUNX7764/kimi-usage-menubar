@@ -1033,9 +1033,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let err = usage.fiveHourError { h5 += " · 刷新失败：\(err)" }
         if let err = usage.sevenDayError { d7 += " · 刷新失败：\(err)" }
         if let err = usage.monthError { m30 += " · 刷新失败：\(err)" }
-        h5 += " · 成功 \(Fmt.lastOK(lastFiveHourSuccessAt))"
-        d7 += " · 成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
-        m30 += " · 成功 \(Fmt.lastOK(lastMonthSuccessAt))"
+        if lastFiveHourSuccessAt != nil, fiveHourStale || usage.fiveHourError != nil {
+            h5 += " · 成功 \(Fmt.lastOK(lastFiveHourSuccessAt))"
+        }
+        if lastSevenDaySuccessAt != nil, sevenDayStale || usage.sevenDayError != nil {
+            d7 += " · 成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
+        }
+        if lastMonthSuccessAt != nil, monthStale || usage.monthError != nil {
+            m30 += " · 成功 \(Fmt.lastOK(lastMonthSuccessAt))"
+        }
         menu.addItem(info(h5))
         menu.addItem(info(d7))
         menu.addItem(info(m30))
@@ -1062,14 +1068,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(info("API 客户端扫描最后成功：\(Fmt.lastOK(cliTokensLastSuccessAt))"
             + (cliTokensStale ? " · ⚠️ 已过期" : "")))
 
-        // 数据过期提示：仅对应组过期时显示，紧贴更新时间行（两组独立判定）
-        if tokensStale {
-            menu.addItem(info("⚠️ Work Token 数据已过期 · 最后成功 \(Fmt.lastOK(workTokensLastSuccessAt))"))
-        }
-        if cliTokensStale { menu.addItem(info("⚠️ API Token 数据已过期 · 最后成功 \(Fmt.lastOK(cliTokensLastSuccessAt))")) }
-
         menu.addItem(.separator())
-        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt)) · 各项成功时间见上方"))
+        menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt))"))
         menu.addItem(.separator())
 
         let refreshItem = NSMenuItem(title: "立即刷新", action: #selector(onRefresh), keyEquivalent: "r")

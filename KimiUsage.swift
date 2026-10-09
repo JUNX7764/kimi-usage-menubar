@@ -535,6 +535,18 @@ enum TokenAggregator {
     }
 }
 
+/// Token 窗口明细的树形行：今日/近 7 天/近 30 天各一行，├ 分支 └ 收尾、两空格缩进
+/// （与 GlmUsage 的模型明细、CodexUsage 的窗口明细同款呈现）；无数据显示「暂无记录」
+enum TokenWindowLines {
+    static func render(_ rows: [(label: String, stat: TokenStat?)]) -> [String] {
+        rows.enumerated().map { index, row in
+            let branch = index < rows.count - 1 ? "├" : "└"
+            guard let s = row.stat, !s.isEmpty else { return "  \(branch) \(row.label)：暂无记录" }
+            return "  \(branch) \(row.label)：入 \(Fmt.tokens(s.input)) · 出 \(Fmt.tokens(s.output)) · 计 \(Fmt.tokens(s.total))"
+        }
+    }
+}
+
 enum ISO {
     // formatter 创建有开销，复用静态实例（旧实现每次调用新建，全量扫描时是热点）
     private static let frac: ISO8601DateFormatter = {
@@ -1065,20 +1077,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Token 用量（本地会话统计）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（Kimi Work 本地会话）"))
-        func tokenLine(_ label: String, _ s: TokenStat?) -> String {
-            guard let s = s, !s.isEmpty else { return "\(label)：暂无记录" }
-            return "\(label)：入 \(Fmt.tokens(s.input)) · 出 \(Fmt.tokens(s.output)) · 计 \(Fmt.tokens(s.total))"
-        }
-        menu.addItem(info(tokenLine("今日", usage.tokensToday)))
-        menu.addItem(info(tokenLine("近 7 天", usage.tokens7d)))
-        menu.addItem(info(tokenLine("近 30 天", usage.tokens30d)))
+        for line in TokenWindowLines.render([
+            ("今日", usage.tokensToday), ("近 7 天", usage.tokens7d), ("近 30 天", usage.tokens30d)
+        ]) { menu.addItem(info(line)) }
 
         // Token 用量（API 客户端：Kimi Code CLI / Proma / Claude Code / hermes 中的 Kimi 用量）
         menu.addItem(.separator())
         menu.addItem(info("Token 用量（API 客户端 · 仅 Kimi 模型）"))
-        menu.addItem(info(tokenLine("今日", usage.cliTokensToday)))
-        menu.addItem(info(tokenLine("近 7 天", usage.cliTokens7d)))
-        menu.addItem(info(tokenLine("近 30 天", usage.cliTokens30d)))
+        for line in TokenWindowLines.render([
+            ("今日", usage.cliTokensToday), ("近 7 天", usage.cliTokens7d), ("近 30 天", usage.cliTokens30d)
+        ]) { menu.addItem(info(line)) }
 
         // 扫描状态行仅在数据过期时显示（正常状态保持菜单简洁）
         if tokensStale {
@@ -1282,7 +1290,21 @@ enum KimiOfflineRegression {
             let cacheDateAfter = try FileManager.default.attributesOfItem(atPath: cachePath)[.modificationDate] as! Date
             try expect(cacheDateAfter == cacheDate, "unchanged cache modification time changed")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, refresh gate/schedule, credential merge/permissions/failure, cache no-op)")
+            // Token 窗口树形行：├/└ 分支、两空格缩进，空数据显示「暂无记录」
+            let windowTree = TokenWindowLines.render([
+                ("今日", TokenStat(input: 1234, output: 56)),
+                ("近 7 天", nil),
+                ("近 30 天", TokenStat(input: 0, output: 0))
+            ])
+            try expect(windowTree == [
+                "  ├ 今日：入 1.23K · 出 56 · 计 1.29K",
+                "  ├ 近 7 天：暂无记录",
+                "  └ 近 30 天：暂无记录"
+            ], "token window tree lines did not render with branch symbols")
+            try expect(TokenWindowLines.render([]).isEmpty,
+                       "empty token window rows still rendered lines")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

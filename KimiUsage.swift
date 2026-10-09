@@ -230,10 +230,13 @@ enum TokenAggregator {
         + "/Library/Application Support/kimi-desktop/daimon-share/daimon/runtime/kimi-code/home/sessions"
     // API 客户端会话目录：独立 Kimi Code CLI + Proma / Claude Code（Claude SDK 可混接多家 API）
     // 注意：Proma 会话日志位置两度迁移：sdk-config/projects →（≈2026-07）sdk-config/sessions →（≈2026-08-26）agent-sessions
+    //（2026-10-09 实测：sdk-config/sessions 与 agent-sessions 是同一批会话的并行双写——
+    //  近 40 天所有 Kimi 会话 workspace 两侧全有，简单会话数值完全一致、重会话 sdk 侧
+    //  多记子请求/续写调用；两者都扫会双算，近 40 天多记 226.8M。只取 agent-sessions，
+    //  与 Token Monitor 的 proma 来源同款口径；sdk 侧 08-26 前独有历史在 30 天窗口外）
     static let apiSessionsRoots = [
         NSHomeDirectory() + "/.kimi-code/sessions",
         NSHomeDirectory() + "/.proma/sdk-config/projects",
-        NSHomeDirectory() + "/.proma/sdk-config/sessions",
         NSHomeDirectory() + "/.proma/agent-sessions",
         NSHomeDirectory() + "/.claude/projects"
     ]
@@ -255,8 +258,9 @@ enum TokenAggregator {
         var days: [String: [Double]] = [:]   // dayKey -> [input, output]
     }
 
+    // v2：proma 源去掉 sdk-config/sessions 双写目录（口径变更）后弃用 v1 缓存强制重建
     static let statePath = NSHomeDirectory()
-        + "/Library/Application Support/KimiUsage/scan-state.json"
+        + "/Library/Application Support/KimiUsage/scan-state-v2.json"
     private static var state: ScanState?
     private static let lock = NSLock()
 
@@ -314,6 +318,15 @@ enum TokenAggregator {
         aggregateBoth().cli
     }
 
+    /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回。
+    /// 枚举器产出的 url.path 是 realpath 形式（如 /var → /private/var；URL 的
+    /// resolvingSymlinksInPath 不解析根级链接），前缀清理必须同口径才能匹配上
+    private static func realPath(_ p: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(p, &buf) != nil else { return p }
+        return String(cString: buf)
+    }
+
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
     /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）
     private static func scan(roots: [String], kimiOnly: Bool,
@@ -331,7 +344,7 @@ enum TokenAggregator {
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles])
             else { continue }
-            enumedRoots.append(root)
+            enumedRoots.append(realPath(root))
 
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 let path = url.path
@@ -369,9 +382,12 @@ enum TokenAggregator {
         }
 
         // 枚举成功的 root 里已不存在的文件：从状态剔除，停止计入窗口
-        // （枚举失败的 root 不动，避免目录临时不可用时误清状态）
-        for path in files.keys where !seen.contains(path)
-            && enumedRoots.contains(where: { path.hasPrefix($0 + "/") }) {
+        // （枚举失败的 root 不动，避免目录临时不可用时误清状态；
+        //  先快照再删——迭代中变更字典可能跳过条目）
+        let vanished = files.keys.filter { path in
+            !seen.contains(path) && enumedRoots.contains(where: { path.hasPrefix($0 + "/") })
+        }
+        for path in vanished {
             files.removeValue(forKey: path)
         }
     }

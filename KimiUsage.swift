@@ -818,13 +818,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         renderBar()
         refresh(manual: true)
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refresh()
         }
         timer?.tolerance = 6
     }
 
-    // 额度每分钟刷新；月度和本地扫描按上次尝试时间每 5 分钟刷新。
+    // 额度每 30s 刷新；月度和本地扫描按上次尝试时间每 5 分钟刷新。
     private func refresh(manual: Bool = false) {
         guard refreshGate.begin(manual: manual) else { return }
         let now = Date()

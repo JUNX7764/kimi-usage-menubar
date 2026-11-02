@@ -16,15 +16,19 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
   - 各窗口分别保留最后成功时间；失败时保留旧值，同时显示刷新错误与过期状态
   - 「最近尝试刷新」表示请求开始时间
 
-## 安装与构建
+## 安装与更新
 
-需要 macOS 13+ 与 Xcode Command Line Tools（未装先执行 `xcode-select --install`，自带 `swiftc`）：
+需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/kimi-usage-menubar/releases) 下载最新 `KimiUsage.dmg`，打开后把 KimiUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+
+**更新**：发布新 Release 后（每 2 小时检查一次），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启。日常代码提交不会触发更新提示——只有正式发版才会。
+
+从源码构建（开发者，需要 Xcode Command Line Tools，未装先执行 `xcode-select --install`）：
 
 ```bash
 ./build.sh
 ```
 
-产物 `KimiUsage.app`，拖到 `/Applications` 双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——打 tag → 构建 → 打包 DMG/zip → 创建 GitHub Release 上传产物。
 
 ## 原理
 

@@ -28,7 +28,7 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 ./build.sh
 ```
 
-发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——打 tag → 构建 → 打包 DMG/zip → 创建 GitHub Release 上传产物。
+发布新版本（开发者，要求工作区干净且已推送）：`scripts/release.sh v1.2.3`——创建本地 tag → 构建与离线自测 → 签名及 DMG/zip 校验 → 推送 tag → 创建 GitHub Release。验证失败不会推送远端 tag。
 
 ## 原理
 
@@ -47,6 +47,9 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 ```bash
 # 离线自检：只用临时目录和假凭据，不访问真实凭据、网络或会话缓存
 ./KimiUsage.app/Contents/MacOS/KimiUsage --self-test
+
+# 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
+python3 -m unittest discover -s tests -p '*_test.py'
 ```
 
 ## 文件说明
@@ -59,6 +62,9 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 | `AppIcon.icns` / `AppIcon.iconset/` | 应用图标 |
 | `icon_gen.py` | 图标生成脚本 |
 | `icon_*.png` | 图标设计候选稿 |
+| `scripts/update.sh` | Release 下载、暂存、换包、健康检查与失败回滚 |
+| `scripts/release.sh` | 本地 tag、构建测试、资产校验与 GitHub Release 发布 |
+| `tests/script_test.py` | 更新、发布、签名故障的离线回归测试 |
 
 ## License
 

@@ -247,6 +247,8 @@ enum TokenAggregator {
     struct FileScanState: Codable {
         var offset: UInt64 = 0
         var days: [String: [Double]] = [:]
+        /// Kimi Work 新旧格式混存：文件内一旦出现 usage.record，就只取 record，跳过 loop 镜像。
+        var preferUsageRecord: Bool = false
     }
     struct ScanState: Codable {
         var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
@@ -272,9 +274,9 @@ enum TokenAggregator {
         }
     }
 
-    // v3：修 Kimi Code / Proma 双算、Hermes 换 key 回填双算，并接入 ZCode；弃用 v2 缓存强制重建
+    // v4：Kimi Work 按文件选择 usage.record / loop 镜像，修双写双算；弃用 v3 缓存强制重建
     static let statePath = NSHomeDirectory()
-        + "/Library/Application Support/KimiUsage/scan-state-v3.json"
+        + "/Library/Application Support/KimiUsage/scan-state-v4.json"
     private static var state: ScanState?
     private static let lock = NSLock()
 
@@ -326,7 +328,7 @@ enum TokenAggregator {
         return (d.work, d.cli)
     }
 
-    static func aggregateBothDetailed() -> BothStats {
+    static func aggregateBothDetailed(persist: Bool = true) -> BothStats {
         lock.lock(); defer { lock.unlock() }
         var st = loadState()
         let workScan = scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
@@ -342,7 +344,7 @@ enum TokenAggregator {
             zcodeOK = zcodeDays != nil
         }
         state = st
-        saveState(st)
+        if persist { saveState(st) }
         var extraDays = st.hermes?.days ?? [:]
         if let zcodeDays {
             for (day, v) in zcodeDays {
@@ -393,8 +395,8 @@ enum TokenAggregator {
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
     /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）。
     /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面
-    private static func scan(roots: [String], kimiOnly: Bool,
-                             into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int) {
+    static func scan(roots: [String], kimiOnly: Bool,
+                     into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
@@ -441,7 +443,17 @@ enum TokenAggregator {
                 guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
                 let consumed = st.offset + UInt64(lastNL + 1)
                 if let text = String(data: data[..<lastNL], encoding: .utf8) {
-                    parseLines(text, kimiOnly: kimiOnly, cutoffKey: cutoffKey, into: &st)
+                    if !kimiOnly && !st.preferUsageRecord && containsUsageRecord(text) {
+                        // 已消费过 loop 的旧文件：发现 record 后清零，下轮从 0 重扫，撤掉镜像贡献。
+                        if st.offset > 0 {
+                            st = FileScanState(preferUsageRecord: true)
+                            files[path] = st
+                            continue
+                        }
+                        st.preferUsageRecord = true
+                    }
+                    parseLines(text, kimiOnly: kimiOnly, cutoffKey: cutoffKey,
+                               preferUsageRecord: st.preferUsageRecord, into: &st)
                 }
                 st.offset = consumed
                 st.days = st.days.filter { $0.key >= cutoffKey }
@@ -486,7 +498,10 @@ enum TokenAggregator {
         let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
         var hs = st.hermes ?? HermesState()
         var alive = Set<String>()
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { return false }
             func col(_ i: Int32) -> String {
                 sqlite3_column_text(stmt, i).map { String(cString: $0) } ?? ""
             }
@@ -543,7 +558,10 @@ enum TokenAggregator {
         sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
         let cutoffKey = dayFmt.string(from: cutoff)
         var days: [String: [Double]] = [:]
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { return nil }
             let model = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
             guard isKimiModel(model) else { continue }
             let startedAt = sqlite3_column_double(stmt, 3)
@@ -558,9 +576,21 @@ enum TokenAggregator {
         return days
     }
 
+    private static func containsUsageRecord(_ text: String) -> Bool {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true)
+        where line.contains("usage.record") {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            if obj["type"] as? String == "usage.record" { return true }
+        }
+        return false
+    }
+
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
     static func parseLines(_ text: String, kimiOnly: Bool,
-                           cutoffKey: String, into st: inout FileScanState) {
+                           cutoffKey: String, preferUsageRecord: Bool = false,
+                           into st: inout FileScanState) {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true)
         where line.contains("\"usage\"") {
             guard let data = line.data(using: .utf8),
@@ -571,9 +601,9 @@ enum TokenAggregator {
             if obj["modelUsage"] != nil { continue }
             let rowType = obj["type"] as? String
             if kimiOnly && rowType == "result" { continue }
-            // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写；
-            // API 统计只取前者。Kimi Work 只有后者，因此 work 路径（kimiOnly=false）仍保留。
-            if kimiOnly && rowType == "context.append_loop_event" { continue }
+            // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写。
+            // API 只取前者；Kimi Work 旧文件只有 loop 时保留 loop，新文件出现 record 后只取 record。
+            if rowType == "context.append_loop_event" && (kimiOnly || preferUsageRecord) { continue }
             // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
             let t: Date
             if let ms = obj["time"] as? Double {
@@ -2705,7 +2735,30 @@ enum KimiOfflineRegression {
             var workFile = TokenAggregator.FileScanState()
             try TokenAggregator.parseLines(jsonLine(loopMirror), kimiOnly: false,
                                            cutoffKey: "0000-00-00", into: &workFile)
-            try expect(totals(workFile) == [35, 2], "Kimi Work loop event was lost")
+            try expect(totals(workFile) == [35, 2], "legacy Kimi Work loop event was lost")
+            var workMixed = TokenAggregator.FileScanState()
+            try TokenAggregator.parseLines([jsonLine(usageRecord), jsonLine(loopMirror)].joined(separator: "\n"),
+                                           kimiOnly: false, cutoffKey: "0000-00-00",
+                                           preferUsageRecord: true, into: &workMixed)
+            try expect(totals(workMixed) == [35, 2], "Kimi Work record + loop mirror was double-counted")
+
+            // 增量格式升级：先只有 loop，追加 record 后自动清零重扫，最终只留 record。
+            let workRoot = root.appendingPathComponent("work-scan").path
+            try FileManager.default.createDirectory(atPath: workRoot, withIntermediateDirectories: true)
+            let workPath = workRoot + "/wire.jsonl"
+            try (try jsonLine(loopMirror) + "\n").write(toFile: workPath, atomically: true, encoding: .utf8)
+            var workFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
+            try expect(workFiles.values.first.map(totals) == [35, 2], "initial loop-only work scan is wrong")
+            let append = try FileHandle(forWritingTo: URL(fileURLWithPath: workPath))
+            append.seekToEndOfFile()
+            append.write(Data((try jsonLine(usageRecord) + "\n").utf8))
+            try append.close()
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
+            try expect(workFiles.values.first?.preferUsageRecord == true && workFiles.values.first.map(totals) == [0, 0],
+                       "work format upgrade did not reset old mirror contributions")
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
+            try expect(workFiles.values.first.map(totals) == [35, 2], "work record-only rescan is wrong")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]
@@ -2786,7 +2839,7 @@ enum KimiOfflineRegression {
             try expect(!UpdateCheck.isOutdated(local: "", remote: "v1.0.0"), "empty local version flagged outdated")
             try expect(!UpdateCheck.isOutdated(local: "abc", remote: "1.2"), "non-numeric local version flagged outdated")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op, update check release version compare)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op, update check release version compare)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
@@ -2802,8 +2855,8 @@ if CommandLine.arguments.contains("--self-test") {
 }
 
 if CommandLine.arguments.contains("--tokens-once") {
-    // 纯本地验收：不读凭据、不联网，只重建并打印两类 token 统计。
-    let detailed = TokenAggregator.aggregateBothDetailed()
+    // 纯本地验收：不读凭据、不联网、不写扫描状态，只打印两类 token 统计。
+    let detailed = TokenAggregator.aggregateBothDetailed(persist: false)
     if let e = detailed.workError { print("work tokens error: \(e)") }
     if let e = detailed.cliError { print("api tokens error: \(e)") }
     func printTokens(_ label: String, _ stats: (TokenStat, TokenStat, TokenStat)) {

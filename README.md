@@ -51,7 +51,7 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 # 离线自检：只用临时目录和假凭据，不访问真实凭据、网络或会话缓存
 ./KimiUsage.app/Contents/MacOS/KimiUsage --self-test
 
-# 纯本地 token 对账：不读取凭据、不联网，重建并打印两类会话统计
+# 纯本地 token 对账：不读取凭据、不联网、不写扫描状态，只读聚合并打印两类统计
 ./KimiUsage.app/Contents/MacOS/KimiUsage --tokens-once
 
 # 固定假数据交互预览：不读取凭据、扫描缓存或写入状态，也不联网

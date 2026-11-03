@@ -197,6 +197,8 @@ struct UsageData {
     var fiveHourError: String?
     var sevenDayError: String?
     var monthError: String?
+    var workTokensError: String?   // Work 会话目录已安装但不可读（保留旧值、不推进成功时间）
+    var cliTokensError: String?    // API 客户端来源全部不可读（同上）
     var updatedAt: Date = Date()
 }
 
@@ -298,16 +300,50 @@ enum TokenAggregator {
         catch { NSLog("[KimiUsage] scan cache save failed: %@", error.localizedDescription) }
     }
 
+    /// 双路统计 + 失败面：work/cli 各自的错误（已安装来源全部不可读时非 nil）
+    struct BothStats {
+        var work: (TokenStat, TokenStat, TokenStat)
+        var cli: (TokenStat, TokenStat, TokenStat)
+        var workError: String?
+        var cliError: String?
+    }
+
     /// Kimi Work 本地会话统计
     static func aggregateBoth() -> (work: (TokenStat, TokenStat, TokenStat), cli: (TokenStat, TokenStat, TokenStat)) {
+        let d = aggregateBothDetailed()
+        return (d.work, d.cli)
+    }
+
+    static func aggregateBothDetailed() -> BothStats {
         lock.lock(); defer { lock.unlock() }
         var st = loadState()
-        scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
-        scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
-        scanHermes(into: &st)
+        let workScan = scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
+        let cliScan = scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
+        var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
+        if FileManager.default.fileExists(atPath: hermesDBPath) {
+            hermesOK = scanHermes(into: &st)
+        }
         state = st
         saveState(st)
-        return (buckets(st.work), buckets(st.cli, extraDays: st.hermes?.days))
+        return BothStats(
+            work: buckets(st.work), cli: buckets(st.cli, extraDays: st.hermes?.days),
+            workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
+            cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated, hermesOK: hermesOK))
+    }
+
+    /// 失败面判定：有已安装来源（目录存在 / hermes 库存在）但无一可读 → 错误；
+    /// 全部未安装（路径不存在）返回 nil——没装对应工具时该来源自然为 0，不算失败；
+    /// 部分来源可读仍按成功（增量状态保留旧贡献，下轮自愈）
+    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?) -> String? {
+        let anySource = installed > 0 || hermesOK != nil
+        let anySuccess = enumerated > 0 || hermesOK == true
+        return (anySource && !anySuccess) ? "会话目录 / hermes state.db 均不可读" : nil
+    }
+
+    /// 窗口起算日：含今天共 7 / 30 个日历日（2026-11-03 起；此前为 8 / 31 天）
+    static func windowCutoffs(now: Date) -> (d7: String, d30: String) {
+        (dayFmt.string(from: now.addingTimeInterval(-6 * 86400)),
+         dayFmt.string(from: now.addingTimeInterval(-29 * 86400)))
     }
 
     /// 兼容既有调用；主刷新使用 aggregateBoth 合并扫描和缓存写入。
@@ -328,19 +364,24 @@ enum TokenAggregator {
     }
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
-    /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）
+    /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）。
+    /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面
     private static func scan(roots: [String], kimiOnly: Bool,
-                             into files: inout [String: FileScanState]) {
+                             into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
         var seen = Set<String>()
         var enumedRoots: [String] = []
+        var installed = 0
 
         for root in roots {
-            let rootURL = URL(fileURLWithPath: root)
-            guard let enumerator = FileManager.default.enumerator(
-                at: rootURL,
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir) else { continue }
+            installed += 1
+            // 不是目录（异常）或枚举失败都算该 root 不可读；未枚举成功不入 enumedRoots
+            guard isDir.boolValue, let enumerator = FileManager.default.enumerator(
+                at: URL(fileURLWithPath: root),
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles])
             else { continue }
@@ -390,6 +431,7 @@ enum TokenAggregator {
         for path in vanished {
             files.removeValue(forKey: path)
         }
+        return (installed, enumedRoots.count)
     }
 
     // hermes 用量库（sqlite，只读打开，绝不写入）
@@ -399,10 +441,11 @@ enum TokenAggregator {
     /// （全表仅千余行、命中百余行，每次刷新一次查询开销可忽略，不新增定时器）；
     /// 与持久化的上次快照做差，delta 按 last_seen 归日。首次运行会把存量行的累计值
     /// 归入各自 last_seen 当天，相当于自动回填近 30 天窗口。
-    private static func scanHermes(into st: inout ScanState) {
+    /// 返回是否成功读取（库文件不存在由调用方先行排除，不算失败）。
+    private static func scanHermes(into st: inout ScanState) -> Bool {
         var db: OpaquePointer?
         guard sqlite3_open_v2(hermesDBPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
-        else { return }
+        else { return false }
         defer { sqlite3_close(db) }
         let sql = """
             SELECT session_id, model, billing_provider, billing_base_url, billing_mode, task,
@@ -411,7 +454,7 @@ enum TokenAggregator {
             WHERE billing_base_url LIKE '%kimi.com%' OR billing_base_url LIKE '%moonshot%'
             """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
 
         let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
@@ -445,6 +488,7 @@ enum TokenAggregator {
         hs.rows = hs.rows.filter { alive.contains($0.key) }
         hs.days = hs.days.filter { $0.key >= cutoffKey }
         st.hermes = hs
+        return true
     }
 
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
@@ -508,8 +552,7 @@ enum TokenAggregator {
         -> (TokenStat, TokenStat, TokenStat) {
         let now = Date()
         let todayKey = dayFmt.string(from: now)
-        let d7Key = dayFmt.string(from: now.addingTimeInterval(-7 * 86400))
-        let d30Key = dayFmt.string(from: now.addingTimeInterval(-30 * 86400))
+        let (d7Key, d30Key) = windowCutoffs(now: now)
         var today = TokenStat(), week = TokenStat(), month = TokenStat()
         var allDays: [String: [Double]] = [:]
         for (_, st) in files {
@@ -758,12 +801,22 @@ enum Fmt {
         guard let v = v else { return "暂无数据" }
         return String(format: "%.2f%%", v * 100)
     }
-    static func time(_ d: Date?) -> String {
-        guard let d = d else { return "" }
+    // 展示用 formatter 静态缓存：菜单每轮重建要调多次，新建 DateFormatter 开销大
+    private static let timeFmt: DateFormatter = {
         let f = DateFormatter()
         f.locale = Locale(identifier: "zh_CN")
         f.dateFormat = "HH:mm"
-        return f.string(from: d)
+        return f
+    }()
+    private static let dayTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MM-dd HH:mm"
+        return f
+    }()
+    static func time(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        return timeFmt.string(from: d)
     }
     // 最后成功时间的占位口径：无记录用 "--"（time() 对 nil 返回空串，不适合过期提示行）
     static func lastOK(_ d: Date?) -> String {
@@ -774,10 +827,7 @@ enum Fmt {
     static let iso8601 = ISO8601DateFormatter()
     static func dayTime(_ d: Date?) -> String {
         guard let d = d else { return "" }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "MM-dd HH:mm"
-        return f.string(from: d)
+        return dayTimeFmt.string(from: d)
     }
     // token 数量缩写：999 / 12.3K / 1.23M / 1.23B
     static func tokens(_ v: Double) -> String {
@@ -807,8 +857,8 @@ enum BuildInfo {
 enum UpdateCheck {
     static let apiURL = URL(string: "https://api.github.com/repos/JUNX7764/kimi-usage-menubar/releases/latest")!
     static let releasesPage = URL(string: "https://github.com/JUNX7764/kimi-usage-menubar/releases")!
-    /// GitHub 匿名限额 60 次/小时/IP，2 小时一查绰绰有余
-    static let interval: TimeInterval = 2 * 3600
+    /// GitHub 匿名限额 60 次/小时/IP，30 分钟一查仅 2 次/小时；ETag/304 条件请求不耗配额
+    static let interval: TimeInterval = 30 * 60
 
     /// 版本号归一化：v1.0.1 / v1.0.1-3-gabc / v1.0.1-dirty → [1, 0, 1]；
     /// 破折号后缀（预发布/dirty/git describe 尾巴）丢弃，任一段非数字视为无法比较
@@ -883,12 +933,15 @@ final class UpdateChecker {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
     private var usage = UsageData()
     private let refreshGate = RefreshGate()
+    // 菜单打开期间不重建菜单（避免打开中的菜单被替换闪断），关闭时补一次
+    private var menuOpen = false
+    private var pendingMenuRebuild = false
     private let launchAgentLabel = "com.local.kimi-usage"
     // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
     // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
@@ -915,7 +968,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.refresh()
         }
         timer?.tolerance = 6
-        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 2 小时
+        // 更新检查：启动 20 秒后首查（避开启动网络高峰），此后每 30 分钟；
+        // 打开菜单也会触发一次（同一 interval 节流，不增加请求频率）
         updateTimer = Timer.scheduledTimer(withTimeInterval: UpdateCheck.interval, repeats: true) { [weak self] _ in
             self?.checkForUpdate()
         }
@@ -936,8 +990,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func performRefresh(includeSlow: Bool) {
         lastAttemptAt = Date()
         if includeSlow { lastSlowAttemptAt = lastAttemptAt }
-        renderBar()
-        rebuildMenu()
+        updateUI()
         let cred = CredStore.load()
         var merged = UsageData()
         let group = DispatchGroup()
@@ -998,10 +1051,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if includeSlow {
             group.enter()
             DispatchQueue.global(qos: .utility).async {
-                let (work, cli) = TokenAggregator.aggregateBoth()
+                let d = TokenAggregator.aggregateBothDetailed()
                 mergeLock.lock()
-                merged.tokensToday = work.0; merged.tokens7d = work.1; merged.tokens30d = work.2
-                merged.cliTokensToday = cli.0; merged.cliTokens7d = cli.1; merged.cliTokens30d = cli.2
+                merged.tokensToday = d.work.0; merged.tokens7d = d.work.1; merged.tokens30d = d.work.2
+                merged.cliTokensToday = d.cli.0; merged.cliTokens7d = d.cli.1; merged.cliTokens30d = d.cli.2
+                merged.workTokensError = d.workError
+                merged.cliTokensError = d.cliError
                 mergeLock.unlock()
                 group.leave()
             }
@@ -1017,10 +1072,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if includeSlow {
                 self.lastMonthSuccessAt = DataFreshness.updated(self.lastMonthSuccessAt,
                     succeeded: merged.monthError == nil && merged.monthUsed != nil, at: completedAt)
+                // 扫描失败面：已安装来源全部不可读时不推进成功时间，30 分钟后 ⚠️ 自动亮起
                 self.workTokensLastSuccessAt = DataFreshness.updated(self.workTokensLastSuccessAt,
-                    succeeded: merged.tokensToday != nil, at: completedAt)
+                    succeeded: merged.workTokensError == nil, at: completedAt)
                 self.cliTokensLastSuccessAt = DataFreshness.updated(self.cliTokensLastSuccessAt,
-                    succeeded: merged.cliTokensToday != nil, at: completedAt)
+                    succeeded: merged.cliTokensError == nil, at: completedAt)
             }
 
             let old = self.usage
@@ -1030,13 +1086,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset; merged.monthError = old.monthError
                 merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
                 merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
-            } else if merged.monthUsed == nil {
-                merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset
+                merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
+            } else {
+                if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
+                // 扫描失败：保留旧值（⚠️ 过期标注由 lastSuccess 不推进自然产生）
+                if merged.workTokensError != nil {
+                    merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
+                }
+                if merged.cliTokensError != nil {
+                    merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
+                }
             }
             self.usage = merged
-            self.renderBar()
-            self.rebuildMenu()
+            self.updateUI()
             if self.refreshGate.finish() { self.performRefresh(includeSlow: true) }
+        }
+    }
+
+    /// 菜单栏图标 + 下拉菜单的统一渲染入口；菜单打开期间延迟重建到关闭时
+    private func updateUI() {
+        renderBar()
+        if menuOpen { pendingMenuRebuild = true } else { rebuildMenu() }
+    }
+
+    // 打开菜单即触发一轮全量刷新（RefreshGate 防重入、合并重复请求）与一次节流更新检查；
+    // 数据到位时若菜单仍打开，重建延迟到关闭后，下次打开即为最新
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        refresh(manual: true)
+        checkForUpdate()   // 节流共享 30 分钟 interval，不增加 GitHub 请求频率
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        if pendingMenuRebuild {
+            pendingMenuRebuild = false
+            rebuildMenu()
         }
     }
 
@@ -1102,7 +1187,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "errors": [
                 "fiveHour": usage.fiveHourError ?? "",
                 "sevenDay": usage.sevenDayError ?? "",
-                "month": usage.monthError ?? ""
+                "month": usage.monthError ?? "",
+                "workTokens": usage.workTokensError ?? "",
+                "cliTokens": usage.cliTokensError ?? ""
             ],
             "fiveHourStale": fiveHourStale,
             "sevenDayStale": sevenDayStale,
@@ -1205,6 +1292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if cliTokensStale {
             menu.addItem(info("⚠️ API Token 数据已过期 · 最后成功 \(Fmt.lastOK(cliTokensLastSuccessAt))"))
         }
+        if let e = usage.workTokensError { menu.addItem(info("Work Token 统计失败：\(e)")) }
+        if let e = usage.cliTokensError { menu.addItem(info("API Token 统计失败：\(e)")) }
 
         menu.addItem(.separator())
         menu.addItem(info("最近尝试刷新 \(Fmt.time(lastAttemptAt))"))
@@ -1226,6 +1315,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem.menu = menu
+        menu.delegate = self
     }
 
     // MARK: 开机自启（LaunchAgent）
@@ -1260,14 +1350,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             """
             try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
         }
-        rebuildMenu()
+        updateUI()
     }
 
     @objc private func onRefresh() { refresh(manual: true) }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
-        UpdateChecker.shared.check { [weak self] in self?.rebuildMenu() }
+        UpdateChecker.shared.check { [weak self] in self?.updateUI() }
     }
 
     // 更新横幅点击：唤起 Terminal 代跑 .app 内置 update.sh（从 GitHub Releases 下载最新
@@ -1333,6 +1423,24 @@ enum KimiOfflineRegression {
             try expect(Fetcher.parseMonthUsagePayload(["balances": [
                 ["feature": "FEATURE_OMNI", "amountUsedRatio": "NaN"]
             ]]).monthUsed == nil, "invalid monthly ratio accepted")
+
+            // 扫描失败面：已安装来源全部不可读才置错；未安装/部分可读/仅 hermes 成功均不置错
+            try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: nil) != nil,
+                       "unreadable installed root was reported as success")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil) == nil,
+                       "not-installed source was reported as failure")
+            try expect(TokenAggregator.sourceError(installed: 2, enumerated: 1, hermesOK: nil) == nil,
+                       "partially readable sources were reported as total failure")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: false) != nil,
+                       "corrupt hermes db was reported as success")
+            try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: true) == nil,
+                       "healthy hermes source did not clear the failure")
+            // 窗口口径：含今天共 7/30 个日历日（起算日 = 今天 −6/−29 天，此前 8/31 天）
+            let cutNow = Date(timeIntervalSince1970: 1_800_000_000)
+            let cuts = TokenAggregator.windowCutoffs(now: cutNow)
+            try expect(cuts.d7 == TokenAggregator.dayFmt.string(from: cutNow.addingTimeInterval(-6 * 86400))
+                       && cuts.d30 == TokenAggregator.dayFmt.string(from: cutNow.addingTimeInterval(-29 * 86400)),
+                       "7/30 calendar-day window cutoffs drifted")
 
             let gate = RefreshGate()
             try expect(gate.begin(manual: false), "initial refresh gate did not open")
@@ -1521,7 +1629,10 @@ if CommandLine.arguments.contains("--once") {
     let snapshot = merged
     onceLock.unlock()
     func rem(_ used: Double?) -> Double? { used.map { max(0, min(1, 1 - $0)) } }
-    let (work, cli) = TokenAggregator.aggregateBoth()
+    let detailed = TokenAggregator.aggregateBothDetailed()
+    let (work, cli) = (detailed.work, detailed.cli)
+    if let e = detailed.workError { print("work tokens error: \(e)") }
+    if let e = detailed.cliError { print("api tokens error: \(e)") }
     let (tt, tw, tm) = work
     print("menubar: 5H \(Fmt.pct(rem(snapshot.fiveHourUsed))) / 7D \(Fmt.pct(rem(snapshot.sevenDayUsed)))")
     print("5h remaining=\(Fmt.pctLong(rem(snapshot.fiveHourUsed))) reset=\(Fmt.dayTime(snapshot.fiveHourReset))")

@@ -1751,7 +1751,8 @@ final class UsagePanelController: NSObject {
 
     @objc private func performAction(_ sender: PanelActionButton) {
         guard let item = sender.menuItem, let action = item.action else { return }
-        close()
+        // 只有「退出」先收起面板；刷新/开机自启等保持面板打开，动作结果就地可见
+        if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
             _ = NSApp.sendAction(action, to: item.target, from: item)
         }
@@ -2419,9 +2420,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         send("r", 15)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            guard self.previewRefreshCount == 1, !self.panelController.isOpen else { return fail("Command-R") }
+            // 刷新不再收起面板（与点击「立即刷新」同路径），随后手动走关闭→重开→⌘Q
+            guard self.previewRefreshCount == 1, self.panelController.isOpen else { return fail("Command-R") }
             button.performClick(nil)
-            guard self.panelController.isOpen else { return fail("reopen") }
+            guard !self.panelController.isOpen else { return fail("toggle close") }
+            button.performClick(nil)
+            guard self.panelController.isOpen else { return fail("toggle reopen") }
             send("q", 12)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                 guard self.previewQuitCount == 1, !self.panelController.isOpen else { return fail("Command-Q") }
@@ -2498,7 +2502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(UpdateCheck.releasesPage)
     }
 
-    @objc private func onQuit() { if visualPreview && CommandLine.arguments.contains("--visual-preview-key-test") { previewQuitCount += 1 } else { NSApp.terminate(nil) } }
+    @objc func onQuit() { if visualPreview && CommandLine.arguments.contains("--visual-preview-key-test") { previewQuitCount += 1 } else { NSApp.terminate(nil) } }
 }
 
 enum KimiOfflineRegression {

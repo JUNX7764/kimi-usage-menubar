@@ -895,10 +895,17 @@ final class UpdateChecker {
     static let shared = UpdateChecker()
     private(set) var available = false
     private var etag: String?
+    private var hasValidRelease = false
     private var lastCheck: Date?
     private var inFlight = false
     private var waiters: [() -> Void] = []
     private(set) var lastError = false
+    typealias Transport = (URLRequest, @escaping (Data?, URLResponse?, Error?) -> Void) -> Void
+    private let transport: Transport
+
+    init(transport: @escaping Transport = { request, completion in
+        URLSession.shared.dataTask(with: request, completionHandler: completion).resume()
+    }) { self.transport = transport }
 
     /// force=false 时按 interval 节流；completion 固定主线程回调
     func check(force: Bool = false, completion: @escaping () -> Void = {}) {
@@ -913,18 +920,23 @@ final class UpdateChecker {
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         req.setValue("KimiUsage/1.0 (menubar; update check)", forHTTPHeaderField: "User-Agent")
         if let etag = etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
-        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+        transport(req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.inFlight = false
                 self.lastCheck = Date()
                 let http = resp as? HTTPURLResponse
-                self.lastError = !(http?.statusCode == 304 || (err == nil && http?.statusCode == 200 && data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["tag_name"] is String))
-                if http?.statusCode == 304 {
+                let payload = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                let tag = payload?["tag_name"] as? String
+                let validTag = tag.flatMap { UpdateCheck.normalized($0) } != nil
+                self.lastError = !(err == nil && ((http?.statusCode == 304 && self.hasValidRelease) ||
+                    (http?.statusCode == 200 && validTag)))
+                if http?.statusCode == 304 && !self.lastError {
                     // 内容未变：结论保持
                 } else if err == nil, let data = data, http?.statusCode == 200,
                           let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                          let tag = obj["tag_name"] as? String {
+                          let tag = obj["tag_name"] as? String, validTag {
+                    self.hasValidRelease = true
                     self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 }
@@ -933,7 +945,7 @@ final class UpdateChecker {
                 self.waiters.removeAll()
                 pending.forEach { $0() }
             }
-        }.resume()
+        }
     }
 }
 
@@ -1563,10 +1575,18 @@ final class UsagePanelController: NSObject {
     }
 
     private func refreshPanelLayout() {
+        let previousOrigin = scrollView.contentView.bounds.origin
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         rebuildContent()
         if let button = anchorButton, let window = button.window, isOpen {
             layoutPanel(anchoredTo: button, buttonWindow: window)
+            let clip = scrollView.contentView
+            let desired = NSRect(origin: previousOrigin, size: clip.bounds.size)
+            clip.scroll(to: clip.constrainBoundsRect(desired).origin)
+            scrollView.reflectScrolledClipView(clip)
         }
+        CATransaction.commit()
     }
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
@@ -1607,7 +1627,7 @@ final class UsagePanelController: NSObject {
         button.layer?.cornerRadius = 6
         button.alignment = style == .prominent ? .center : .left
         button.keyEquivalent = item.keyEquivalent
-        button.keyEquivalentModifierMask = []
+        button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
         button.focusRingType = .none
         let title = overrideTitle ?? item.title
@@ -1652,7 +1672,12 @@ final class UsagePanelController: NSObject {
                 + view.subviews.flatMap { labels($0) }
         }
         guard isOpen, codexExpanded, externalExpanded else { return false }
-        if expectScroll && !scrollToEndForPreview() { return false }
+        if expectScroll {
+            guard scrollToEndForPreview(), let model = model else { return false }
+            let oldOrigin = scrollView.contentView.bounds.origin
+            update(model: model)
+            guard isOpen, abs(scrollView.contentView.bounds.origin.y - oldOrigin.y) < 1 else { return false }
+        }
         toggleCodex()
         guard !codexExpanded, externalExpanded,
               labels(stack).contains(where: { $0.contains("统计失败") }) else { return false }
@@ -1839,7 +1864,7 @@ private final class PanelFooterView: NSView {
         version.isBordered = false
         version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
         version.contentTintColor = .secondaryLabelColor
-        version.toolTip = "点击检查更新"
+        version.toolTip = "\(BuildInfo.version) · 点击检查更新"
         version.setAccessibilityLabel("\(model.version)，点击检查更新")
         meta.addArrangedSubview(version)
         root.addArrangedSubview(meta)
@@ -1871,6 +1896,8 @@ private final class PanelFooterView: NSView {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelController = UsagePanelController()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
+    private var previewRefreshCount = 0
+    private var previewQuitCount = 0
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -2177,8 +2204,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let error = error { notices.append(notice("统计失败：\(error) · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")", .error)) }
             return .init(title: title, accent: accent, buckets: rows, notices: notices)
         }
-        func item(_ title: String, _ selector: Selector) -> NSMenuItem {
-            let item = NSMenuItem(title: title, action: selector, keyEquivalent: ""); item.target = self; return item
+        func item(_ title: String, _ selector: Selector, key: String = "") -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: key); item.target = self; return item
         }
         let login = item("开机自启", #selector(onToggleLogin))
         login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
@@ -2190,8 +2217,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             resetCards: nil, tibo: nil,
             codexTokens: section("Kimi Work 用量", .codex, [usage.tokensToday, usage.tokens7d, usage.tokens30d], usage.workTokensError, workTokensLastSuccessAt, tokensStale),
             externalTokens: section("API 客户端用量 · 仅 Kimi 模型", .external, [usage.cliTokensToday, usage.cliTokens7d, usage.cliTokens30d], usage.cliTokensError, cliTokensLastSuccessAt, cliTokensStale),
-            notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version)",
-            refreshItem: item("立即刷新", #selector(onRefresh)), loginItem: login, quitItem: item("退出", #selector(onQuit))))
+            notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
+            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
     }
 
     private func configureVisualPreview() {
@@ -2227,6 +2254,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("KimiUsage visual interaction test: PASS")
                 exit(0)
             }
+            if args.contains("--visual-preview-update-test") {
+                self.runPreviewUpdateTest()
+                return
+            }
+            if args.contains("--visual-preview-key-test") {
+                self.runPreviewKeyTest(button: button)
+                return
+            }
             let prefix = "--visual-preview-output="
             if let arg = args.first(where: { $0.hasPrefix(prefix) }) {
                 let path = String(arg.dropFirst(prefix.count))
@@ -2234,6 +2269,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if args.contains("--visual-preview-scroll-end") { _ = self.panelController.scrollToEndForPreview() }
                     exit(self.panelController.savePreviewImage(to: path) ? 0 : 1)
                 }
+            }
+        }
+    }
+
+    // The fake transport lets overlapping checks complete through the normal main-queue path.
+    private func runPreviewUpdateTest() {
+        typealias Reply = (Data?, URLResponse?, Error?) -> Void
+        var replies: [Reply] = []
+        var completions = 0
+        let checker = UpdateChecker { _, reply in replies.append(reply) }
+        func fail(_ message: String) { fputs("KimiUsage update test: FAIL: \(message)\n", stderr); exit(1) }
+        func response(_ status: Int) -> HTTPURLResponse {
+            HTTPURLResponse(url: UpdateCheck.apiURL, statusCode: status, httpVersion: nil, headerFields: nil)!
+        }
+        checker.check { completions += 1 }
+        checker.check(force: true) { completions += 1 }
+        guard replies.count == 1 else { return fail("overlapping checks started extra requests") }
+        replies.removeFirst()(nil, nil, NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            guard completions == 2, checker.lastError else { return fail("concurrent error callbacks") }
+            checker.check(force: true) { completions += 1 }
+            guard replies.count == 1 else { return fail("forced retry") }
+            replies.removeFirst()(Data("{\"tag_name\":\"invalid\"}".utf8), response(200), nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                guard completions == 3, checker.lastError else { return fail("invalid release reported success") }
+                checker.check(force: true) { completions += 1 }
+                replies.removeFirst()(Data("{\"tag_name\":\"v999.0.0\"}".utf8), response(200), nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    guard completions == 4, !checker.lastError, checker.available else { return fail("successful release check") }
+                    checker.check(force: true) { completions += 1 }
+                    replies.removeFirst()(nil, response(304), nil)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        guard completions == 5, !checker.lastError, checker.available else { return fail("cached 304") }
+                        print("KimiUsage update check test: PASS")
+                        exit(0)
+                    }
+                }
+            }
+        }
+    }
+
+    private func runPreviewKeyTest(button: NSStatusBarButton) {
+        func fail(_ message: String) { fputs("KimiUsage key event test: FAIL: \(message)\n", stderr); exit(1) }
+        func send(_ character: String, _ keyCode: UInt16) {
+            guard let window = NSApp.keyWindow,
+                  let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
+                      timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                      characters: character, charactersIgnoringModifiers: character,
+                      isARepeat: false, keyCode: keyCode) else { fail("cannot create event"); return }
+            NSApp.sendEvent(event)
+        }
+        send("r", 15)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            guard self.previewRefreshCount == 1, !self.panelController.isOpen else { return fail("Command-R") }
+            button.performClick(nil)
+            guard self.panelController.isOpen else { return fail("reopen") }
+            send("q", 12)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                guard self.previewQuitCount == 1, !self.panelController.isOpen else { return fail("Command-Q") }
+                print("KimiUsage key event test: PASS")
+                exit(0)
             }
         }
     }
@@ -2284,7 +2380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateUI()
     }
 
-    @objc private func onRefresh() { if !visualPreview { refresh(manual: true) } }
+    @objc private func onRefresh() { if visualPreview { previewRefreshCount += 1 } else { refresh(manual: true) } }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤30s 也会兜底重建）
     private func checkForUpdate() {
@@ -2305,7 +2401,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(UpdateCheck.releasesPage)
     }
 
-    @objc private func onQuit() { NSApp.terminate(nil) }
+    @objc private func onQuit() { if visualPreview && CommandLine.arguments.contains("--visual-preview-key-test") { previewQuitCount += 1 } else { NSApp.terminate(nil) } }
 }
 
 enum KimiOfflineRegression {

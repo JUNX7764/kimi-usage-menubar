@@ -188,6 +188,7 @@ struct UsageData {
     var sevenDayReset: Date?
     var monthUsed: Double?         // 0..1
     var monthReset: Date?
+    var planName: String?          // 订阅套餐名（GetSubscription subscription.goods.title）
     var tokensToday: TokenStat?
     var tokens7d: TokenStat?
     var tokens30d: TokenStat?
@@ -824,7 +825,7 @@ enum Fetcher {
         }.resume()
     }
 
-    /// 本月总额度：Kimi 订阅接口（OMNI 余额）
+    /// 本月总额度：Kimi 订阅接口（OMNI 余额）+ 套餐名（与 GLM/Codex 面板标题同款逻辑）
     static func parseMonthUsagePayload(_ obj: [String: Any]) -> UsageData {
         var result = UsageData()
         if let balances = obj["balances"] as? [[String: Any]],
@@ -834,6 +835,10 @@ enum Fetcher {
             if result.monthUsed == nil { result.monthError = "invalid amountUsedRatio" }
         } else {
             result.monthError = "no omni balance"
+        }
+        if let goods = (obj["subscription"] as? [String: Any])?["goods"] as? [String: Any],
+           let title = goods["title"] as? String, !title.isEmpty {
+            result.planName = title
         }
         return result
     }
@@ -2112,6 +2117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 mergeLock.lock()
                                 merged.monthUsed = r2.monthUsed
                                 merged.monthReset = r2.monthReset
+                                merged.planName = r2.planName
                                 merged.monthError = r2.monthError
                                 mergeLock.unlock()
                                 group.leave()
@@ -2127,6 +2133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     mergeLock.lock()
                     merged.monthUsed = r.monthUsed
                     merged.monthReset = r.monthReset
+                    merged.planName = r.planName
                     merged.monthError = r.monthError
                     mergeLock.unlock()
                     group.leave()
@@ -2172,11 +2179,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if merged.sevenDayUsed == nil { merged.sevenDayUsed = old.sevenDayUsed; merged.sevenDayReset = old.sevenDayReset }
             if !includeSlow {
                 merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset; merged.monthError = old.monthError
+                merged.planName = old.planName
                 merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
                 merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
                 merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
             } else {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
+                // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
+                if merged.monthError != nil { merged.planName = old.planName }
                 // 扫描失败：保留旧值（⚠️ 过期标注由 lastSuccess 不推进自然产生）
                 if merged.workTokensError != nil {
                     merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
@@ -2261,6 +2271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "line2": line2,
             "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
             "version": BuildInfo.version,
+            "planName": usage.planName ?? "",
             "updateAvailable": UpdateChecker.shared.available,
             "lastSuccessAt": [
                 "fiveHour": lastFiveHourSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
@@ -2338,7 +2349,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let login = item("开机自启", #selector(onToggleLogin))
         login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
-        panelController.update(model: UsagePanelModel(updateItem: update, title: "Kimi 余额", email: nil,
+        panelController.update(model: UsagePanelModel(updateItem: update,
+            title: "Kimi 余额" + (usage.planName.map { "（\($0) 套餐）" } ?? ""), email: nil,
             quotas: [quota("5 小时", usage.fiveHourUsed, usage.fiveHourReset, usage.fiveHourError, lastFiveHourSuccessAt, fiveHourStale),
                      quota("7 天", usage.sevenDayUsed, usage.sevenDayReset, usage.sevenDayError, lastSevenDaySuccessAt, sevenDayStale),
                      quota("月度", usage.monthUsed, usage.monthReset, usage.monthError, lastMonthSuccessAt, monthStale)],
@@ -2358,6 +2370,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastFiveHourSuccessAt = now; lastSevenDaySuccessAt = now; lastMonthSuccessAt = now
         workTokensLastSuccessAt = now; cliTokensLastSuccessAt = now
         usage.fiveHourUsed = 0.23; usage.sevenDayUsed = 0.67; usage.monthUsed = 0.42
+        usage.planName = "Allegretto"
         usage.fiveHourReset = now.addingTimeInterval(18000); usage.sevenDayReset = now.addingTimeInterval(604800); usage.monthReset = now.addingTimeInterval(2592000)
         usage.tokensToday = TokenStat(input: 1230000, output: 320000); usage.tokens7d = TokenStat(input: 8200000, output: 1200000); usage.tokens30d = TokenStat(input: 32000000, output: 5100000)
         usage.cliTokensToday = TokenStat(input: 5400000, output: 230000); usage.cliTokens7d = TokenStat(input: 61000000, output: 890000); usage.cliTokens30d = TokenStat(input: 440000000, output: 2100000)
@@ -2598,6 +2611,18 @@ enum KimiOfflineRegression {
             try expect(Fetcher.parseMonthUsagePayload(["balances": [
                 ["feature": "FEATURE_OMNI", "amountUsedRatio": "NaN"]
             ]]).monthUsed == nil, "invalid monthly ratio accepted")
+            // 套餐名：取 subscription.goods.title；缺失/空串一律视为无套餐，不得报错
+            try expect(Fetcher.parseMonthUsagePayload([
+                "subscription": ["goods": ["title": "Allegretto"]],
+                "balances": [["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]]
+            ]).planName == "Allegretto", "valid plan title rejected")
+            try expect(Fetcher.parseMonthUsagePayload([
+                "balances": [["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]]
+            ]).planName == nil, "missing subscription was treated as a plan")
+            try expect(Fetcher.parseMonthUsagePayload([
+                "subscription": ["goods": ["title": ""]],
+                "balances": [["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]]
+            ]).planName == nil, "empty plan title was accepted")
 
             // 扫描失败面：已安装来源全部不可读才置错；未安装/部分可读/仅 hermes 成功均不置错
             try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: nil) != nil,
@@ -2904,6 +2929,7 @@ if CommandLine.arguments.contains("--once") {
                             applyResult { current in
                                 current.monthUsed = r2.monthUsed
                                 current.monthReset = r2.monthReset
+                                current.planName = r2.planName
                                 current.monthError = r2.monthError
                             }
                         }
@@ -2915,6 +2941,7 @@ if CommandLine.arguments.contains("--once") {
                 applyResult { current in
                     current.monthUsed = r.monthUsed
                     current.monthReset = r.monthReset
+                    current.planName = r.planName
                     current.monthError = r.monthError
                 }
             }
@@ -2935,6 +2962,7 @@ if CommandLine.arguments.contains("--once") {
     print("5h remaining=\(Fmt.pctLong(rem(snapshot.fiveHourUsed))) reset=\(Fmt.dayTime(snapshot.fiveHourReset))")
     print("7d remaining=\(Fmt.pctLong(rem(snapshot.sevenDayUsed))) reset=\(Fmt.dayTime(snapshot.sevenDayReset))")
     print("month remaining=\(Fmt.pctLong(rem(snapshot.monthUsed))) reset=\(Fmt.dayTime(snapshot.monthReset))")
+    print("plan: \(snapshot.planName ?? "none")")
     print("tokens today: in=\(Fmt.tokens(tt.input)) out=\(Fmt.tokens(tt.output)) total=\(Fmt.tokens(tt.total))")
     print("tokens 7d:    in=\(Fmt.tokens(tw.input)) out=\(Fmt.tokens(tw.output)) total=\(Fmt.tokens(tw.total))")
     print("tokens 30d:   in=\(Fmt.tokens(tm.input)) out=\(Fmt.tokens(tm.output)) total=\(Fmt.tokens(tm.total))")

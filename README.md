@@ -15,14 +15,14 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 - **刷新机制**
   - 5H / 7D 每 30 秒；月度额度与两类会话扫描每 300 秒；手动刷新执行完整刷新
   - 各窗口分别保留最后成功时间；失败时保留旧值，同时显示刷新错误与过期状态
-  - 打开下拉菜单即触发一轮全量刷新；菜单打开期间不重建菜单，数据在关闭后更新、下次打开即最新
+  - 打开面板即触发一轮全量刷新；面板打开时数据会更新
   - 「最近尝试刷新」表示请求开始时间
 
 ## 安装与更新
 
 需要 macOS 13+。安装：到 [Releases](https://github.com/JUNX7764/kimi-usage-menubar/releases) 下载最新 `KimiUsage.dmg`，打开后把 KimiUsage 拖进 Applications（或 `~/Applications`）双击运行。首次打开如遇 Gatekeeper 提示，右键 → 打开。
 
-**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）。日常代码提交不会触发更新提示——只有正式发版才会。
+**更新**：发布新 Release 后（每 30 分钟检查一次，打开菜单也会触发一次节流检查），菜单最上方出现「⬆ 新版本可用，点击更新」，点击即自动下载替换并重启（zip 经 SHA256 校验后才替换）。点击面板底部版本号可手动检查并查看结果。日常代码提交不会触发更新提示——只有正式发版才会。
 
 从源码构建（开发者，需要 Xcode Command Line Tools，未装先执行 `xcode-select --install`）：
 
@@ -49,6 +49,11 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 ```bash
 # 离线自检：只用临时目录和假凭据，不访问真实凭据、网络或会话缓存
 ./KimiUsage.app/Contents/MacOS/KimiUsage --self-test
+
+# 固定假数据交互预览：不读取凭据、扫描缓存或写入状态，也不联网
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview
+# 可附加 --visual-preview-dark / --visual-preview-narrow / --visual-preview-empty /
+# --visual-preview-states / --visual-preview-long 检查不同外观和异常状态
 
 # 脚本回归：PATH mock 故障注入，不操作真实 app、LaunchAgent 或 GitHub
 python3 -m unittest discover -s tests -p '*_test.py'

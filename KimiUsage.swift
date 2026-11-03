@@ -768,22 +768,42 @@ enum Fetcher {
 // MARK: - 菜单栏堆叠两行文字渲染
 
 enum StackImage {
-    static func make(line1: String, line2: String) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        let attrs: [NSAttributedString.Key: Any] = [
+    struct Line {
+        let label: String
+        let value: String
+        let remaining: Int?
+    }
+
+    private static func attributed(_ line: Line, font: NSFont,
+                                   appearance: NSAppearance) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
-            .foregroundColor: NSColor.black
-        ]
-        let s1 = NSAttributedString(string: line1, attributes: attrs)
-        let s2 = NSAttributedString(string: line2, attributes: attrs)
-        let w = max(s1.size().width, s2.size().width) + 2
-        let h: CGFloat = 21
-        let img = NSImage(size: NSSize(width: ceil(w), height: h))
-        img.lockFocus()
-        s1.draw(at: NSPoint(x: 1, y: 10.5))
-        s2.draw(at: NSPoint(x: 1, y: 0.5))
-        img.unlockFocus()
-        img.isTemplate = true   // 自动适配深色/浅色菜单栏
+            .foregroundColor: NSColor.labelColor
+        ])
+        result.append(NSAttributedString(string: line.value, attributes: [
+            .font: font,
+            .foregroundColor: RemainingColorTier(remaining: line.remaining).color(for: appearance)
+        ]))
+        return result
+    }
+
+    static func make(line1: Line, line2: Line, appearance: NSAppearance) -> NSImage {
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
+        var s1: NSAttributedString!
+        var s2: NSAttributedString!
+        appearance.performAsCurrentDrawingAppearance {
+            s1 = attributed(line1, font: font, appearance: appearance)
+            s2 = attributed(line2, font: font, appearance: appearance)
+        }
+        let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
+        let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
+            appearance.performAsCurrentDrawingAppearance {
+                s1.draw(at: NSPoint(x: 1, y: 10.5))
+                s2.draw(at: NSPoint(x: 1, y: 0.5))
+            }
+            return true
+        }
+        img.isTemplate = false   // 保留百分比的柔彩色；标签仍随外观使用系统文本色
         return img
     }
 }
@@ -2108,15 +2128,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 菜单栏显示：5H / 7D 两行堆叠（显示余额）；额度过期时两行加 ⚠️ 前缀
     // （5H/7D 同属服务端额度组，整组标注；token 组无菜单栏行，仅在下拉菜单标注）
     private func renderBar() {
-        let line1 = (fiveHourStale ? "⚠️ " : "") + "5H \(Fmt.pct(remaining(usage.fiveHourUsed)))"
-        let line2 = (sevenDayStale ? "⚠️ " : "") + "7D \(Fmt.pct(remaining(usage.sevenDayUsed)))"
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+        let fiveRemaining = remaining(usage.fiveHourUsed).map { Int(($0 * 100).rounded()) }
+        let sevenRemaining = remaining(usage.sevenDayUsed).map { Int(($0 * 100).rounded()) }
+        let line1 = StackImage.Line(label: (fiveHourStale ? "⚠️ 5H" : "5H"),
+                                    value: Fmt.pct(remaining(usage.fiveHourUsed)), remaining: fiveRemaining)
+        let line2 = StackImage.Line(label: (sevenDayStale ? "⚠️ 7D" : "7D"),
+                                    value: Fmt.pct(remaining(usage.sevenDayUsed)), remaining: sevenRemaining)
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        statusItem.button?.image = StackImage.make(line1: line1, line2: line2, appearance: appearance)
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Kimi 余额 · 5H成功 \(Fmt.lastOK(lastFiveHourSuccessAt)) · 7D成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
             + " · 月度成功 \(Fmt.lastOK(lastMonthSuccessAt)) · Work扫描成功 \(Fmt.lastOK(workTokensLastSuccessAt))"
             + " · API扫描成功 \(Fmt.lastOK(cliTokensLastSuccessAt))"
-        if !visualPreview { writeStatus(line1: line1, line2: line2) }
+        if !visualPreview { writeStatus(line1: "\(line1.label) \(line1.value)", line2: "\(line2.label) \(line2.value)") }
     }
 
     // 自诊断：把渲染内容和状态项可见性写到本地，便于排查
@@ -2423,6 +2448,22 @@ enum KimiOfflineRegression {
             try expect(UsageNumber.finite(Double.nan) == nil, "NaN accepted")
             try expect(UsageNumber.finite("Infinity") == nil, "Infinity accepted")
             try expect(UsageNumber.unitRatio("1.2") == nil, "out-of-range month ratio accepted")
+
+            let tiers: [(Int?, RemainingColorTier)] = [
+                (nil, .normal), (0, .red), (19, .red), (20, .orange), (39, .orange),
+                (40, .normal), (79, .normal), (80, .green), (100, .green)
+            ]
+            for (remaining, expected) in tiers {
+                try expect(RemainingColorTier(remaining: remaining) == expected,
+                           "wrong menu bar color tier for \(remaining.map(String.init) ?? "nil")")
+            }
+            let previewLine = StackImage.Line(label: "7D", value: "39%", remaining: 39)
+            for name in [NSAppearance.Name.aqua, .darkAqua] {
+                let appearance = NSAppearance(named: name)!
+                let image = StackImage.make(line1: previewLine, line2: previewLine, appearance: appearance)
+                try expect(!image.isTemplate && image.size.width > 0 && image.tiffRepresentation != nil,
+                           "menu bar color image did not render for \(name.rawValue)")
+            }
 
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")

@@ -254,15 +254,27 @@ enum TokenAggregator {
         var hermes: HermesState?                  // hermes（sqlite 快照差分）
     }
     /// hermes session_model_usage 是 (session,model,...) 级累计行：rows 存上次快照，
-    /// 每次刷新做差，delta 按行的 last_seen 归入当日 days
+    /// 每次刷新做差，delta 按行的 last_seen 归入该 row 自己的 days。
+    /// rowDays 分行保存，键变化/行删除时同步撤掉旧贡献，避免换 key 后新行全量回填造成双算。
     struct HermesState: Codable {
-        var rows: [String: [Double]] = [:]   // rowKey -> [累计input, 累计output]
-        var days: [String: [Double]] = [:]   // dayKey -> [input, output]
+        var rows: [String: [Double]] = [:]                 // rowKey -> [累计input, 累计output]
+        var rowDays: [String: [String: [Double]]] = [:]    // rowKey -> dayKey -> [input, output]
+        var days: [String: [Double]] {
+            var total: [String: [Double]] = [:]
+            for days in rowDays.values {
+                for (day, v) in days {
+                    var a = total[day] ?? [0, 0]
+                    a[0] += v[0]; a[1] += v[1]
+                    total[day] = a
+                }
+            }
+            return total
+        }
     }
 
-    // v2：proma 源去掉 sdk-config/sessions 双写目录（口径变更）后弃用 v1 缓存强制重建
+    // v3：修 Kimi Code / Proma 双算、Hermes 换 key 回填双算，并接入 ZCode；弃用 v2 缓存强制重建
     static let statePath = NSHomeDirectory()
-        + "/Library/Application Support/KimiUsage/scan-state-v2.json"
+        + "/Library/Application Support/KimiUsage/scan-state-v3.json"
     private static var state: ScanState?
     private static let lock = NSLock()
 
@@ -275,8 +287,8 @@ enum TokenAggregator {
         return f
     }()
 
-    /// Claude SDK 客户端可经 ccswitch 接多家 API，按 model 字段甄别 Kimi；
-    /// 无 model 字段的行默认计入（kimi-code 自有格式部分行无 model，且该客户端只接 Kimi）
+    /// Claude SDK / ZCode 可混接多家 API，按 model 字段甄别 Kimi。
+    /// 无 model 的逐调用行兼容 kimi-code 旧格式；Proma result 汇总行和 Kimi Code 双写行已先行排除。
     static func isKimiModel(_ model: String?) -> Bool {
         guard let m = model?.lowercased(), !m.isEmpty else { return true }
         if m.contains("kimi") || m.contains("moonshot") { return true }
@@ -323,21 +335,36 @@ enum TokenAggregator {
         if FileManager.default.fileExists(atPath: hermesDBPath) {
             hermesOK = scanHermes(into: &st)
         }
+        var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
+        var zcodeDays: [String: [Double]]?
+        if FileManager.default.fileExists(atPath: zcodeDBPath) {
+            zcodeDays = scanZCode()
+            zcodeOK = zcodeDays != nil
+        }
         state = st
         saveState(st)
+        var extraDays = st.hermes?.days ?? [:]
+        if let zcodeDays {
+            for (day, v) in zcodeDays {
+                var a = extraDays[day] ?? [0, 0]
+                a[0] += v[0]; a[1] += v[1]
+                extraDays[day] = a
+            }
+        }
         return BothStats(
-            work: buckets(st.work), cli: buckets(st.cli, extraDays: st.hermes?.days),
+            work: buckets(st.work), cli: buckets(st.cli, extraDays: extraDays),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
-            cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated, hermesOK: hermesOK))
+            cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
+                                  hermesOK: hermesOK, zcodeOK: zcodeOK))
     }
 
-    /// 失败面判定：有已安装来源（目录存在 / hermes 库存在）但无一可读 → 错误；
+    /// 失败面判定：有已安装来源（目录 / sqlite 库存在）但无一可读 → 错误；
     /// 全部未安装（路径不存在）返回 nil——没装对应工具时该来源自然为 0，不算失败；
     /// 部分来源可读仍按成功（增量状态保留旧贡献，下轮自愈）
-    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?) -> String? {
-        let anySource = installed > 0 || hermesOK != nil
-        let anySuccess = enumerated > 0 || hermesOK == true
-        return (anySource && !anySuccess) ? "会话目录 / hermes state.db 均不可读" : nil
+    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil) -> String? {
+        let anySource = installed > 0 || hermesOK != nil || zcodeOK != nil
+        let anySuccess = enumerated > 0 || hermesOK == true || zcodeOK == true
+        return (anySource && !anySuccess) ? "会话目录 / 客户端用量数据库均不可读" : nil
     }
 
     /// 窗口起算日：含今天共 7 / 30 个日历日（2026-11-03 起；此前为 8 / 31 天）
@@ -349,7 +376,7 @@ enum TokenAggregator {
     /// 兼容既有调用；主刷新使用 aggregateBoth 合并扫描和缓存写入。
     static func aggregate() -> (TokenStat, TokenStat, TokenStat) { aggregateBoth().work }
 
-    /// API 客户端（CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
+    /// API 客户端（ZCode / Kimi Code CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
     static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
         aggregateBoth().cli
     }
@@ -437,14 +464,13 @@ enum TokenAggregator {
     // hermes 用量库（sqlite，只读打开，绝不写入）
     private static let hermesDBPath = NSHomeDirectory() + "/.hermes/state.db"
 
-    /// hermes 的 Kimi 用量：只读查询 billing_base_url 指向 kimi.com / moonshot 的累计行
-    /// （全表仅千余行、命中百余行，每次刷新一次查询开销可忽略，不新增定时器）；
-    /// 与持久化的上次快照做差，delta 按 last_seen 归日。首次运行会把存量行的累计值
-    /// 归入各自 last_seen 当天，相当于自动回填近 30 天窗口。
+    /// hermes 的 Kimi 用量：只读查询 billing_base_url 指向 kimi.com / moonshot 的累计行。
+    /// 每行独立保存快照差分与按日贡献；换 key / 删除行时旧贡献同步移除，
+    /// 避免 provider、mode、task 等主键字段变化后，新行全量回填而旧行仍计入。
     /// 返回是否成功读取（库文件不存在由调用方先行排除，不算失败）。
-    private static func scanHermes(into st: inout ScanState) -> Bool {
+    static func scanHermes(into st: inout ScanState, at path: String = hermesDBPath) -> Bool {
         var db: OpaquePointer?
-        guard sqlite3_open_v2(hermesDBPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
         else { return false }
         defer { sqlite3_close(db) }
         let sql = """
@@ -476,32 +502,78 @@ enum TokenAggregator {
             var dIn = cumIn - old[0], dOut = cumOut - old[1]
             if dIn < 0 || dOut < 0 { dIn = max(dIn, 0); dOut = max(dOut, 0) }  // 计数被重置：rebase，不倒扣
             hs.rows[key] = [cumIn, cumOut]
-            guard dIn > 0 || dOut > 0, lastSeen > 0 else { continue }
-            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
-            if dayKey >= cutoffKey {
-                var day = hs.days[dayKey] ?? [0, 0]
-                day[0] += dIn; day[1] += dOut
-                hs.days[dayKey] = day
+            var days = hs.rowDays[key] ?? [:]
+            if (dIn > 0 || dOut > 0), lastSeen > 0 {
+                let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+                if dayKey >= cutoffKey {
+                    var day = days[dayKey] ?? [0, 0]
+                    day[0] += dIn; day[1] += dOut
+                    days[dayKey] = day
+                }
             }
+            hs.rowDays[key] = days.filter { $0.key >= cutoffKey }
         }
-        // 会话被 hermes 删除（ON DELETE CASCADE）的行：移出快照，停止计入
+        // 换 key / 删除行时，快照和按日贡献必须一起撤掉，不能只清快照。
         hs.rows = hs.rows.filter { alive.contains($0.key) }
-        hs.days = hs.days.filter { $0.key >= cutoffKey }
+        hs.rowDays = hs.rowDays.filter { alive.contains($0.key) }
         st.hermes = hs
         return true
     }
 
+    // ZCode 用量库：model_usage 每次逻辑请求一行；turn_usage / JSONL 是其汇总或并行日志，不叠加。
+    private static let zcodeDBPath = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite"
+
+    /// 直接按 started_at 索引读取近 31 天明细，天然支持历史回填，无需持久化扫描状态。
+    /// input_tokens 已包含 cache read/write（provider_total = input + output），缓存字段不能再加。
+    /// error / running 行若已有非零 token 也计入；cancelled 行通常为零，无需按状态丢弃真实消耗。
+    static func scanZCode(at path: String = zcodeDBPath, now: Date = Date()) -> [String: [Double]]? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        else { return nil }
+        defer { sqlite3_close(db) }
+        let sql = """
+            SELECT model_id, input_tokens, output_tokens, started_at
+            FROM model_usage
+            WHERE started_at >= ?
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        let cutoff = now.addingTimeInterval(-retainSeconds)
+        sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
+        let cutoffKey = dayFmt.string(from: cutoff)
+        var days: [String: [Double]] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let model = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+            guard isKimiModel(model) else { continue }
+            let startedAt = sqlite3_column_double(stmt, 3)
+            guard startedAt > 0 else { continue }
+            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: startedAt / 1000))
+            guard dayKey >= cutoffKey else { continue }
+            var day = days[dayKey] ?? [0, 0]
+            day[0] += sqlite3_column_double(stmt, 1)
+            day[1] += sqlite3_column_double(stmt, 2)
+            days[dayKey] = day
+        }
+        return days
+    }
+
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
-    private static func parseLines(_ text: String, kimiOnly: Bool,
-                                   cutoffKey: String, into st: inout FileScanState) {
+    static func parseLines(_ text: String, kimiOnly: Bool,
+                           cutoffKey: String, into st: inout FileScanState) {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true)
         where line.contains("\"usage\"") {
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            // Proma result 行的 modelUsage / 顶层 usage 是全会话累计汇总，
-            // 逐条 assistant 行（message.usage）已含每次调用，跳过汇总行避免双算
+            // Proma result 行的 modelUsage / 顶层 usage 都是全会话累计汇总，逐条 assistant 行已含每次调用。
+            // 有些 result 没有 modelUsage，必须按 type 一并跳过，不能只判断 modelUsage 字段。
             if obj["modelUsage"] != nil { continue }
+            let rowType = obj["type"] as? String
+            if kimiOnly && rowType == "result" { continue }
+            // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写；
+            // API 统计只取前者。Kimi Work 只有后者，因此 work 路径（kimiOnly=false）仍保留。
+            if kimiOnly && rowType == "context.append_loop_event" { continue }
             // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
             let t: Date
             if let ms = obj["time"] as? Double {
@@ -2504,6 +2576,12 @@ enum KimiOfflineRegression {
                        "corrupt hermes db was reported as success")
             try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: true) == nil,
                        "healthy hermes source did not clear the failure")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: false) != nil,
+                       "corrupt ZCode db was reported as success")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: false, zcodeOK: true) == nil,
+                       "healthy ZCode source did not clear the failure")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: nil) == nil,
+                       "not-installed sqlite sources were reported as failure")
             // 窗口口径：含今天共 7/30 个日历日（起算日 = 今天 −6/−29 天，此前 8/31 天）
             let cutNow = Date(timeIntervalSince1970: 1_800_000_000)
             let cuts = TokenAggregator.windowCutoffs(now: cutNow)
@@ -2598,6 +2676,84 @@ enum KimiOfflineRegression {
             let cacheDateAfter = try FileManager.default.attributesOfItem(atPath: cachePath)[.modificationDate] as! Date
             try expect(cacheDateAfter == cacheDate, "unchanged cache modification time changed")
 
+            // API 逐调用行回归：Kimi Code 双写只计 usage.record；Proma result 汇总整行跳过。
+            func jsonLine(_ object: [String: Any]) throws -> String {
+                let data = try JSONSerialization.data(withJSONObject: object)
+                return String(data: data, encoding: .utf8)!
+            }
+            func totals(_ state: TokenAggregator.FileScanState) -> [Double] {
+                state.days.values.reduce([0, 0]) { [$0[0] + $1[0], $0[1] + $1[1]] }
+            }
+            let eventMS = Date().timeIntervalSince1970 * 1000
+            let kimiUsage: [String: Any] = ["inputOther": 10, "inputCacheRead": 20,
+                                            "inputCacheCreation": 5, "output": 2]
+            let usageRecord: [String: Any] = ["type": "usage.record", "time": eventMS,
+                                              "model": "k3.1-pro", "usage": kimiUsage]
+            let loopMirror: [String: Any] = ["type": "context.append_loop_event", "time": eventMS,
+                                             "event": ["usage": kimiUsage]]
+            let otherRecord: [String: Any] = ["type": "usage.record", "time": eventMS,
+                                              "model": "glm-5.3", "usage": kimiUsage]
+            var apiFile = TokenAggregator.FileScanState()
+            try TokenAggregator.parseLines([jsonLine(usageRecord), jsonLine(loopMirror),
+                                            jsonLine(otherRecord)].joined(separator: "\n"),
+                                           kimiOnly: true, cutoffKey: "0000-00-00", into: &apiFile)
+            try expect(totals(apiFile) == [35, 2], "Kimi Code mirror row or other model was counted")
+            var workFile = TokenAggregator.FileScanState()
+            try TokenAggregator.parseLines(jsonLine(loopMirror), kimiOnly: false,
+                                           cutoffKey: "0000-00-00", into: &workFile)
+            try expect(totals(workFile) == [35, 2], "Kimi Work loop event was lost")
+
+            let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
+                                             "cache_creation_input_tokens": 5, "output_tokens": 3]
+            let promaAssistant: [String: Any] = ["type": "assistant", "_createdAt": eventMS,
+                                                 "message": ["model": "k3-256k", "usage": promaUsage]]
+            let promaResult: [String: Any] = ["type": "result", "_createdAt": eventMS,
+                                              "usage": ["input_tokens": 1000, "cache_read_input_tokens": 2000,
+                                                        "cache_creation_input_tokens": 3000, "output_tokens": 400]]
+            var promaFile = TokenAggregator.FileScanState()
+            try TokenAggregator.parseLines([jsonLine(promaAssistant), jsonLine(promaResult)].joined(separator: "\n"),
+                                           kimiOnly: true, cutoffKey: "0000-00-00", into: &promaFile)
+            try expect(totals(promaFile) == [35, 3], "Proma result summary was counted as per-call usage")
+
+            // SQLite 假库：ZCode 输入已含 cache，不能重复加；Hermes 换 key 不得重复回填。
+            let sqlitePath = root.appendingPathComponent("client-usage.sqlite").path
+            var testDB: OpaquePointer?
+            try expect(sqlite3_open(sqlitePath, &testDB) == SQLITE_OK, "failed to create temporary usage db")
+            defer { sqlite3_close(testDB) }
+            func exec(_ sql: String) throws {
+                try expect(sqlite3_exec(testDB, sql, nil, nil, nil) == SQLITE_OK, "temporary db SQL failed: \(sql)")
+            }
+            try exec("CREATE TABLE model_usage (model_id TEXT, input_tokens INTEGER, output_tokens INTEGER, started_at INTEGER)")
+            let usageNow = Date()
+            let nowSeconds = usageNow.timeIntervalSince1970
+            let nowMS = Int64(nowSeconds * 1000)
+            let oldMS = nowMS - Int64(40 * 86400 * 1000)
+            try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 100, 5, \(nowMS)), ('glm-5.3', 1000, 50, \(nowMS)), ('k3-256k', 7, 1, \(oldMS))")
+            let zcodeDays = TokenAggregator.scanZCode(at: sqlitePath, now: usageNow)
+            let todayKey = TokenAggregator.dayFmt.string(from: usageNow)
+            try expect(zcodeDays != nil && zcodeDays?[todayKey] == [100, 5],
+                       "ZCode model filtering, cache accounting, or retention is wrong")
+            try exec("""
+                CREATE TABLE session_model_usage (
+                    session_id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT,
+                    billing_mode TEXT, task TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_tokens INTEGER, cache_write_tokens INTEGER, last_seen REAL
+                )
+                """)
+            try exec("INSERT INTO session_model_usage VALUES ('s1', 'k3.1-pro', 'old', 'https://api.kimi.com/coding', '', 'main', 10, 1, 20, 0, \(nowSeconds))")
+            var hermesScan = TokenAggregator.ScanState()
+            try expect(TokenAggregator.scanHermes(into: &hermesScan, at: sqlitePath), "temporary hermes db was rejected")
+            try expect(hermesScan.hermes?.days[todayKey] == [30, 1], "Hermes initial backfill is wrong")
+            try exec("UPDATE session_model_usage SET billing_provider = 'new' WHERE session_id = 's1'")
+            try expect(TokenAggregator.scanHermes(into: &hermesScan, at: sqlitePath), "Hermes rekey scan failed")
+            try expect(hermesScan.hermes?.days[todayKey] == [30, 1], "Hermes rekey double-counted old contributions")
+            try exec("UPDATE session_model_usage SET input_tokens = 15, output_tokens = 2 WHERE session_id = 's1'")
+            try expect(TokenAggregator.scanHermes(into: &hermesScan, at: sqlitePath), "Hermes delta scan failed")
+            try expect(hermesScan.hermes?.days[todayKey] == [35, 2], "Hermes cumulative delta is wrong")
+            try exec("DELETE FROM session_model_usage WHERE session_id = 's1'")
+            try expect(TokenAggregator.scanHermes(into: &hermesScan, at: sqlitePath), "Hermes delete scan failed")
+            try expect(hermesScan.hermes?.days[todayKey] == nil, "deleted Hermes row left stale contributions")
+
             // Token 窗口树形行：├/└ 分支、两空格缩进，空数据显示「暂无记录」
             let windowTree = TokenWindowLines.render([
                 ("今日", TokenStat(input: 1234, output: 56)),
@@ -2626,7 +2782,7 @@ enum KimiOfflineRegression {
             try expect(!UpdateCheck.isOutdated(local: "", remote: "v1.0.0"), "empty local version flagged outdated")
             try expect(!UpdateCheck.isOutdated(local: "abc", remote: "1.2"), "non-numeric local version flagged outdated")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op, update check release version compare)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op, update check release version compare)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
@@ -2639,6 +2795,21 @@ enum KimiOfflineRegression {
 
 if CommandLine.arguments.contains("--self-test") {
     exit(KimiOfflineRegression.run())
+}
+
+if CommandLine.arguments.contains("--tokens-once") {
+    // 纯本地验收：不读凭据、不联网，只重建并打印两类 token 统计。
+    let detailed = TokenAggregator.aggregateBothDetailed()
+    if let e = detailed.workError { print("work tokens error: \(e)") }
+    if let e = detailed.cliError { print("api tokens error: \(e)") }
+    func printTokens(_ label: String, _ stats: (TokenStat, TokenStat, TokenStat)) {
+        for (window, stat) in zip(["today", "7d", "30d"], [stats.0, stats.1, stats.2]) {
+            print("\(label) \(window): in=\(Fmt.tokens(stat.input)) out=\(Fmt.tokens(stat.output)) total=\(Fmt.tokens(stat.total))")
+        }
+    }
+    printTokens("work", detailed.work)
+    printTokens("api", detailed.cli)
+    exit(detailed.workError == nil && detailed.cliError == nil ? 0 : 1)
 }
 
 if CommandLine.arguments.contains("--once") {

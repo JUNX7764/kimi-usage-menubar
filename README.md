@@ -7,9 +7,10 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 ## 功能
 
 - **配额用量**：5 小时窗口 / 7 天 / 月度配额的使用比例与重置时间
-- **Token 统计**：扫描本地会话日志，统计今天 / 近 7 天 / 近 30 天的 input/output 消耗（近 7/30 天为含今天共 7/30 个日历日，2026-11-03 起）
+- **Token 统计**：扫描本地会话日志与只读用量数据库，统计今天 / 近 7 天 / 近 30 天的 input/output 消耗（近 7/30 天为含今天共 7/30 个日历日，2026-11-03 起）
   - Kimi Work 本地会话（kimi-desktop daimon）
-  - API 客户端会话：Kimi Code CLI、Proma、Claude Code、Hermes Agent 等客户端中实际走 Kimi / Moonshot 模型的用量（按会话内的模型与接口地址字段甄别，其他模型的用量不计入）
+  - API 客户端会话：ZCode、Kimi Code CLI、Proma、Claude Code、Hermes Agent 等客户端中实际走 Kimi / Moonshot 模型的用量（按会话内的模型与接口地址字段甄别，其他模型的用量不计入）
+  - ZCode 以 `model_usage` 逐请求表为唯一来源，自动回填数据库保留的历史；不叠加 `turn_usage` 或并行日志，input 已含缓存读取/创建，不重复加 cache 字段
   - 已安装来源全部不可读时保留旧值并显示错误与 ⚠️ 过期标注，不静默沿用旧数据充当新鲜
 - **菜单栏**：常驻，纯本地运行，数据不上传
 - **刷新机制**
@@ -37,7 +38,7 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 - **凭据**：只读 Kimi 桌面端本地配置文件 `~/Library/Application Support/kimi-desktop/daimon-share/daimon/config.json`，不在本仓库保存任何凭据
 - **月度接口 401**：读取最新 refresh token；写回前重新读取最新 JSON，仅合并 Kimi Web 认证字段，以唯一临时文件和同目录原子替换保存，并限制为仅所有者可读写。若检测到 Kimi 客户端已轮换 access/refresh token，则保留客户端版本。由于官方客户端不使用共享文件锁，检查与替换之间仍无法完全消除并发写入窗口
 - **配额**：调用 Kimi 官方本地接口查询
-- **Token**：扫描本地会话 wire.jsonl 日志聚合
+- **Token**：扫描本地会话 wire.jsonl / 客户端 JSONL 日志，并只读查询 ZCode、Hermes 的 sqlite 用量表聚合
 
 ## 隐私与安全
 
@@ -49,6 +50,9 @@ macOS 菜单栏常驻，一瞥即知 Kimi 订阅的配额余量。原生 Swift �
 ```bash
 # 离线自检：只用临时目录和假凭据，不访问真实凭据、网络或会话缓存
 ./KimiUsage.app/Contents/MacOS/KimiUsage --self-test
+
+# 纯本地 token 对账：不读取凭据、不联网，重建并打印两类会话统计
+./KimiUsage.app/Contents/MacOS/KimiUsage --tokens-once
 
 # 固定假数据交互预览：不读取凭据、扫描缓存或写入状态，也不联网
 ./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview

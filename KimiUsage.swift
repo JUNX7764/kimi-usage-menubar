@@ -1715,7 +1715,9 @@ final class QuotaWindowView: NSView {
         let remaining = PanelUI.label(model.remaining.map { "\($0)%" } ?? "--",
             size: 14, weight: .semibold, color: remainingColor,
             wrapping: false, monospacedDigits: true)
-        remaining.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        // 保留两位百分比时的对齐宽度；100% 按实际文字宽度扩展，避免百分号被截断。
+        remaining.widthAnchor.constraint(greaterThanOrEqualToConstant: 40).isActive = true
+        remaining.setContentHuggingPriority(.required, for: .horizontal)
         remaining.setContentCompressionResistancePriority(.required, for: .horizontal)
         main.addArrangedSubview(remaining)
         let progress = QuotaProgressView(remaining: model.remaining)
@@ -2864,6 +2866,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lastFiveHourSuccessAt = now; lastSevenDaySuccessAt = now; lastMonthSuccessAt = now
         workTokensLastSuccessAt = now; cliTokensLastSuccessAt = now
         usage.fiveHourUsed = 0.23; usage.sevenDayUsed = 0.67; usage.monthUsed = 0.42
+        if args.contains("--visual-preview-full") {
+            usage.fiveHourUsed = 0; usage.sevenDayUsed = 0; usage.monthUsed = 0
+        }
         usage.planName = "Allegretto"
         usage.fiveHourReset = now.addingTimeInterval(18000); usage.sevenDayReset = now.addingTimeInterval(604800); usage.monthReset = now.addingTimeInterval(2592000)
         func previewStat(_ input: Double, _ output: Double, _ first: [Double], _ second: [Double]) -> TokenStat {

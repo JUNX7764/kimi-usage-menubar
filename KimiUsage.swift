@@ -248,13 +248,15 @@ enum TokenAggregator {
     struct FileScanState: Codable {
         var offset: UInt64 = 0
         var days: [String: [Double]] = [:]
-        /// Kimi Work 新旧格式混存：文件内一旦出现 usage.record，就只取 record，跳过 loop 镜像。
+        /// 已出现 usage.record 的 Work 文件，在追加后重扫以重新匹配镜像。
         var preferUsageRecord: Bool = false
+        var scanRevision: Int? = nil
     }
     struct ScanState: Codable {
         var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
         var cli: [String: FileScanState] = [:]    // API 客户端（仅 Kimi 模型）
         var hermes: HermesState?                  // hermes（sqlite 快照差分）
+        var zcodeDays: [String: [Double]]?          // 最近一次成功快照
     }
     /// hermes session_model_usage 是 (session,model,...) 级累计行：rows 存上次快照，
     /// 每次刷新做差，delta 按行的 last_seen 归入该 row 自己的 days。
@@ -275,9 +277,9 @@ enum TokenAggregator {
         }
     }
 
-    // v4：Kimi Work 按文件选择 usage.record / loop 镜像，修双写双算；弃用 v3 缓存强制重建
+    // v5：按来源归属模型并重建文件缓存；保留旧 Hermes 快照。
     static let statePath = NSHomeDirectory()
-        + "/Library/Application Support/KimiUsage/scan-state-v4.json"
+        + "/Library/Application Support/KimiUsage/scan-state-v5.json"
     private static var state: ScanState?
     private static let lock = NSLock()
 
@@ -291,9 +293,9 @@ enum TokenAggregator {
     }()
 
     /// Claude SDK / ZCode 可混接多家 API，按 model 字段甄别 Kimi。
-    /// 无 model 的逐调用行兼容 kimi-code 旧格式；Proma result 汇总行和 Kimi Code 双写行已先行排除。
+    /// 缺失模型默认不归属；可信 Kimi Code 目录的旧格式由调用方单独放行。
     static func isKimiModel(_ model: String?) -> Bool {
-        guard let m = model?.lowercased(), !m.isEmpty else { return true }
+        guard let m = model?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !m.isEmpty else { return false }
         if m.contains("kimi") || m.contains("moonshot") { return true }
         return m.hasPrefix("k") && m.count > 1 && m[m.index(after: m.startIndex)].isNumber
     }
@@ -305,7 +307,9 @@ enum TokenAggregator {
             state = s
             return s
         }
-        let s = ScanState()
+        // 保留旧缓存；每个文件在可读取时才按新规则重建。
+        let oldPath = statePath.replacingOccurrences(of: "scan-state-v5.json", with: "scan-state-v4.json")
+        let s = (FileManager.default.contents(atPath: oldPath)).flatMap { try? JSONDecoder().decode(ScanState.self, from: $0) } ?? ScanState()
         state = s
         return s
     }
@@ -339,21 +343,13 @@ enum TokenAggregator {
             hermesOK = scanHermes(into: &st)
         }
         var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
-        var zcodeDays: [String: [Double]]?
-        if FileManager.default.fileExists(atPath: zcodeDBPath) {
-            zcodeDays = scanZCode()
-            zcodeOK = zcodeDays != nil
+        if FileManager.default.fileExists(atPath: zcodeDBPath) || st.zcodeDays != nil {
+            zcodeOK = updateZCode(into: &st, at: zcodeDBPath)
         }
+        st.zcodeDays = st.zcodeDays?.filter { $0.key >= dayFmt.string(from: Date().addingTimeInterval(-retainSeconds)) }
         state = st
         if persist { saveState(st) }
-        var extraDays = st.hermes?.days ?? [:]
-        if let zcodeDays {
-            for (day, v) in zcodeDays {
-                var a = extraDays[day] ?? [0, 0]
-                a[0] += v[0]; a[1] += v[1]
-                extraDays[day] = a
-            }
-        }
+        let extraDays = mergeSourceDays(st.hermes?.days ?? [:], st.zcodeDays ?? [:])
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraDays: extraDays),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
@@ -361,13 +357,25 @@ enum TokenAggregator {
                                   hermesOK: hermesOK, zcodeOK: zcodeOK))
     }
 
+    static func mergeSourceDays(_ first: [String: [Double]], _ second: [String: [Double]]) -> [String: [Double]] {
+        var result = first
+        for (day, value) in second {
+            var total = result[day] ?? [0, 0]
+            total[0] += value[0]; total[1] += value[1]
+            result[day] = total
+        }
+        return result
+    }
+
     /// 失败面判定：有已安装来源（目录 / sqlite 库存在）但无一可读 → 错误；
     /// 全部未安装（路径不存在）返回 nil——没装对应工具时该来源自然为 0，不算失败；
-    /// 部分来源可读仍按成功（增量状态保留旧贡献，下轮自愈）
+    /// 部分来源失败时返回提示，并保留失败来源最近一次贡献。
     static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil) -> String? {
         let anySource = installed > 0 || hermesOK != nil || zcodeOK != nil
         let anySuccess = enumerated > 0 || hermesOK == true || zcodeOK == true
-        return (anySource && !anySuccess) ? "会话目录 / 客户端用量数据库均不可读" : nil
+        if anySource && !anySuccess { return "会话目录 / 客户端用量数据库均不可读" }
+        if enumerated < installed || hermesOK == false || zcodeOK == false { return "部分来源读取失败，显示上次数据" }
+        return nil
     }
 
     /// 窗口起算日：含今天共 7 / 30 个日历日（2026-11-03 起；此前为 8 / 31 天）
@@ -427,36 +435,44 @@ enum TokenAggregator {
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
                 // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
-                if st.offset == sizeU { files[path] = st; continue }
+                if st.offset == sizeU && st.scanRevision == 1 { files[path] = st; continue }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
                 if st.offset == 0, st.days.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
-                    st.offset = sizeU; files[path] = st; continue
+                    st.offset = sizeU; st.scanRevision = 1; files[path] = st; continue
                 }
                 // 截断/轮换：该文件的旧聚合已不可信，清零重扫
                 if sizeU < st.offset { st = FileScanState() }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                let rebuild = st.scanRevision != 1 || (!kimiOnly && st.preferUsageRecord)
+                if rebuild { st = FileScanState() }
                 fh.seek(toFileOffset: st.offset)
-                let data = fh.readDataToEndOfFile()
+                var data = fh.readDataToEndOfFile()
+                guard var lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
+                var text = String(data: data[..<lastNL], encoding: .utf8)
+                if !kimiOnly && st.offset > 0 && text.map(containsUsageRecord) == true {
+                    // 从 loop 增量切到 record：本轮即重扫并原子替换贡献。
+                    fh.seek(toFileOffset: 0)
+                    data = fh.readDataToEndOfFile()
+                    guard let end = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
+                    lastNL = end
+                    text = String(data: data[..<lastNL], encoding: .utf8)
+                    st = FileScanState()
+                }
                 try? fh.close()
-                // 只消费到最后一个完整换行：正在被写入的残缺行留给下次
-                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { continue }
                 let consumed = st.offset + UInt64(lastNL + 1)
-                if let text = String(data: data[..<lastNL], encoding: .utf8) {
-                    if !kimiOnly && !st.preferUsageRecord && containsUsageRecord(text) {
-                        // 已消费过 loop 的旧文件：发现 record 后清零，下轮从 0 重扫，撤掉镜像贡献。
-                        if st.offset > 0 {
-                            st = FileScanState(preferUsageRecord: true)
-                            files[path] = st
-                            continue
-                        }
-                        st.preferUsageRecord = true
-                    }
-                    parseLines(text, kimiOnly: kimiOnly, cutoffKey: cutoffKey,
-                               preferUsageRecord: st.preferUsageRecord, into: &st)
+                guard let text else { continue }
+                if kimiOnly {
+                    let trusted = realPath(root) == realPath(apiSessionsRoots[0])
+                    parseLines(text, kimiOnly: true, cutoffKey: cutoffKey, allowMissingModel: trusted, into: &st)
+                } else if st.offset == 0 {
+                    parseWorkLines(text, cutoffKey: cutoffKey, into: &st)
+                } else {
+                    parseLines(text, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
                 }
                 st.offset = consumed
+                st.scanRevision = 1
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 files[path] = st
             }
@@ -539,6 +555,12 @@ enum TokenAggregator {
     // ZCode 用量库：model_usage 每次逻辑请求一行；turn_usage / JSONL 是其汇总或并行日志，不叠加。
     private static let zcodeDBPath = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite"
 
+    static func updateZCode(into state: inout ScanState, at path: String, now: Date = Date()) -> Bool {
+        guard let days = scanZCode(at: path, now: now) else { return false }
+        state.zcodeDays = days
+        return true
+    }
+
     /// 直接按 started_at 索引读取近 31 天明细，天然支持历史回填，无需持久化扫描状态。
     /// input_tokens 已包含 cache read/write（provider_total = input + output），缓存字段不能再加。
     /// error / running 行若已有非零 token 也计入；cancelled 行通常为零，无需按状态丢弃真实消耗。
@@ -588,9 +610,34 @@ enum TokenAggregator {
         return false
     }
 
+    // 按日和 usage 内容配对镜像；未配对的历史 loop 保留。
+    static func parseWorkLines(_ text: String, cutoffKey: String, into st: inout FileScanState) {
+        let lines = text.split(separator: "\n").map(String.init)
+        func signature(_ line: String, type: String) -> String? {
+            guard let data = line.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  obj["type"] as? String == type,
+                  let ms = obj["time"] as? Double,
+                  let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any] ?? obj["usage"] as? [String: Any],
+                  let encoded = try? JSONSerialization.data(withJSONObject: usage, options: [.sortedKeys]),
+                  let value = String(data: encoded, encoding: .utf8) else { return nil }
+            return dayFmt.string(from: Date(timeIntervalSince1970: ms / 1000)) + value
+        }
+        var records: [String: Int] = [:]
+        for line in lines { if let key = signature(line, type: "usage.record") { records[key, default: 0] += 1 } }
+        for line in lines {
+            if let key = signature(line, type: "context.append_loop_event"), let n = records[key], n > 0 {
+                records[key] = n - 1
+                continue
+            }
+            parseLines(line, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
+        }
+        st.preferUsageRecord = !records.isEmpty
+    }
+
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
     static func parseLines(_ text: String, kimiOnly: Bool,
-                           cutoffKey: String, preferUsageRecord: Bool = false,
+                           cutoffKey: String, preferUsageRecord: Bool = false, allowMissingModel: Bool = false,
                            into st: inout FileScanState) {
         for line in text.split(separator: "\n", omittingEmptySubsequences: true)
         where line.contains("\"usage\"") {
@@ -623,7 +670,7 @@ enum TokenAggregator {
             if kimiOnly {
                 let model = (obj["message"] as? [String: Any])?["model"] as? String
                     ?? obj["model"] as? String
-                guard isKimiModel(model) else { continue }
+                guard isKimiModel(model) || (allowMissingModel && (model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { continue }
             }
             // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
             var input: Double = 0
@@ -976,7 +1023,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private var directory: URL?
 
-    func start(script: String) {
+    func start(script: String, targetTag: String, appPath: String) {
         if let window = window { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return }
         do {
             let dir = FileManager.default.temporaryDirectory.appendingPathComponent("usage-update-" + UUID().uuidString, isDirectory: true)
@@ -989,7 +1036,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
@@ -1014,7 +1061,7 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             let launch = Process()
             launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel]
+            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, targetTag, appPath]
             launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
             try launch.run(); launch.waitUntilExit()
             guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
@@ -1130,6 +1177,7 @@ enum UpdateCheck {
 final class UpdateChecker {
     static let shared = UpdateChecker()
     private(set) var available = false
+    private(set) var targetTag: String?
     private var etag: String?
     private var hasValidRelease = false
     private var lastCheck: Date?
@@ -1172,8 +1220,10 @@ final class UpdateChecker {
                     self.hasValidRelease = true
                     if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
+                        self.targetTag = self.available ? tag : nil
                     } else {
                         self.available = false
+                        self.targetTag = nil
                     }
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 }
@@ -2209,10 +2259,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cred = CredStore.load()
         var merged = UsageData()
         let group = DispatchGroup()
+        let quotaGroup = DispatchGroup()
         let mergeLock = NSLock()
 
         if let key = cred.codeApiKey, !key.isEmpty {
             group.enter()
+            quotaGroup.enter()
             Fetcher.fetchCodeUsage(apiKey: key) { r in
                 mergeLock.lock()
                 merged.fiveHourUsed = r.fiveHourUsed
@@ -2222,11 +2274,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.fiveHourError = r.fiveHourError
                 merged.sevenDayError = r.sevenDayError
                 mergeLock.unlock()
+                quotaGroup.leave()
                 group.leave()
             }
         } else {
             merged.fiveHourError = "no api key"
             merged.sevenDayError = "no api key"
+        }
+
+        // 额度先展示，不等待月度接口或本地扫描。
+        quotaGroup.notify(queue: .main) { [weak self] in
+            guard let self = self else { return }
+            mergeLock.lock()
+            let five = merged.fiveHourUsed, fiveReset = merged.fiveHourReset, fiveError = merged.fiveHourError
+            let seven = merged.sevenDayUsed, sevenReset = merged.sevenDayReset, sevenError = merged.sevenDayError
+            mergeLock.unlock()
+            if let five { self.usage.fiveHourUsed = five; self.usage.fiveHourReset = fiveReset; self.lastFiveHourSuccessAt = Date() }
+            if let seven { self.usage.sevenDayUsed = seven; self.usage.sevenDayReset = sevenReset; self.lastSevenDaySuccessAt = Date() }
+            self.usage.fiveHourError = fiveError; self.usage.sevenDayError = sevenError
+            self.updateUI()
         }
 
         if includeSlow, let token = CredStore.load().webToken, !token.isEmpty {
@@ -2309,13 +2375,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
                 if merged.monthError != nil { merged.planName = old.planName }
-                // 扫描失败：保留旧值（⚠️ 过期标注由 lastSuccess 不推进自然产生）
-                if merged.workTokensError != nil {
-                    merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
-                }
-                if merged.cliTokensError != nil {
-                    merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
-                }
+                // 即使部分来源失败，也显示健康来源的新贡献和失败来源的缓存。
+
             }
             self.usage = merged
             self.updateUI()
@@ -2331,7 +2392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func togglePanel() {
         guard let button = statusItem.button else { return }
         if !panelController.isOpen && !visualPreview {
-            refresh(manual: true)
+            refresh()
             checkForUpdate()
         }
         panelController.toggle(anchoredTo: button)
@@ -2658,7 +2719,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
-        UpdateProgressController.shared.start(script: script)
+        guard let tag = UpdateChecker.shared.targetTag else { return }
+        UpdateProgressController.shared.start(script: script, targetTag: tag, appPath: Bundle.main.bundleURL.path)
     }
 
     @objc func onQuit() { if visualPreview && CommandLine.arguments.contains("--visual-preview-key-test") { previewQuitCount += 1 } else { NSApp.terminate(nil) } }
@@ -2745,16 +2807,16 @@ enum KimiOfflineRegression {
                        "unreadable installed root was reported as success")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil) == nil,
                        "not-installed source was reported as failure")
-            try expect(TokenAggregator.sourceError(installed: 2, enumerated: 1, hermesOK: nil) == nil,
+            try expect(TokenAggregator.sourceError(installed: 2, enumerated: 1, hermesOK: nil) != nil,
                        "partially readable sources were reported as total failure")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: false) != nil,
                        "corrupt hermes db was reported as success")
-            try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: true) == nil,
+            try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: true) != nil,
                        "healthy hermes source did not clear the failure")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: false) != nil,
                        "corrupt ZCode db was reported as success")
-            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: false, zcodeOK: true) == nil,
-                       "healthy ZCode source did not clear the failure")
+            try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: false, zcodeOK: true) != nil,
+                       "partial failure was not reported")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: nil) == nil,
                        "not-installed sqlite sources were reported as failure")
             // 窗口口径：含今天共 7/30 个日历日（起算日 = 今天 −6/−29 天，此前 8/31 天）
@@ -2883,7 +2945,7 @@ enum KimiOfflineRegression {
                                            preferUsageRecord: true, into: &workMixed)
             try expect(totals(workMixed) == [35, 2], "Kimi Work record + loop mirror was double-counted")
 
-            // 增量格式升级：先只有 loop，追加 record 后自动清零重扫，最终只留 record。
+            // 增量格式升级：先只有 loop，追加 record 后同轮重扫，只留一份镜像。
             let workRoot = root.appendingPathComponent("work-scan").path
             try FileManager.default.createDirectory(atPath: workRoot, withIntermediateDirectories: true)
             let workPath = workRoot + "/wire.jsonl"
@@ -2896,10 +2958,25 @@ enum KimiOfflineRegression {
             append.write(Data((try jsonLine(usageRecord) + "\n").utf8))
             try append.close()
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
-            try expect(workFiles.values.first?.preferUsageRecord == true && workFiles.values.first.map(totals) == [0, 0],
-                       "work format upgrade did not reset old mirror contributions")
+            try expect(workFiles.values.first?.preferUsageRecord == true && workFiles.values.first.map(totals) == [35, 2],
+                       "work format upgrade lost or doubled contributions")
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
             try expect(workFiles.values.first.map(totals) == [35, 2], "work record-only rescan is wrong")
+
+            // 同一文件中的历史独有 loop 保留，镜像只计一次。
+            let uniqueLoop: [String: Any] = ["type": "context.append_loop_event", "time": eventMS,
+                                              "event": ["usage": ["inputOther": 7, "output": 1]]]
+            var mixedHistory = TokenAggregator.FileScanState()
+            try TokenAggregator.parseWorkLines([jsonLine(uniqueLoop), jsonLine(loopMirror), jsonLine(usageRecord)].joined(separator: "\n"), cutoffKey: "0000-00-00", into: &mixedHistory)
+            try expect(totals(mixedHistory) == [42, 3], "unmirrored work history lost or mirror duplicated")
+            var missingMixed = TokenAggregator.FileScanState()
+            var missingTrusted = TokenAggregator.FileScanState()
+            let missing = try jsonLine(["type": "usage.record", "time": eventMS, "usage": kimiUsage])
+            TokenAggregator.parseLines(missing, kimiOnly: true, cutoffKey: "0000-00-00", into: &missingMixed)
+            TokenAggregator.parseLines(missing, kimiOnly: true, cutoffKey: "0000-00-00", allowMissingModel: true, into: &missingTrusted)
+            try expect(totals(missingMixed) == [0, 0] && totals(missingTrusted) == [35, 2], "missing model source attribution wrong")
+            let oldJSON = Data("{\"work\":{},\"cli\":{}}".utf8)
+            try expect((try? JSONDecoder().decode(TokenAggregator.ScanState.self, from: oldJSON)) != nil, "old cache cannot decode")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]
@@ -2926,11 +3003,22 @@ enum KimiOfflineRegression {
             let nowSeconds = usageNow.timeIntervalSince1970
             let nowMS = Int64(nowSeconds * 1000)
             let oldMS = nowMS - Int64(40 * 86400 * 1000)
-            try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 100, 5, \(nowMS)), ('glm-5.3', 1000, 50, \(nowMS)), ('k3-256k', 7, 1, \(oldMS))")
+            try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 100, 5, \(nowMS)), ('glm-5.3', 1000, 50, \(nowMS)), (NULL, 500, 50, \(nowMS)), ('k3-256k', 7, 1, \(oldMS))")
             let zcodeDays = TokenAggregator.scanZCode(at: sqlitePath, now: usageNow)
             let todayKey = TokenAggregator.dayFmt.string(from: usageNow)
             try expect(zcodeDays != nil && zcodeDays?[todayKey] == [100, 5],
                        "ZCode model filtering, cache accounting, or retention is wrong")
+            var zState = TokenAggregator.ScanState()
+            try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "initial ZCode read failed")
+            try expect(!TokenAggregator.updateZCode(into: &zState, at: sqlitePath + ".missing", now: usageNow), "missing ZCode read succeeded")
+            try expect(zState.zcodeDays?[todayKey] == [100, 5], "failed ZCode read lost snapshot")
+            let beforeOther = [todayKey: [20.0, 0.0]]
+            let afterOther = [todayKey: [30.0, 0.0]]
+            try expect(TokenAggregator.mergeSourceDays(beforeOther, zState.zcodeDays ?? [:])[todayKey] == [120, 5] &&
+                       TokenAggregator.mergeSourceDays(afterOther, zState.zcodeDays ?? [:])[todayKey] == [130, 5], "healthy source increment lost during ZCode failure")
+            try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 8, 2, \(nowMS))")
+            try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "ZCode recovery failed")
+            try expect(zState.zcodeDays?[todayKey] == [108, 7], "ZCode recovery double counted")
             try exec("""
                 CREATE TABLE session_model_usage (
                     session_id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT,

@@ -1104,7 +1104,8 @@ enum Fmt {
 }
 
 
-// 更新任务由独立 launchd 作业执行，应用退出换包时作业仍可完成或回滚。
+// 更新任务由应用直接启动的独立进程执行，应用退出换包后仍可完成或回滚。
+// 不用 launchctl submit：其隐私权限上下文可能无法移动 Documents 下的 .app。
 final class UpdateProgressController: NSObject, NSWindowDelegate {
     static let shared = UpdateProgressController()
     private var window: NSWindow?
@@ -1126,14 +1127,13 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             #!/bin/bash
             cd "$1" || exit 1
             export UPDATE_PROGRESS_FILE="$1/progress"
-            /bin/bash "$1/update.sh" "$3" "$4" > "$1/log" 2>&1
+            /bin/bash "$1/update.sh" "$2" "$3" > "$1/log" 2>&1
             result=$?
             printf '%s' "$result" > "$1/result"
             if [ "$result" -ne 0 ] && /usr/bin/grep -q '4/5' "$1/log"; then
                 /usr/bin/osascript -e 'display dialog "更新失败，已尝试恢复旧版本。请重新打开应用后重试。" with title "更新失败" buttons {"好"} default button 1 with icon caution' >/dev/null 2>&1
             fi
             if [ "$result" -eq 0 ]; then /bin/sleep 5; /bin/rm -rf "$1"; fi
-            /bin/launchctl remove "$2" >/dev/null 2>&1
             exit "$result"
             """
             try wrapperText.write(to: wrapper, atomically: true, encoding: .utf8)
@@ -1148,13 +1148,12 @@ final class UpdateProgressController: NSObject, NSWindowDelegate {
             win.contentView?.addSubview(label); win.contentView?.addSubview(bar)
             status = label; progress = bar; window = win
             win.center(); win.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-            let launch = Process()
-            launch.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-            let jobLabel = "com.local.usage-update." + UUID().uuidString
-            launch.arguments = ["submit", "-l", jobLabel, "--", "/bin/bash", wrapper.path, dir.path, jobLabel, targetTag, appPath]
-            launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice
-            try launch.run(); launch.waitUntilExit()
-            guard launch.terminationStatus == 0 else { throw NSError(domain: "Update", code: Int(launch.terminationStatus)) }
+            let update = Process()
+            update.executableURL = URL(fileURLWithPath: "/bin/bash")
+            update.arguments = [wrapper.path, dir.path, targetTag, appPath]
+            update.standardInput = FileHandle.nullDevice
+            update.standardOutput = FileHandle.nullDevice; update.standardError = FileHandle.nullDevice
+            try update.run()
             timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.refresh() }
         } catch {
             finishError("无法启动更新，请稍后重试。")

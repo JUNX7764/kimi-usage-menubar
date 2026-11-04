@@ -479,6 +479,15 @@ echo "build" >> "$MOCK_LOG"
         self.assertFalse(any(line.startswith("git tag") for line in self.log_lines()))
         self.assertFalse(any(line.startswith("git push") for line in self.log_lines()))
 
+    def test_update_process_preserves_user_file_permissions(self):
+        source = (ROOT / f"{EXECUTABLE}.swift").read_text()
+        controller = source.split("final class UpdateProgressController", 1)[1].split("// MARK: - 版本与更新检查", 1)[0]
+        self.assertNotIn('"submit"', controller)
+        self.assertNotIn("launchctl remove", controller)
+        self.assertNotIn("update.waitUntilExit()", controller)
+        self.assertIn('update.executableURL = URL(fileURLWithPath: "/bin/bash")', controller)
+        self.assertIn("update.arguments = [wrapper.path, dir.path, targetTag, appPath]", controller)
+
     def test_codesign_failure_blocks_build(self):
         project = self.base / "build-project"
         (project / "scripts").mkdir(parents=True)

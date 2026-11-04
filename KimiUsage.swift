@@ -174,9 +174,16 @@ enum CredStore {
 
 // MARK: - 用量数据模型
 
+struct ModelTokenStat {
+    var input: Double = 0
+    var output: Double = 0
+    var total: Double { input + output }
+}
+
 struct TokenStat {
     var input: Double = 0    // 含缓存读取/创建的输入
     var output: Double = 0
+    var models: [String: ModelTokenStat] = [:]
     var total: Double { input + output }
     var isEmpty: Bool { input == 0 && output == 0 }
 }
@@ -244,10 +251,13 @@ enum TokenAggregator {
         NSHomeDirectory() + "/.claude/projects"
     ]
 
-    // 按文件增量扫描状态：offset 为已消费字节数，days 为按日聚合 [input, output]
+    typealias ModelDays = [String: [String: [Double]]]  // day -> model -> [input, output]
+
+    // days 保留用于兼容旧缓存与对账；modelDays 是窗口汇总和模型明细的共同数据源。
     struct FileScanState: Codable {
         var offset: UInt64 = 0
         var days: [String: [Double]] = [:]
+        var modelDays: ModelDays = [:]
         /// 已出现 usage.record 的 Work 文件，在追加后重扫以重新匹配镜像。
         var preferUsageRecord: Bool = false
         var scanRevision: Int? = nil
@@ -256,7 +266,8 @@ enum TokenAggregator {
         var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
         var cli: [String: FileScanState] = [:]    // API 客户端（仅 Kimi 模型）
         var hermes: HermesState?                  // hermes（sqlite 快照差分）
-        var zcodeDays: [String: [Double]]?          // 最近一次成功快照
+        var zcodeDays: [String: [Double]]?         // 最近一次成功快照（兼容旧调用）
+        var zcodeModelDays: ModelDays?             // 同一快照的模型维度
     }
     /// hermes session_model_usage 是 (session,model,...) 级累计行：rows 存上次快照，
     /// 每次刷新做差，delta 按行的 last_seen 归入该 row 自己的 days。
@@ -275,11 +286,24 @@ enum TokenAggregator {
             }
             return total
         }
+        var modelDays: ModelDays {
+            var result: ModelDays = [:]
+            for (key, days) in rowDays {
+                let fields = key.split(separator: "|", omittingEmptySubsequences: false)
+                let model = fields.count > 1 ? TokenAggregator.normalizedModel(String(fields[1])) : "未知模型"
+                for (day, value) in days {
+                    var current = result[day]?[model] ?? [0, 0]
+                    current[0] += value[0]; current[1] += value[1]
+                    result[day, default: [:]][model] = current
+                }
+            }
+            return result
+        }
     }
 
-    // v5：按来源归属模型并重建文件缓存；保留旧 Hermes 快照。
+    // v6：增加按天按模型聚合并重建文件缓存；保留旧 Hermes / ZCode 快照。
     static let statePath = NSHomeDirectory()
-        + "/Library/Application Support/KimiUsage/scan-state-v5.json"
+        + "/Library/Application Support/KimiUsage/scan-state-v6.json"
     private static var state: ScanState?
     private static let lock = NSLock()
 
@@ -300,6 +324,11 @@ enum TokenAggregator {
         return m.hasPrefix("k") && m.count > 1 && m[m.index(after: m.startIndex)].isNumber
     }
 
+    static func normalizedModel(_ model: String?) -> String {
+        let name = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? "未知模型" : name
+    }
+
     private static func loadState() -> ScanState {
         if let s = state { return s }
         if let data = FileManager.default.contents(atPath: statePath),
@@ -307,8 +336,8 @@ enum TokenAggregator {
             state = s
             return s
         }
-        // 保留旧缓存；每个文件在可读取时才按新规则重建。
-        let oldPath = statePath.replacingOccurrences(of: "scan-state-v5.json", with: "scan-state-v4.json")
+        // 保留旧缓存；文件通过 scanRevision 全量重建，sqlite 快照继续增量对账。
+        let oldPath = statePath.replacingOccurrences(of: "scan-state-v6.json", with: "scan-state-v5.json")
         let s = (FileManager.default.contents(atPath: oldPath)).flatMap { try? JSONDecoder().decode(ScanState.self, from: $0) } ?? ScanState()
         state = s
         return s
@@ -343,15 +372,19 @@ enum TokenAggregator {
             hermesOK = scanHermes(into: &st)
         }
         var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
-        if FileManager.default.fileExists(atPath: zcodeDBPath) || st.zcodeDays != nil {
+        if FileManager.default.fileExists(atPath: zcodeDBPath) || st.zcodeDays != nil || st.zcodeModelDays != nil {
             zcodeOK = updateZCode(into: &st, at: zcodeDBPath)
         }
-        st.zcodeDays = st.zcodeDays?.filter { $0.key >= dayFmt.string(from: Date().addingTimeInterval(-retainSeconds)) }
+        let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
+        st.zcodeDays = st.zcodeDays?.filter { $0.key >= cutoffKey }
+        st.zcodeModelDays = st.zcodeModelDays?.filter { $0.key >= cutoffKey }
         state = st
         if persist { saveState(st) }
-        let extraDays = mergeSourceDays(st.hermes?.days ?? [:], st.zcodeDays ?? [:])
+        // 旧缓存没有模型维度时保留总量并归入未知模型；数据库恢复后会自动替换为真实模型。
+        let zcodeModels = st.zcodeModelDays ?? (st.zcodeDays ?? [:]).mapValues { ["未知模型": $0] }
+        let extraModels = mergeSourceModelDays(st.hermes?.modelDays ?? [:], zcodeModels)
         return BothStats(
-            work: buckets(st.work), cli: buckets(st.cli, extraDays: extraDays),
+            work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
             cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
                                   hermesOK: hermesOK, zcodeOK: zcodeOK))
@@ -363,6 +396,18 @@ enum TokenAggregator {
             var total = result[day] ?? [0, 0]
             total[0] += value[0]; total[1] += value[1]
             result[day] = total
+        }
+        return result
+    }
+
+    static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
+        var result = first
+        for (day, models) in second {
+            for (model, value) in models {
+                var total = result[day]?[model] ?? [0, 0]
+                total[0] += value[0]; total[1] += value[1]
+                result[day, default: [:]][model] = total
+            }
         }
         return result
     }
@@ -434,12 +479,12 @@ enum TokenAggregator {
                 else { continue }
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
-                // Work v2 重建早期镜像匹配缓存；API 客户端继续使用 v1。
-                let revision = kimiOnly ? 1 : 2
+                // v3 / v2 为模型维度重建文件贡献，后续仍只读追加字节。
+                let revision = kimiOnly ? 2 : 3
                 // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
                 if st.offset == sizeU && st.scanRevision == revision { files[path] = st; continue }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
-                if st.offset == 0, st.days.isEmpty,
+                if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
                     st.offset = sizeU; st.scanRevision = revision; files[path] = st; continue
                 }
@@ -476,6 +521,7 @@ enum TokenAggregator {
                 st.offset = consumed
                 st.scanRevision = revision
                 st.days = st.days.filter { $0.key >= cutoffKey }
+                st.modelDays = st.modelDays.filter { $0.key >= cutoffKey }
                 files[path] = st
             }
         }
@@ -558,15 +604,27 @@ enum TokenAggregator {
     private static let zcodeDBPath = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite"
 
     static func updateZCode(into state: inout ScanState, at path: String, now: Date = Date()) -> Bool {
-        guard let days = scanZCode(at: path, now: now) else { return false }
-        state.zcodeDays = days
+        guard let modelDays = scanZCodeModelDays(at: path, now: now) else { return false }
+        state.zcodeModelDays = modelDays
+        state.zcodeDays = days(from: modelDays)
         return true
+    }
+
+    static func days(from modelDays: ModelDays) -> [String: [Double]] {
+        modelDays.mapValues { models in
+            models.values.reduce([0, 0]) { [$0[0] + $1[0], $0[1] + $1[1]] }
+        }
+    }
+
+    /// 兼容既有对账调用；窗口展示使用同一快照的模型维度。
+    static func scanZCode(at path: String = zcodeDBPath, now: Date = Date()) -> [String: [Double]]? {
+        scanZCodeModelDays(at: path, now: now).map { days(from: $0) }
     }
 
     /// 直接按 started_at 索引读取近 31 天明细，天然支持历史回填，无需持久化扫描状态。
     /// input_tokens 已包含 cache read/write（provider_total = input + output），缓存字段不能再加。
     /// error / running 行若已有非零 token 也计入；cancelled 行通常为零，无需按状态丢弃真实消耗。
-    static func scanZCode(at path: String = zcodeDBPath, now: Date = Date()) -> [String: [Double]]? {
+    static func scanZCodeModelDays(at path: String = zcodeDBPath, now: Date = Date()) -> ModelDays? {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
         else { return nil }
@@ -582,7 +640,7 @@ enum TokenAggregator {
         let cutoff = now.addingTimeInterval(-retainSeconds)
         sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
         let cutoffKey = dayFmt.string(from: cutoff)
-        var days: [String: [Double]] = [:]
+        var days: ModelDays = [:]
         while true {
             let rc = sqlite3_step(stmt)
             if rc == SQLITE_DONE { break }
@@ -593,10 +651,10 @@ enum TokenAggregator {
             guard startedAt > 0 else { continue }
             let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: startedAt / 1000))
             guard dayKey >= cutoffKey else { continue }
-            var day = days[dayKey] ?? [0, 0]
-            day[0] += sqlite3_column_double(stmt, 1)
-            day[1] += sqlite3_column_double(stmt, 2)
-            days[dayKey] = day
+            var value = days[dayKey]?[model] ?? [0, 0]
+            value[0] += sqlite3_column_double(stmt, 1)
+            value[1] += sqlite3_column_double(stmt, 2)
+            days[dayKey, default: [:]][model] = value
         }
         return days
     }
@@ -700,12 +758,14 @@ enum TokenAggregator {
                 ?? obj["usage"] as? [String: Any]
                 ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
             guard let usage = usage else { continue }
-            // 混接客户端只统计 Kimi 模型的行
+            let event = obj["event"] as? [String: Any] ?? [:]
+            let rawModel = (obj["message"] as? [String: Any])?["model"] as? String
+                ?? obj["model"] as? String ?? event["model"] as? String
+            // 混接客户端只统计 Kimi 模型的行；可信旧格式与 Work 旧镜像归入未知模型。
             if kimiOnly {
-                let model = (obj["message"] as? [String: Any])?["model"] as? String
-                    ?? obj["model"] as? String
-                guard isKimiModel(model) || (allowMissingModel && (model?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { continue }
+                guard isKimiModel(rawModel) || (allowMissingModel && (rawModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { continue }
             }
+            let model = normalizedModel(rawModel)
             // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
             var input: Double = 0
             for k in ["inputOther", "inputCacheRead", "inputCacheCreation",
@@ -726,37 +786,38 @@ enum TokenAggregator {
                 day[0] += input
                 day[1] += output
                 st.days[dayKey] = day
+                var modelDay = st.modelDays[dayKey]?[model] ?? [0, 0]
+                modelDay[0] += input
+                modelDay[1] += output
+                st.modelDays[dayKey, default: [:]][model] = modelDay
             }
         }
     }
 
-    /// 按日聚合 → 今日/近7天/近30天三个窗口；extraDays 用于合并非文件来源（hermes）
-    private static func buckets(_ files: [String: FileScanState],
-                                extraDays: [String: [Double]]? = nil)
+    /// 按日 × 模型聚合同步生成窗口汇总与明细，保证各模型之和等于周期总量。
+    static func buckets(_ files: [String: FileScanState], extraModelDays: ModelDays = [:])
         -> (TokenStat, TokenStat, TokenStat) {
         let now = Date()
         let todayKey = dayFmt.string(from: now)
         let (d7Key, d30Key) = windowCutoffs(now: now)
         var today = TokenStat(), week = TokenStat(), month = TokenStat()
-        var allDays: [String: [Double]] = [:]
+        var allDays: ModelDays = [:]
         for (_, st) in files {
-            for (day, v) in st.days {
-                var a = allDays[day] ?? [0, 0]
-                a[0] += v[0]; a[1] += v[1]
-                allDays[day] = a
-            }
+            allDays = mergeSourceModelDays(allDays, st.modelDays)
         }
-        if let extra = extraDays {
-            for (day, v) in extra {
-                var a = allDays[day] ?? [0, 0]
-                a[0] += v[0]; a[1] += v[1]
-                allDays[day] = a
-            }
+        allDays = mergeSourceModelDays(allDays, extraModelDays)
+        func add(_ value: [Double], model: String, to stat: inout TokenStat) {
+            stat.input += value[0]; stat.output += value[1]
+            var current = stat.models[model] ?? ModelTokenStat()
+            current.input += value[0]; current.output += value[1]
+            stat.models[model] = current
         }
-        for (day, v) in allDays where day >= d30Key {
-            month.input += v[0]; month.output += v[1]
-            if day >= d7Key { week.input += v[0]; week.output += v[1] }
-            if day >= todayKey { today.input += v[0]; today.output += v[1] }
+        for (day, models) in allDays where day >= d30Key {
+            for (model, value) in models {
+                add(value, model: model, to: &month)
+                if day >= d7Key { add(value, model: model, to: &week) }
+                if day >= todayKey { add(value, model: model, to: &today) }
+            }
         }
         return (today, week, month)
     }
@@ -1338,12 +1399,19 @@ struct UsagePanelModel {
         var rows: [TiboRow]
         var notices: [Notice]
     }
+    struct TokenModel {
+        var name: String
+        var total: String
+        var input: String
+        var output: String
+    }
     struct TokenBucket {
         var summaryLabel: String
         var detailLabel: String
         var total: String
         var input: String
         var output: String
+        var models: [TokenModel]
     }
     struct TokenSection {
         var title: String
@@ -1719,6 +1787,8 @@ final class UsagePanelController: NSObject {
     var onCheckUpdate: (() -> Void)?
     private var codexExpanded = true
     private var externalExpanded = true
+    private var expandedCodexBuckets: Set<Int> = []
+    private var expandedExternalBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
@@ -1889,9 +1959,13 @@ final class UsagePanelController: NSObject {
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
         }
-        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded, target: self, action: #selector(toggleCodex)))
+        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
+            expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
+            bucketAction: #selector(toggleCodexBucket(_:))))
         if let external = model.externalTokens {
-            addContentRow(TokenSectionView(model: external, expanded: externalExpanded, target: self, action: #selector(toggleExternal)))
+            addContentRow(TokenSectionView(model: external, expanded: externalExpanded,
+                expandedBuckets: expandedExternalBuckets, target: self, action: #selector(toggleExternal),
+                bucketAction: #selector(toggleExternalBucket(_:))))
         }
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
@@ -1913,6 +1987,16 @@ final class UsagePanelController: NSObject {
     }
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleCodexBucket(_ sender: NSButton) {
+        if expandedCodexBuckets.contains(sender.tag) { expandedCodexBuckets.remove(sender.tag) }
+        else { expandedCodexBuckets.insert(sender.tag) }
+        refreshPanelLayout()
+    }
+    @objc private func toggleExternalBucket(_ sender: NSButton) {
+        if expandedExternalBuckets.contains(sender.tag) { expandedExternalBuckets.remove(sender.tag) }
+        else { expandedExternalBuckets.insert(sender.tag) }
+        refreshPanelLayout()
+    }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
@@ -2022,7 +2106,61 @@ final class UsagePanelController: NSObject {
         toggleCodex()
         guard codexExpanded, !externalExpanded else { return false }
         toggleExternal()
-        return codexExpanded && externalExpanded
+        return codexExpanded && externalExpanded && verifyTokenBucketInteractionsForPreview()
+    }
+
+    func expandAllTokenBucketsForPreview() {
+        expandedCodexBuckets = [0, 1, 2]
+        expandedExternalBuckets = [0, 1, 2]
+        refreshPanelLayout()
+    }
+
+    /// 逐一点击两个板块的三个周期行，核对明细数量、列坐标和刷新后的展开状态。
+    func verifyTokenBucketInteractionsForPreview() -> Bool {
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        func rows(_ action: Selector) -> [TokenBucketRow] {
+            descendants(stack).compactMap { $0 as? TokenBucketRow }
+                .filter { $0.action == action }.sorted { $0.tag < $1.tag }
+        }
+        func details() -> [TokenDetailRow] {
+            descendants(stack).compactMap { $0 as? TokenDetailRow }.filter { $0.isModelDetail }
+        }
+        func detailCount() -> Int { details().count }
+        func numericColumnsAligned() -> Bool {
+            panel.contentView?.layoutSubtreeIfNeeded()
+            stack.layoutSubtreeIfNeeded()
+            let summary = rows(#selector(toggleCodexBucket(_:)))[0].cells
+            guard let detail = details().first else { return false }
+            for index in 1..<4 {
+                let summaryLabel = summary.columnLabels[index]
+                let detailLabel = detail.columnLabels[index]
+                let summaryFrame = summaryLabel.convert(summaryLabel.bounds, to: stack)
+                let detailFrame = detailLabel.convert(detailLabel.bounds, to: stack)
+                guard abs(summaryFrame.minX - detailFrame.minX) < 0.5,
+                      abs(summaryFrame.width - detailFrame.width) < 0.5 else { return false }
+            }
+            return true
+        }
+        guard rows(#selector(toggleCodexBucket(_:))).count == 3,
+              rows(#selector(toggleExternalBucket(_:))).count == 3,
+              detailCount() == 0 else { return false }
+        for (index, expected) in [(0, 2), (1, 4), (2, 6)] {
+            rows(#selector(toggleCodexBucket(_:)))[index].performClick(nil)
+            guard detailCount() == expected else { return false }
+            if index == 0, !numericColumnsAligned() { return false }
+        }
+        rows(#selector(toggleCodexBucket(_:)))[1].performClick(nil)
+        guard detailCount() == 4 else { return false }
+        for (index, expected) in [(0, 6), (1, 8), (2, 10)] {
+            rows(#selector(toggleExternalBucket(_:)))[index].performClick(nil)
+            guard detailCount() == expected else { return false }
+        }
+        rows(#selector(toggleExternalBucket(_:)))[1].performClick(nil)
+        guard detailCount() == 8, let model = model else { return false }
+        update(model: model)
+        return expandedCodexBuckets == [0, 2] && expandedExternalBuckets == [0, 2] && detailCount() == 8
     }
 
     /// 视觉回归专用：真实滚动到底部并确认 clip view 位置发生变化。
@@ -2129,18 +2267,29 @@ final class UsagePanelController: NSObject {
 }
 
 private final class TokenDetailRow: NSView {
-    init(values: [String], header: Bool, accent: PanelAccent) {
+    let isModelDetail: Bool
+    private(set) var columnLabels: [NSTextField] = []
+
+    init(values: [String], header: Bool, accent: PanelAccent, modelDetail: Bool = false) {
+        isModelDetail = modelDetail
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
         row.distribution = .fillEqually
         for (index, value) in values.enumerated() {
-            let label = PanelUI.label(value, size: header ? 10 : 11,
-                weight: header ? .regular : (index == 0 ? .regular : .semibold),
-                color: header ? .secondaryLabelColor : (index == 1 ? accent.color : .labelColor),
+            let size: CGFloat = header ? 10 : (modelDetail ? (index == 0 ? 9 : 10) : 11)
+            let label = PanelUI.label(value, size: size,
+                weight: header || modelDetail ? .regular : (index == 0 ? .regular : .semibold),
+                color: header || modelDetail ? .secondaryLabelColor : (index == 1 ? accent.color : .labelColor),
                 wrapping: false, monospacedDigits: !header && index > 0)
             label.alignment = index == 0 ? .left : .right
+            if modelDetail && index == 0 {
+                label.maximumNumberOfLines = 1
+                label.lineBreakMode = .byTruncatingMiddle
+                label.toolTip = value
+            }
             row.addArrangedSubview(label)
+            columnLabels.append(label)
         }
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -2153,8 +2302,44 @@ private final class TokenDetailRow: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+private final class TokenBucketRow: NSButton {
+    let cells: TokenDetailRow
+
+    init(bucket: UsagePanelModel.TokenBucket, accent: PanelAccent, expanded: Bool,
+         tag: Int, target: AnyObject, action: Selector) {
+        cells = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output],
+            header: false, accent: accent)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        title = ""
+        isBordered = false
+        isEnabled = !bucket.models.isEmpty
+        self.tag = tag
+        self.target = target
+        self.action = action
+        addSubview(cells)
+        NSLayoutConstraint.activate([
+            cells.topAnchor.constraint(equalTo: topAnchor),
+            cells.leadingAnchor.constraint(equalTo: leadingAnchor),
+            cells.trailingAnchor.constraint(equalTo: trailingAnchor),
+            cells.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+        let summary = "\(bucket.detailLabel)，总量 \(bucket.total)，输入 \(bucket.input)，输出 \(bucket.output)"
+        toolTip = bucket.models.isEmpty ? "暂无模型明细" : (expanded ? "收起模型明细" : "展开模型明细")
+        setAccessibilityLabel(summary + (bucket.models.isEmpty ? "，无模型明细" : "，\(expanded ? "收起" : "展开")模型明细"))
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard isEnabled, let parent = superview else { return super.hitTest(point) }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 private final class TokenSectionView: NSView {
-    init(model: UsagePanelModel.TokenSection, expanded: Bool, target: AnyObject, action: Selector) {
+    init(model: UsagePanelModel.TokenSection, expanded: Bool, expandedBuckets: Set<Int>,
+         target: AnyObject, action: Selector, bucketAction: Selector) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 3)
@@ -2172,12 +2357,22 @@ private final class TokenSectionView: NSView {
         header.addArrangedSubview(toggle)
         PanelUI.addFullWidth(header, to: root)
         if expanded {
-        let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
-        PanelUI.addFullWidth(tableHeader, to: root)
-        for bucket in model.buckets {
-            let row = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output], header: false, accent: model.accent)
-            PanelUI.addFullWidth(row, to: root)
-        }
+            let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
+            PanelUI.addFullWidth(tableHeader, to: root)
+            for (index, bucket) in model.buckets.enumerated() {
+                let row = TokenBucketRow(bucket: bucket, accent: model.accent,
+                    expanded: expandedBuckets.contains(index), tag: index, target: target, action: bucketAction)
+                PanelUI.addFullWidth(row, to: root)
+                if expandedBuckets.contains(index) {
+                    for (modelIndex, tokenModel) in bucket.models.enumerated() {
+                        let detail = TokenDetailRow(values: [tokenModel.name, tokenModel.total,
+                            tokenModel.input, tokenModel.output], header: false,
+                            accent: model.accent, modelDetail: true)
+                        PanelUI.addFullWidth(detail, to: root)
+                        if modelIndex == bucket.models.count - 1 { root.setCustomSpacing(8, after: detail) }
+                    }
+                }
+            }
         }
         for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
         addSubview(root)
@@ -2598,7 +2793,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let rows = zip(names, values).map { name, stat in
                 UsagePanelModel.TokenBucket(summaryLabel: name, detailLabel: name,
                     total: stat.map { Fmt.tokens($0.total) } ?? "--", input: stat.map { Fmt.tokens($0.input) } ?? "--",
-                    output: stat.map { Fmt.tokens($0.output) } ?? "--")
+                    output: stat.map { Fmt.tokens($0.output) } ?? "--",
+                    models: (stat?.models ?? [:]).filter { $0.value.total > 0 }
+                        .sorted { $0.value.total != $1.value.total ? $0.value.total > $1.value.total : $0.key < $1.key }
+                        .map { UsagePanelModel.TokenModel(name: $0.key, total: Fmt.tokens($0.value.total),
+                            input: Fmt.tokens($0.value.input), output: Fmt.tokens($0.value.output)) })
             }
             var notices: [UsagePanelModel.Notice] = []
             if stale { notices.append(notice("⚠ 已过期 · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")", .warning)) }
@@ -2634,8 +2833,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.fiveHourUsed = 0.23; usage.sevenDayUsed = 0.67; usage.monthUsed = 0.42
         usage.planName = "Allegretto"
         usage.fiveHourReset = now.addingTimeInterval(18000); usage.sevenDayReset = now.addingTimeInterval(604800); usage.monthReset = now.addingTimeInterval(2592000)
-        usage.tokensToday = TokenStat(input: 1230000, output: 320000); usage.tokens7d = TokenStat(input: 8200000, output: 1200000); usage.tokens30d = TokenStat(input: 32000000, output: 5100000)
-        usage.cliTokensToday = TokenStat(input: 5400000, output: 230000); usage.cliTokens7d = TokenStat(input: 61000000, output: 890000); usage.cliTokens30d = TokenStat(input: 440000000, output: 2100000)
+        func previewStat(_ input: Double, _ output: Double, _ first: [Double], _ second: [Double]) -> TokenStat {
+            var stat = TokenStat(input: input, output: output)
+            stat.models = ["k3.1-pro": ModelTokenStat(input: first[0], output: first[1]),
+                           "k3-256k": ModelTokenStat(input: second[0], output: second[1])]
+            return stat
+        }
+        usage.tokensToday = previewStat(1230000, 320000, [800000, 200000], [430000, 120000])
+        usage.tokens7d = previewStat(8200000, 1200000, [6000000, 800000], [2200000, 400000])
+        usage.tokens30d = previewStat(32000000, 5100000, [24000000, 4000000], [8000000, 1100000])
+        usage.cliTokensToday = previewStat(5400000, 230000, [4000000, 180000], [1400000, 50000])
+        usage.cliTokens7d = previewStat(61000000, 890000, [45000000, 700000], [16000000, 190000])
+        usage.cliTokens30d = previewStat(440000000, 2100000, [320000000, 1500000], [120000000, 600000])
         if args.contains("--visual-preview-empty") { usage = UsageData() }
         if args.contains("--visual-preview-states") || args.contains("--visual-preview-long") {
             let message = args.contains("--visual-preview-long") ? String(repeating: "网络连接失败，请稍后重试。", count: 80) : "网络连接失败"
@@ -2646,6 +2855,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
             self.panelController.toggle(anchoredTo: button)
+            if args.contains("--visual-preview-models") { self.panelController.expandAllTokenBucketsForPreview() }
             if args.contains("--visual-preview-test") {
                 guard self.panelController.verifyPreviewInteractions(expectScroll: args.contains("--visual-preview-long")) else {
                     fputs("KimiUsage visual interaction test: FAIL\n", stderr); exit(1)
@@ -3028,6 +3238,18 @@ enum KimiOfflineRegression {
                                            kimiOnly: false, cutoffKey: "0000-00-00",
                                            preferUsageRecord: true, into: &workMixed)
             try expect(totals(workMixed) == [35, 2], "Kimi Work record + loop mirror was double-counted")
+            let modelDayKey = TokenAggregator.dayFmt.string(from: Date())
+            try expect(apiFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && workMixed.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && workFile.modelDays[modelDayKey]?["未知模型"] == [35, 2],
+                       "model attribution or legacy unknown-model fallback is wrong")
+            let switchedRecord = try jsonLine(["type": "usage.record", "time": eventMS + 1,
+                                               "model": "k3-256k", "usage": kimiUsage])
+            TokenAggregator.parseLines(switchedRecord, kimiOnly: true, cutoffKey: "0000-00-00", into: &apiFile)
+            try expect(totals(apiFile) == [70, 4]
+                       && apiFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && apiFile.modelDays[modelDayKey]?["k3-256k"] == [35, 2],
+                       "model switching mixed or dropped token contributions")
 
             // 增量格式升级：先只有 loop，追加 record 后同轮重扫，只留一份镜像。
             let workRoot = root.appendingPathComponent("work-scan").path
@@ -3058,9 +3280,35 @@ enum KimiOfflineRegression {
             let missing = try jsonLine(["type": "usage.record", "time": eventMS, "usage": kimiUsage])
             TokenAggregator.parseLines(missing, kimiOnly: true, cutoffKey: "0000-00-00", into: &missingMixed)
             TokenAggregator.parseLines(missing, kimiOnly: true, cutoffKey: "0000-00-00", allowMissingModel: true, into: &missingTrusted)
-            try expect(totals(missingMixed) == [0, 0] && totals(missingTrusted) == [35, 2], "missing model source attribution wrong")
+            try expect(totals(missingMixed) == [0, 0] && totals(missingTrusted) == [35, 2]
+                       && missingTrusted.modelDays[modelDayKey]?["未知模型"] == [35, 2],
+                       "missing model source attribution wrong")
+            try expect(mixedHistory.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && mixedHistory.modelDays[modelDayKey]?["未知模型"] == [7, 1],
+                       "mirrored and legacy Work models were not reconciled")
             let oldJSON = Data("{\"work\":{},\"cli\":{}}".utf8)
             try expect((try? JSONDecoder().decode(TokenAggregator.ScanState.self, from: oldJSON)) != nil, "old cache cannot decode")
+
+            // 三个窗口与模型明细共用数据源：今日 < 7 天 < 30 天，模型之和严格等于汇总。
+            func offsetDay(_ days: Int) -> String {
+                TokenAggregator.dayFmt.string(from: Date().addingTimeInterval(TimeInterval(days * 86400)))
+            }
+            var windowFile = TokenAggregator.FileScanState()
+            windowFile.modelDays = [
+                offsetDay(0): ["k3.1-pro": [60, 6], "未知模型": [40, 4]],
+                offsetDay(-2): ["k3-256k": [20, 2]],
+                offsetDay(-8): ["k3.1-pro": [30, 3]],
+            ]
+            let windows = TokenAggregator.buckets(["fixture": windowFile])
+            try expect(windows.0.input == 100 && windows.0.output == 10
+                       && windows.0.models["k3.1-pro"]?.total == 66 && windows.0.models["未知模型"]?.total == 44,
+                       "today model breakdown does not reconcile")
+            try expect(windows.1.input == 120 && windows.1.output == 12
+                       && windows.1.models["k3-256k"]?.total == 22,
+                       "seven-day model breakdown does not reconcile")
+            try expect(windows.2.input == 150 && windows.2.output == 15
+                       && windows.2.models["k3.1-pro"]?.input == 90 && windows.2.models["k3.1-pro"]?.output == 9,
+                       "thirty-day model breakdown does not reconcile")
 
             // 相同用量隔数小时是两次调用；午夜附近的镜像仍能配对。
             func workRow(_ kind: String, _ ms: Double, _ id: String? = nil) -> [String: Any] {
@@ -3081,14 +3329,17 @@ enum KimiOfflineRegression {
             try expect((try? workTotals([workRow("context.append_loop_event", eventMS, "request-1"), workRow("usage.record", eventMS + 3 * 3600_000, "request-1")])) == [35, 2], "matching request ID did not pair")
             try expect((try? workTotals([workRow("context.append_loop_event", eventMS, "request-1"), workRow("usage.record", eventMS + 1, "request-2")])) == [70, 4], "conflicting request IDs were paired")
             try expect((try? workTotals([workRow("context.append_loop_event", eventMS), workRow("usage.record", eventMS), workRow("usage.record", eventMS)])) == [70, 4], "one loop matched multiple records")
-            // v5 旧修订的错误结果在文件未改变时也要重建，保留其他来源快照。
+            // v6 旧修订的错误结果在文件未改变时也要重建，保留其他来源快照。
             var legacyWork = workFiles
             for key in legacyWork.keys {
-                legacyWork[key]?.scanRevision = 1
+                legacyWork[key]?.scanRevision = 2
                 legacyWork[key]?.days = [TokenAggregator.dayFmt.string(from: Date()): [999, 999]]
+                legacyWork[key]?.modelDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧模型": [999, 999]]]
             }
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &legacyWork)
-            try expect(legacyWork.values.first?.scanRevision == 2 && legacyWork.values.first.map(totals) == [35, 2], "v5 old revision was not rebuilt")
+            try expect(legacyWork.values.first?.scanRevision == 3 && legacyWork.values.first.map(totals) == [35, 2]
+                       && legacyWork.values.first?.modelDays.values.first?["旧模型"] == nil,
+                       "v6 old revision was not rebuilt")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]
@@ -3131,6 +3382,17 @@ enum KimiOfflineRegression {
             try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 8, 2, \(nowMS))")
             try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "ZCode recovery failed")
             try expect(zState.zcodeDays?[todayKey] == [108, 7], "ZCode recovery double counted")
+            try exec("INSERT INTO model_usage VALUES ('k3-256k', 7, 1, \(nowMS))")
+            try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "ZCode model refresh failed")
+            try expect(zState.zcodeDays?[todayKey] == [115, 8]
+                       && zState.zcodeModelDays?[todayKey]?["k3.1-pro"] == [108, 7]
+                       && zState.zcodeModelDays?[todayKey]?["k3-256k"] == [7, 1],
+                       "ZCode model breakdown does not reconcile")
+            let encodedZState = try ScanStateFile.encoded(zState)
+            let decodedZState = try JSONDecoder().decode(TokenAggregator.ScanState.self, from: encodedZState)
+            try expect(decodedZState.zcodeModelDays == zState.zcodeModelDays,
+                       "model scan cache did not survive persistence")
+
             try exec("""
                 CREATE TABLE session_model_usage (
                     session_id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT,
@@ -3151,6 +3413,20 @@ enum KimiOfflineRegression {
             try exec("DELETE FROM session_model_usage WHERE session_id = 's1'")
             try expect(TokenAggregator.scanHermes(into: &hermesScan, at: sqlitePath), "Hermes delete scan failed")
             try expect(hermesScan.hermes?.days[todayKey] == nil, "deleted Hermes row left stale contributions")
+            try exec("INSERT INTO session_model_usage VALUES ('s1', 'k3.1-pro', 'p', 'https://api.kimi.com/coding', '', 'main', 10, 1, 20, 0, \(nowSeconds))")
+            try exec("INSERT INTO session_model_usage VALUES ('s2', 'k3-256k', 'p', 'https://api.kimi.com/coding', '', 'main', 5, 2, 5, 0, \(nowSeconds))")
+            var hermesModels = TokenAggregator.ScanState()
+            try expect(TokenAggregator.scanHermes(into: &hermesModels, at: sqlitePath), "Hermes model scan failed")
+            try expect(hermesModels.hermes?.days[todayKey] == [40, 3]
+                       && hermesModels.hermes?.modelDays[todayKey]?["k3.1-pro"] == [30, 1]
+                       && hermesModels.hermes?.modelDays[todayKey]?["k3-256k"] == [10, 2],
+                       "Hermes model breakdown does not reconcile")
+            try exec("UPDATE session_model_usage SET model = 'k3.1-pro' WHERE session_id = 's2'")
+            try expect(TokenAggregator.scanHermes(into: &hermesModels, at: sqlitePath), "Hermes model switch scan failed")
+            try expect(hermesModels.hermes?.days[todayKey] == [40, 3]
+                       && hermesModels.hermes?.modelDays[todayKey]?["k3.1-pro"] == [40, 3]
+                       && hermesModels.hermes?.modelDays[todayKey]?["k3-256k"] == nil,
+                       "Hermes model switch double-counted or retained stale model usage")
 
             // Token 窗口树形行：├/└ 分支、两空格缩进，空数据显示「暂无记录」
             let windowTree = TokenWindowLines.render([

@@ -1525,6 +1525,7 @@ final class UsagePanelController: NSObject {
     private var codexExpanded = true
     private var externalExpanded = true
     private var updateMessage: String?
+    private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
     var isOpen: Bool { panel.isVisible }
 
@@ -1718,7 +1719,18 @@ final class UsagePanelController: NSObject {
     @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
-    func setUpdateMessage(_ message: String?) { updateMessage = message; refreshPanelLayout() }
+    // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
+    func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
+        updateMessageDismissal?.cancel()
+        updateMessageDismissal = nil
+        updateMessage = message
+        refreshPanelLayout()
+        if message != nil, let delay = dismissAfter {
+            let dismissal = DispatchWorkItem { [weak self] in self?.setUpdateMessage(nil) }
+            updateMessageDismissal = dismissal
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: dismissal)
+        }
+    }
 
     private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
         let card = PanelCardView(padding: 8)
@@ -2479,12 +2491,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func manualUpdateCheck() {
-        if visualPreview { panelController.setUpdateMessage("预览模式：未联网检查更新"); return }
+        if visualPreview { panelController.setUpdateMessage("预览模式：未联网检查更新", dismissAfter: 3); return }
         panelController.setUpdateMessage("正在检查更新…")
         UpdateChecker.shared.check(force: true) { [weak self] in
             guard let self = self else { return }
             self.rebuildMenu()
-            self.panelController.setUpdateMessage(UpdateChecker.shared.lastError ? "检查失败，请稍后重试" : (UpdateCheck.normalized(BuildInfo.version) == nil ? "当前版本无法比较" : (UpdateChecker.shared.available ? "发现新版本" : "已是最新版本")))
+            self.panelController.setUpdateMessage(UpdateChecker.shared.lastError ? "检查失败，请稍后重试" : (UpdateCheck.normalized(BuildInfo.version) == nil ? "当前版本无法比较" : (UpdateChecker.shared.available ? "发现新版本" : "已是最新版本")), dismissAfter: 3)
         }
     }
 

@@ -13,7 +13,7 @@
 - **凭据**：读取 Kimi 桌面端本地配置文件 `~/Library/Application Support/kimi-desktop/daimon-share/daimon/config.json`，不在本仓库保存任何凭据
 - **月度接口 401**：读取最新 refresh token；写回前重新读取最新 JSON，仅合并 Kimi Web 认证字段，以唯一临时文件和同目录原子替换保存，并限制为仅所有者可读写。若检测到 Kimi 客户端已轮换 access/refresh token，则保留客户端版本。由于官方客户端不使用共享文件锁，检查与替换之间仍无法完全消除并发写入窗口
 - **配额**：通过 Kimi 远程接口查询 5 小时、7 天和月度额度
-- **Token**：扫描本地会话 wire.jsonl / 客户端 JSONL 日志，并只读查询 ZCode、Hermes 的 sqlite 用量表聚合。ZCode 以 `model_usage` 逐请求表为唯一来源；输入包含缓存读取/创建，不重复加 cache 字段。近 7 天和近 30 天均包含今天。混接客户端缺失模型名时不归属 Kimi；可信 Kimi Code 旧格式可兼容。ZCode 暂时不可读时保留最近成功快照并提示，其他来源继续更新。Work 同时存在新旧日志时按用量和日期匹配镜像，保留未匹配的历史调用。
+- **Token**：扫描本地会话 wire.jsonl / 客户端 JSONL 日志，并只读查询 ZCode、Hermes 的 sqlite 用量表聚合。ZCode 以 `model_usage` 逐请求表为唯一来源；输入包含缓存读取/创建，不重复加 cache 字段。近 7 天和近 30 天均包含今天。混接客户端缺失模型名时不归属 Kimi；可信 Kimi Code 旧格式可兼容。ZCode 暂时不可读时保留最近成功快照并提示，其他来源继续更新。Work 同时存在新旧日志时优先按请求 ID 匹配；缺少 ID 时仅匹配用量相同、时间和位置邻近的事件，保留未匹配的历史调用。
 
 ## 隐私与安全
 

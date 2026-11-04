@@ -434,18 +434,20 @@ enum TokenAggregator {
                 else { continue }
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
+                // Work v2 重建早期镜像匹配缓存；API 客户端继续使用 v1。
+                let revision = kimiOnly ? 1 : 2
                 // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
-                if st.offset == sizeU && st.scanRevision == 1 { files[path] = st; continue }
+                if st.offset == sizeU && st.scanRevision == revision { files[path] = st; continue }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
                 if st.offset == 0, st.days.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
-                    st.offset = sizeU; st.scanRevision = 1; files[path] = st; continue
+                    st.offset = sizeU; st.scanRevision = revision; files[path] = st; continue
                 }
                 // 截断/轮换：该文件的旧聚合已不可信，清零重扫
                 if sizeU < st.offset { st = FileScanState() }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
-                let rebuild = st.scanRevision != 1 || (!kimiOnly && st.preferUsageRecord)
+                let rebuild = st.scanRevision != revision || (!kimiOnly && st.preferUsageRecord)
                 if rebuild { st = FileScanState() }
                 fh.seek(toFileOffset: st.offset)
                 var data = fh.readDataToEndOfFile()
@@ -472,7 +474,7 @@ enum TokenAggregator {
                     parseLines(text, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
                 }
                 st.offset = consumed
-                st.scanRevision = 1
+                st.scanRevision = revision
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 files[path] = st
             }
@@ -610,29 +612,61 @@ enum TokenAggregator {
         return false
     }
 
-    // 按日和 usage 内容配对镜像；未配对的历史 loop 保留。
+    // 同一请求 ID 优先；缺少 ID 时仅匹配邻近的用量事件（5 秒内、最多相隔 20 行）。
     static func parseWorkLines(_ text: String, cutoffKey: String, into st: inout FileScanState) {
+        struct WorkEvent {
+            let lineIndex: Int
+            let kind: String
+            let milliseconds: Double
+            let usage: String
+            let requestID: String?
+        }
         let lines = text.split(separator: "\n").map(String.init)
-        func signature(_ line: String, type: String) -> String? {
+        var events: [WorkEvent] = []
+        for (index, line) in lines.enumerated() {
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  obj["type"] as? String == type,
+                  let kind = obj["type"] as? String,
+                  kind == "usage.record" || kind == "context.append_loop_event",
                   let ms = obj["time"] as? Double,
                   let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any] ?? obj["usage"] as? [String: Any],
                   let encoded = try? JSONSerialization.data(withJSONObject: usage, options: [.sortedKeys]),
-                  let value = String(data: encoded, encoding: .utf8) else { return nil }
-            return dayFmt.string(from: Date(timeIntervalSince1970: ms / 1000)) + value
+                  let value = String(data: encoded, encoding: .utf8) else { continue }
+            let event = obj["event"] as? [String: Any] ?? [:]
+            let id = (obj["request_id"] as? String) ?? (obj["requestId"] as? String)
+                ?? (event["request_id"] as? String) ?? (event["requestId"] as? String)
+            events.append(WorkEvent(lineIndex: index, kind: kind, milliseconds: ms, usage: value,
+                                    requestID: id.flatMap { $0.isEmpty ? nil : $0 }))
         }
-        var records: [String: Int] = [:]
-        for line in lines { if let key = signature(line, type: "usage.record") { records[key, default: 0] += 1 } }
-        for line in lines {
-            if let key = signature(line, type: "context.append_loop_event"), let n = records[key], n > 0 {
-                records[key] = n - 1
-                continue
+        var paired = Set<Int>()
+        func pair(_ i: Int, _ j: Int) { paired.insert(i); paired.insert(j) }
+        // 仅在同 ID 两侧各一条且用量一致时，才作为可验证的关联。
+        var loopsByID: [String: [Int]] = [:], recordsByID: [String: [Int]] = [:]
+        for i in events.indices {
+            guard let id = events[i].requestID else { continue }
+            if events[i].kind == "usage.record" { recordsByID[id, default: []].append(i) }
+            else { loopsByID[id, default: []].append(i) }
+        }
+        for (id, loops) in loopsByID {
+            guard loops.count == 1, let records = recordsByID[id], records.count == 1,
+                  events[loops[0]].usage == events[records[0]].usage else { continue }
+            pair(loops[0], records[0])
+        }
+        // 不凭用量和日期推断：没有冲突 ID 时，限相邻用量事件且时间非常接近。
+        if events.count > 1 {
+            for i in 0..<(events.count - 1) {
+                let j = i + 1, a = events[i], b = events[j]
+                guard !paired.contains(i), !paired.contains(j), a.kind != b.kind, a.usage == b.usage,
+                      b.lineIndex - a.lineIndex <= 20, abs(a.milliseconds - b.milliseconds) <= 5_000,
+                      a.requestID == nil || b.requestID == nil || a.requestID == b.requestID else { continue }
+                pair(i, j)
             }
+        }
+        let skip = Set(events.indices.filter { paired.contains($0) && events[$0].kind == "context.append_loop_event" }.map { events[$0].lineIndex })
+        for (index, line) in lines.enumerated() where !skip.contains(index) {
             parseLines(line, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
         }
-        st.preferUsageRecord = !records.isEmpty
+        st.preferUsageRecord = events.contains { $0.kind == "usage.record" }
     }
 
     /// 解析一批完整行，把 usage 按日累加进 st.days（解析逻辑与旧全量版一致）
@@ -2977,6 +3011,34 @@ enum KimiOfflineRegression {
             try expect(totals(missingMixed) == [0, 0] && totals(missingTrusted) == [35, 2], "missing model source attribution wrong")
             let oldJSON = Data("{\"work\":{},\"cli\":{}}".utf8)
             try expect((try? JSONDecoder().decode(TokenAggregator.ScanState.self, from: oldJSON)) != nil, "old cache cannot decode")
+
+            // 相同用量隔数小时是两次调用；午夜附近的镜像仍能配对。
+            func workRow(_ kind: String, _ ms: Double, _ id: String? = nil) -> [String: Any] {
+                var row: [String: Any] = ["type": kind, "time": ms]
+                if kind == "usage.record" { row["usage"] = kimiUsage }
+                else { row["event"] = ["usage": kimiUsage] }
+                if let id { row["request_id"] = id }
+                return row
+            }
+            func workTotals(_ rows: [[String: Any]]) throws -> [Double] {
+                var state = TokenAggregator.FileScanState()
+                try TokenAggregator.parseWorkLines(rows.map(jsonLine).joined(separator: "\n"), cutoffKey: "0000-00-00", into: &state)
+                return totals(state)
+            }
+            try expect((try? workTotals([workRow("context.append_loop_event", eventMS), workRow("usage.record", eventMS + 3 * 3600_000)])) == [70, 4], "distant independent calls were merged")
+            let midnight = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970 * 1000
+            try expect((try? workTotals([workRow("context.append_loop_event", midnight - 1000), workRow("usage.record", midnight + 1000)])) == [35, 2], "cross-midnight mirror was not paired")
+            try expect((try? workTotals([workRow("context.append_loop_event", eventMS, "request-1"), workRow("usage.record", eventMS + 3 * 3600_000, "request-1")])) == [35, 2], "matching request ID did not pair")
+            try expect((try? workTotals([workRow("context.append_loop_event", eventMS, "request-1"), workRow("usage.record", eventMS + 1, "request-2")])) == [70, 4], "conflicting request IDs were paired")
+            try expect((try? workTotals([workRow("context.append_loop_event", eventMS), workRow("usage.record", eventMS), workRow("usage.record", eventMS)])) == [70, 4], "one loop matched multiple records")
+            // v5 旧修订的错误结果在文件未改变时也要重建，保留其他来源快照。
+            var legacyWork = workFiles
+            for key in legacyWork.keys {
+                legacyWork[key]?.scanRevision = 1
+                legacyWork[key]?.days = [TokenAggregator.dayFmt.string(from: Date()): [999, 999]]
+            }
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &legacyWork)
+            try expect(legacyWork.values.first?.scanRevision == 2 && legacyWork.values.first.map(totals) == [35, 2], "v5 old revision was not rebuilt")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]

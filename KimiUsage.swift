@@ -1873,14 +1873,7 @@ final class ResetCardSectionView: PanelCardView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-final class UsagePanel: NSPanel {
-    var onCancel: (() -> Void)?
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
-    override func cancelOperation(_ sender: Any?) { onCancel?() }
-}
-
-final class UsagePanelController: NSObject {
+final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onClose: (() -> Void)?
     var onCheckUpdate: (() -> Void)?
     private var codexExpanded = true
@@ -1890,9 +1883,11 @@ final class UsagePanelController: NSObject {
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
-    var isOpen: Bool { panel.isVisible }
+    var previewAppearance: NSAppearance? { didSet { contentController.view.appearance = previewAppearance } }
+    var isOpen: Bool { popover.isShown }
 
-    private let panel: UsagePanel
+    private let popover = NSPopover()
+    private let contentController = NSViewController()
     private let effect = NSVisualEffectView()
     private let solid = PanelSolidBackgroundView()
     private let headerContainer = NSView()
@@ -1907,19 +1902,13 @@ final class UsagePanelController: NSObject {
     private var panelWidth = UsagePanelController.maximumWidth
 
     override init() {
-        panel = UsagePanel(contentRect: NSRect(x: 0, y: 0, width: panelWidth, height: 320),
-            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         super.init()
-        panel.isOpaque = false
-        panel.backgroundColor = .clear
-        panel.hasShadow = true
-        panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = false
-        panel.isReleasedWhenClosed = false
-        panel.level = .popUpMenu
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.onCancel = { [weak self] in self?.close() }
+        contentController.view = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
         configureContent()
+        popover.contentViewController = contentController
+        popover.behavior = .transient
+        popover.animates = false
+        popover.delegate = self
     }
 
     deinit {
@@ -1928,7 +1917,7 @@ final class UsagePanelController: NSObject {
     }
 
     private func configureContent() {
-        guard let container = panel.contentView else { return }
+        let container = contentController.view
         container.wantsLayer = true
         container.layer?.cornerRadius = 16
         container.layer?.masksToBounds = true
@@ -2077,8 +2066,8 @@ final class UsagePanelController: NSObject {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         rebuildContent()
-        if let button = anchorButton, let window = button.window, isOpen {
-            layoutPanel(anchoredTo: button, buttonWindow: window)
+        if let button = anchorButton, let window = button.window {
+            layoutPanel(buttonWindow: window)
             let clip = scrollView.contentView
             let desired = NSRect(origin: previousOrigin, size: clip.bounds.size)
             clip.scroll(to: clip.constrainBoundsRect(desired).origin)
@@ -2195,19 +2184,56 @@ final class UsagePanelController: NSObject {
         if expectScroll {
             guard scrollToEndForPreview(), let model = model else { return false }
             let oldOrigin = scrollView.contentView.bounds.origin
+            guard abs(oldOrigin.y) > 1 else { return false }
             update(model: model)
-            guard isOpen, abs(scrollView.contentView.bounds.origin.y - oldOrigin.y) < 1 else { return false }
+            let refreshedOrigin = scrollView.contentView.bounds.origin
+            guard isOpen, abs(refreshedOrigin.y - oldOrigin.y) < 1 else { return false }
+            let sender = NSButton(); sender.tag = 0
+            toggleCodexBucket(sender)
+            let expandedOrigin = scrollView.contentView.bounds.origin
+            let expected = scrollView.contentView.constrainBoundsRect(NSRect(origin: oldOrigin, size: scrollView.contentView.bounds.size)).origin
+            guard isOpen, abs(expandedOrigin.y - expected.y) < 1 else { return false }
+            toggleCodexBucket(sender)
+            let collapsedOrigin = scrollView.contentView.bounds.origin
+            let collapsedExpected = scrollView.contentView.constrainBoundsRect(NSRect(origin: expandedOrigin, size: scrollView.contentView.bounds.size)).origin
+            guard isOpen, abs(collapsedOrigin.y - collapsedExpected.y) < 1 else { return false }
+            print("KimiUsage nonzero scroll: before=\(oldOrigin.y) refresh=\(refreshedOrigin.y) expand=\(expandedOrigin.y) collapse=\(collapsedOrigin.y)")
+        }
+        guard let model = model else { return false }
+        let expectedErrors = (model.codexTokens.notices + (model.externalTokens?.notices ?? []))
+            .map { $0.text }.filter { $0.contains("统计失败") }
+        let requiresErrors = CommandLine.arguments.contains("--visual-preview-states") || CommandLine.arguments.contains("--visual-preview-long")
+        guard !requiresErrors || expectedErrors.count == 2 else {
+            fputs("KimiUsage visual test: expected two fixture errors, got \(expectedErrors.count)\n", stderr); return false
+        }
+        func verifyErrors(_ stage: String) -> Bool {
+            let actual = labels(stack).filter { $0.contains("统计失败") }
+            guard actual.sorted() == expectedErrors.sorted() else {
+                fputs("KimiUsage visual test: \(stage) notices expected=\(expectedErrors), actual=\(actual)\n", stderr); return false
+            }
+            return true
+        }
+        guard verifyErrors("initial") else { return false }
+        toggleCodex()
+        guard !codexExpanded, externalExpanded, verifyErrors("first collapse") else {
+            fputs("KimiUsage visual test: first collapse state or notices\n", stderr); return false
+        }
+        toggleExternal()
+        guard !codexExpanded, !externalExpanded, verifyErrors("second collapse") else {
+            fputs("KimiUsage visual test: second collapse state or notices\n", stderr); return false
         }
         toggleCodex()
-        guard !codexExpanded, externalExpanded,
-              labels(stack).contains(where: { $0.contains("统计失败") }) else { return false }
+        guard codexExpanded, !externalExpanded else {
+            fputs("KimiUsage visual test: first expansion state\n", stderr); return false
+        }
         toggleExternal()
-        guard !codexExpanded, !externalExpanded,
-              labels(stack).filter({ $0.contains("统计失败") }).count == 2 else { return false }
-        toggleCodex()
-        guard codexExpanded, !externalExpanded else { return false }
-        toggleExternal()
-        return codexExpanded && externalExpanded && verifyTokenBucketInteractionsForPreview()
+        guard codexExpanded, externalExpanded, verifyErrors("re-expanded") else {
+            fputs("KimiUsage visual test: second expansion state or notices\n", stderr); return false
+        }
+        guard verifyTokenBucketInteractionsForPreview() else {
+            fputs("KimiUsage visual test: model bucket interactions or alignment\n", stderr); return false
+        }
+        return true
     }
 
     func expandAllTokenBucketsForPreview() {
@@ -2230,7 +2256,7 @@ final class UsagePanelController: NSObject {
         }
         func detailCount() -> Int { details().count }
         func numericColumnsAligned() -> Bool {
-            panel.contentView?.layoutSubtreeIfNeeded()
+            contentController.view.layoutSubtreeIfNeeded()
             stack.layoutSubtreeIfNeeded()
             let summary = rows(#selector(toggleCodexBucket(_:)))[0].cells
             guard let detail = details().first else { return false }
@@ -2266,9 +2292,51 @@ final class UsagePanelController: NSObject {
         return expandedCodexBuckets == [0, 2] && expandedExternalBuckets == [0, 2] && detailCount() == 8
     }
 
+    // Runs against one real popover after AppKit has settled the initial presentation.
+    func runPopoverResizeTest(outputDirectory: String) {
+        func fail(_ message: String) { fputs("KimiUsage popover test: FAIL: \(message)\n", stderr); exit(1) }
+        func row() -> TokenBucketRow? {
+            func all(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { all($0) } }
+            return all(stack).compactMap { $0 as? TokenBucketRow }
+                .first { $0.action == #selector(toggleCodexBucket(_:)) && $0.tag == 0 }
+        }
+        toggleExternal()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            guard self.isOpen, let window = self.contentController.view.window,
+                  let button = self.anchorButton, let buttonWindow = button.window,
+                  let document = self.scrollView.documentView, let first = row() else { return fail("initial state") }
+            let initial = window.frame
+            let controller = self.popover.contentViewController
+            let anchor = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            func stable(_ frame: NSRect) -> Bool {
+                self.isOpen && self.contentController.view.window === window &&
+                    self.popover.contentViewController === controller && self.scrollView.documentView === document &&
+                    abs(frame.maxY - initial.maxY) < 2 &&
+                    (window.screen?.frame.contains(frame) ?? true)
+            }
+            guard self.savePreviewImage(to: outputDirectory + "/before.png") else { return fail("before screenshot") }
+            first.performClick(nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                let expanded = window.frame
+                guard stable(expanded), expanded.height > initial.height + 1 else {
+                    return fail("expand \(initial) -> \(expanded); shown=\(self.isOpen) sameWindow=\(self.contentController.view.window === window) sameController=\(self.popover.contentViewController === controller) sameDocument=\(self.scrollView.documentView === document) screen=\(String(describing: window.screen?.frame))")
+                }
+                guard self.savePreviewImage(to: outputDirectory + "/expanded.png"), let next = row() else { return fail("expanded screenshot or row") }
+                next.performClick(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    let collapsed = window.frame
+                    guard stable(collapsed), collapsed.height < expanded.height - 1 else { return fail("collapse \(expanded) -> \(collapsed)") }
+                    guard self.savePreviewImage(to: outputDirectory + "/collapsed.png") else { return fail("collapsed screenshot") }
+                    print("KimiUsage popover test: PASS heights=\(initial.height),\(expanded.height),\(collapsed.height) maxY=\(initial.maxY),\(expanded.maxY),\(collapsed.maxY) anchor=\(anchor)")
+                    exit(0)
+                }
+            }
+        }
+    }
+
     /// 视觉回归专用：真实滚动到底部并确认 clip view 位置发生变化。
     func scrollToEndForPreview() -> Bool {
-        panel.contentView?.layoutSubtreeIfNeeded()
+        contentController.view.layoutSubtreeIfNeeded()
         scrollView.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
         guard let document = scrollView.documentView else { return false }
@@ -2281,13 +2349,13 @@ final class UsagePanelController: NSObject {
         return abs(clip.bounds.origin.y - targetY) < 1
     }
 
-    /// 固定假数据预览的本地截图，只包含面板，不读取或捕捉其他窗口。
+    /// 捕捉完整系统窗口，包括原生箭头和阴影。
     func savePreviewImage(to path: String) -> Bool {
-        guard let view = panel.contentView else { return false }
-        view.layoutSubtreeIfNeeded()
-        guard let image = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return false }
-        view.cacheDisplay(in: view.bounds, to: image)
-        guard let data = image.representation(using: .png, properties: [:]) else { return false }
+        guard let window = contentController.view.window,
+              let image = CGWindowListCreateImage(.null, .optionIncludingWindow,
+                  CGWindowID(window.windowNumber), [.boundsIgnoreFraming, .bestResolution]) else { return false }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
         return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
     }
 
@@ -2298,38 +2366,35 @@ final class UsagePanelController: NSObject {
     private func show(anchoredTo button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         anchorButton = button
-        layoutPanel(anchoredTo: button, buttonWindow: buttonWindow)
+        layoutPanel(buttonWindow: buttonWindow)
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         solid.opacity = reduceTransparency ? 1 : 0.9
         effect.isHidden = reduceTransparency
-        installMonitors()
-        panel.makeKeyAndOrderFront(nil)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if isOpen { installMonitors() }
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
-    private func layoutPanel(anchoredTo button: NSStatusBarButton, buttonWindow: NSWindow) {
+    private func layoutPanel(buttonWindow: NSWindow) {
         let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
         let visible = screen.visibleFrame
         let desiredWidth = min(previewWidth ?? Self.maximumWidth, visible.width - 24)
-        var frame = panel.frame
-        frame.size.width = desiredWidth
-        panel.setFrame(frame, display: false)
         if desiredWidth != panelWidth {
             panelWidth = desiredWidth
             rebuildContent()
         }
-        panel.contentView?.layoutSubtreeIfNeeded()
+        contentController.view.layoutSubtreeIfNeeded()
         stack.layoutSubtreeIfNeeded()
         let chromeHeight = headerContainer.fittingSize.height + footerContainer.fittingSize.height
         let fittingHeight = max(chromeHeight + stack.fittingSize.height, 240)
         let maximumHeight = max(240, visible.height * 0.85)
-        let height = min(fittingHeight, maximumHeight)
-        let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
-        let x = max(visible.minX + 8, min(buttonRect.midX - panelWidth / 2, visible.maxX - panelWidth - 8))
-        let y = max(visible.minY + 8, buttonRect.minY - height - 4)
-        panel.setFrame(NSRect(x: x, y: y, width: panelWidth, height: height), display: false)
-        panel.contentView?.layoutSubtreeIfNeeded()
+        let desiredSize = NSSize(width: panelWidth, height: min(fittingHeight, maximumHeight))
+        contentController.preferredContentSize = desiredSize
+        popover.contentSize = desiredSize
+        contentController.view.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+        stack.layoutSubtreeIfNeeded()
     }
 
     private func installMonitors() {
@@ -2349,7 +2414,7 @@ final class UsagePanelController: NSObject {
                 if event.keyCode == 53 { self.close(); return nil }
                 return event
             }
-            if event.window === self.panel || event.window === self.anchorButton?.window { return event }
+            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window { return event }
             self.close()
             return event
         }
@@ -2360,9 +2425,9 @@ final class UsagePanelController: NSObject {
         if let monitor = globalMonitor { NSEvent.removeMonitor(monitor); globalMonitor = nil }
     }
 
-    func close() {
-        guard panel.isVisible else { return }
-        panel.orderOut(nil)
+    func close() { popover.performClose(nil) }
+
+    func popoverDidClose(_ notification: Notification) {
         removeMonitors()
         anchorButton = nil
         onClose?()
@@ -2983,7 +3048,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureVisualPreview() {
         let args = CommandLine.arguments
-        if args.contains("--visual-preview-dark") { NSApp.appearance = NSAppearance(named: .darkAqua) }
+        if args.contains("--visual-preview-dark") {
+            NSApp.appearance = NSAppearance(named: .darkAqua)
+            panelController.previewAppearance = NSAppearance(named: .darkAqua)
+        }
         if args.contains("--visual-preview-narrow") { panelController.previewWidth = 300 }
         let now = Date(timeIntervalSince1970: 1_793_702_400)
         lastAttemptAt = now
@@ -3035,6 +3103,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 print("KimiUsage visual interaction test: PASS")
                 exit(0)
             }
+            if let arg = args.first(where: { $0.hasPrefix("--visual-preview-popover-test=") }) {
+                self.panelController.runPopoverResizeTest(outputDirectory: String(arg.dropFirst("--visual-preview-popover-test=".count)))
+                return
+            }
             if args.contains("--visual-preview-update-test") {
                 self.runPreviewUpdateTest()
                 return
@@ -3076,13 +3148,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                 guard completions == 3, checker.lastError else { return fail("invalid release reported success") }
                 checker.check(force: true) { completions += 1 }
-                replies.removeFirst()(Data("{\"tag_name\":\"v999.0.0\"}".utf8), response(200), nil)
+                let release = """
+                    [{"tag_name":"v999.0.0","draft":false,"prerelease":false,
+                      "assets":[{"name":"KimiUsage.zip"},{"name":"KimiUsage.zip.sha256"}]}]
+                    """
+                replies.removeFirst()(Data(release.utf8), response(200), nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    guard completions == 4, !checker.lastError, checker.available else { return fail("successful release check") }
+                    guard completions == 4, !checker.lastError, checker.available, checker.targetTag == "v999.0.0" else { return fail("successful release check") }
                     checker.check(force: true) { completions += 1 }
                     replies.removeFirst()(nil, response(304), nil)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        guard completions == 5, !checker.lastError, checker.available else { return fail("cached 304") }
+                        guard completions == 5, !checker.lastError, checker.available, checker.targetTag == "v999.0.0" else { return fail("cached 304") }
                         print("KimiUsage update check test: PASS")
                         exit(0)
                     }
@@ -3101,6 +3177,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                       isARepeat: false, keyCode: keyCode) else { fail("cannot create event"); return }
             NSApp.sendEvent(event)
         }
+        guard let keyWindow = NSApp.keyWindow,
+              let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
+                  windowNumber: keyWindow.windowNumber, context: nil, characters: "\u{1b}",
+                  charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else { return fail("escape event") }
+        NSApp.sendEvent(escape)
+        guard !panelController.isOpen else { return fail("Escape") }
+        button.performClick(nil)
+        guard panelController.isOpen else { return fail("reopen after Escape") }
         send("r", 15)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
             // 刷新不再收起面板（与点击「立即刷新」同路径），随后手动走关闭→重开→⌘Q

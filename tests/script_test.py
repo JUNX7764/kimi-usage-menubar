@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -484,9 +485,37 @@ echo "build" >> "$MOCK_LOG"
         controller = source.split("final class UpdateProgressController", 1)[1].split("// MARK: - 版本与更新检查", 1)[0]
         self.assertNotIn('"submit"', controller)
         self.assertNotIn("launchctl remove", controller)
-        self.assertNotIn("update.waitUntilExit()", controller)
-        self.assertIn('update.executableURL = URL(fileURLWithPath: "/bin/bash")', controller)
-        self.assertIn("update.arguments = [wrapper.path, dir.path, targetTag, appPath]", controller)
+        self.assertNotIn("waitUntilExit()", controller)
+        self.assertIn('launch.executableURL = URL(fileURLWithPath: "/usr/bin/nohup")', controller)
+        self.assertIn('launch.arguments = ["/bin/bash", wrapper.path, dir.path, targetTag, appPath]', controller)
+        self.assertIn('launch.currentDirectoryURL = dir', controller)
+        self.assertIn('launch.standardInput = FileHandle.nullDevice', controller)
+        self.assertIn('launch.standardOutput = FileHandle.nullDevice; launch.standardError = FileHandle.nullDevice', controller)
+        self.assertIn('try launch.run()', controller)
+        self.assertIn('attributes: [.posixPermissions: 0o700]', controller)
+        self.assertNotRegex(controller, r'(?m)^\s*(?:umask|chmod|chown)\b')
+
+        # Execute the actual generated wrapper with a harmless fake updater.
+        # A nonzero exit keeps the temporary artifacts available for inspection.
+        match = re.search(r'let wrapperText = """\n(.*?)\n\s*"""', controller, re.DOTALL)
+        self.assertIsNotNone(match)
+        work = self.base / "update work"
+        work.mkdir(mode=0o700)
+        wrapper = work / "run.sh"
+        wrapper.write_text(textwrap.dedent(match.group(1)) + "\n")
+        (work / "update.sh").write_text(
+            '#!/bin/bash\nkill -HUP "$$"\nprintf "%s\\n%s\\n" "$1" "$2" > "$UPDATE_PROGRESS_FILE"\n'
+            'touch user-created-file\nexit 17\n'
+        )
+        result = subprocess.run(
+            ["/usr/bin/nohup", "/bin/bash", str(wrapper), str(work), "v2.0.0", "/tmp/app with spaces"],
+            cwd=work, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            umask=0o027, timeout=10, check=False,
+        )
+        self.assertEqual(result.returncode, 17)
+        self.assertEqual((work / "result").read_text(), "17")
+        self.assertEqual((work / "progress").read_text().splitlines(), ["v2.0.0", "/tmp/app with spaces"])
+        self.assertEqual((work / "user-created-file").stat().st_mode & 0o777, 0o640)
 
     def test_codesign_failure_blocks_build(self):
         project = self.base / "build-project"

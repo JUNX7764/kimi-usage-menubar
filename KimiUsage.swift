@@ -325,8 +325,24 @@ enum TokenAggregator {
     }
 
     static func normalizedModel(_ model: String?) -> String {
-        let name = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var name = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if name.lowercased().hasPrefix("kimi-code/") {
+            name = String(name.dropFirst("kimi-code/".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let known = ["k3.1-pro", "k3-256k", "k3", "kimi-for-coding"]
+        if known.contains(name.lowercased()) { return name.lowercased() }
         return name.isEmpty ? "未知模型" : name
+    }
+
+    static func modelDisplayName(_ model: String) -> String {
+        let name = normalizedModel(model)
+        switch name {
+        case "k3.1-pro": return "K3.1 Pro"
+        case "k3-256k": return "K3-256k"
+        case "k3": return "K3"
+        case "kimi-for-coding": return "Kimi for Coding"
+        default: return name
+        }
     }
 
     private static func loadState() -> ScanState {
@@ -401,12 +417,16 @@ enum TokenAggregator {
     }
 
     static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
-        var result = first
-        for (day, models) in second {
-            for (model, value) in models {
-                var total = result[day]?[model] ?? [0, 0]
-                total[0] += value[0]; total[1] += value[1]
-                result[day, default: [:]][model] = total
+        // 在聚合边界归一，也兼容旧缓存里的提供商前缀，不必重建 API 来源。
+        var result: ModelDays = [:]
+        for source in [first, second] {
+            for (day, models) in source {
+                for (rawModel, value) in models {
+                    let model = normalizedModel(rawModel)
+                    var total = result[day]?[model] ?? [0, 0]
+                    total[0] += value[0]; total[1] += value[1]
+                    result[day, default: [:]][model] = total
+                }
             }
         }
         return result
@@ -479,8 +499,8 @@ enum TokenAggregator {
                 else { continue }
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
-                // v3 / v2 为模型维度重建文件贡献，后续仍只读追加字节。
-                let revision = kimiOnly ? 2 : 3
+                // Work v4 按请求关联模型及双写；旧缓存即使文件未变也重建。
+                let revision = kimiOnly ? 2 : 4
                 // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
                 if st.offset == sizeU && st.scanRevision == revision { files[path] = st; continue }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
@@ -492,31 +512,21 @@ enum TokenAggregator {
                 if sizeU < st.offset { st = FileScanState() }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
-                let rebuild = st.scanRevision != revision || (!kimiOnly && st.preferUsageRecord)
+                // Work 的请求与用量可跨刷新追加，变更时重扫，避免丢失请求上下文。
+                let rebuild = st.scanRevision != revision || !kimiOnly
                 if rebuild { st = FileScanState() }
                 fh.seek(toFileOffset: st.offset)
-                var data = fh.readDataToEndOfFile()
-                guard var lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
-                var text = String(data: data[..<lastNL], encoding: .utf8)
-                if !kimiOnly && st.offset > 0 && text.map(containsUsageRecord) == true {
-                    // 从 loop 增量切到 record：本轮即重扫并原子替换贡献。
-                    fh.seek(toFileOffset: 0)
-                    data = fh.readDataToEndOfFile()
-                    guard let end = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
-                    lastNL = end
-                    text = String(data: data[..<lastNL], encoding: .utf8)
-                    st = FileScanState()
-                }
+                let data = fh.readDataToEndOfFile()
+                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
+                let text = String(data: data[..<lastNL], encoding: .utf8)
                 try? fh.close()
                 let consumed = st.offset + UInt64(lastNL + 1)
                 guard let text else { continue }
                 if kimiOnly {
                     let trusted = realPath(root) == realPath(apiSessionsRoots[0])
                     parseLines(text, kimiOnly: true, cutoffKey: cutoffKey, allowMissingModel: trusted, into: &st)
-                } else if st.offset == 0 {
-                    parseWorkLines(text, cutoffKey: cutoffKey, into: &st)
                 } else {
-                    parseLines(text, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
+                    parseWorkLines(text, cutoffKey: cutoffKey, into: &st)
                 }
                 st.offset = consumed
                 st.scanRevision = revision
@@ -659,45 +669,97 @@ enum TokenAggregator {
         return days
     }
 
-    private static func containsUsageRecord(_ text: String) -> Bool {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true)
-        where line.contains("usage.record") {
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            if obj["type"] as? String == "usage.record" { return true }
-        }
-        return false
-    }
-
-    // 同一请求 ID 优先；缺少 ID 时仅匹配邻近的用量事件（5 秒内、最多相隔 20 行）。
+    // 请求 ID / agent + turnStep 关联不依赖耗时，兼容工具执行导致延迟的双写。
+    // 缺少请求上下文的旧日志，仍只匹配时间和位置邻近的事件。
     static func parseWorkLines(_ text: String, cutoffKey: String, into st: inout FileScanState) {
+        struct WorkRequest {
+            let lineIndex: Int
+            let milliseconds: Double
+            let model: String?
+            let kind: String?
+            let turnStep: String?
+            let requestID: String?
+        }
         struct WorkEvent {
             let lineIndex: Int
+            let agent: String
             let kind: String
             let milliseconds: Double
             let usage: String
             let requestID: String?
+            let requestIndex: Int?
+            let hasRequestContext: Bool
+            var object: [String: Any]
+            var model: String?
         }
-        let lines = text.split(separator: "\n").map(String.init)
+        func name(_ value: Any?) -> String? {
+            guard let value = value as? String else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        func requestID(_ object: [String: Any]) -> String? {
+            let event = object["event"] as? [String: Any] ?? [:]
+            return name(object["request_id"]) ?? name(object["requestId"])
+                ?? name(event["request_id"]) ?? name(event["requestId"])
+        }
+        var requests: [String: WorkRequest] = [:]
         var events: [WorkEvent] = []
-        for (index, line) in lines.enumerated() {
+        for (index, line) in text.split(separator: "\n").enumerated() {
+            // 只解析请求和逐调用用量；subagent.completed 是子会话汇总，不能再次计入。
+            guard line.contains("llm.request") || line.contains("usage.record")
+                    || line.contains("context.append_loop_event") else { continue }
             guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let kind = obj["type"] as? String,
-                  kind == "usage.record" || kind == "context.append_loop_event",
-                  let ms = obj["time"] as? Double,
+                  let ms = obj["time"] as? Double else { continue }
+            let agent = name(obj["agentId"]) ?? ""
+            if kind == "llm.request" {
+                requests[agent] = WorkRequest(lineIndex: index, milliseconds: ms,
+                    model: name(obj["model"]) ?? name(obj["modelAlias"]), kind: name(obj["kind"]),
+                    turnStep: name(obj["turnStep"]), requestID: requestID(obj))
+                continue
+            }
+            guard kind == "usage.record" || kind == "context.append_loop_event",
                   let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any] ?? obj["usage"] as? [String: Any],
                   let encoded = try? JSONSerialization.data(withJSONObject: usage, options: [.sortedKeys]),
                   let value = String(data: encoded, encoding: .utf8) else { continue }
             let event = obj["event"] as? [String: Any] ?? [:]
-            let id = (obj["request_id"] as? String) ?? (obj["requestId"] as? String)
-                ?? (event["request_id"] as? String) ?? (event["requestId"] as? String)
-            events.append(WorkEvent(lineIndex: index, kind: kind, milliseconds: ms, usage: value,
-                                    requestID: id.flatMap { $0.isEmpty ? nil : $0 }))
+            let id = requestID(obj)
+            var request = requests[agent]
+            if let active = request {
+                let conflictingID = id != nil && active.requestID != nil && id != active.requestID
+                if ms < active.milliseconds || conflictingID { request = nil }
+                if kind == "context.append_loop_event" {
+                    let turn = name(event["turnId"])
+                    let step = (event["step"] as? Int).map(String.init)
+                    let turnStep = turn.flatMap { t in step.map { "\(t).\($0)" } }
+                    if active.kind != "loop" || turnStep == nil || turnStep != active.turnStep { request = nil }
+                }
+            }
+            let message = obj["message"] as? [String: Any] ?? [:]
+            let model = name(message["model"]) ?? name(obj["model"]) ?? name(event["model"]) ?? request?.model
+            if let model { obj["model"] = model }
+            events.append(WorkEvent(lineIndex: index, agent: agent, kind: kind, milliseconds: ms, usage: value,
+                                    requestID: id, requestIndex: request?.lineIndex,
+                                    hasRequestContext: requests[agent] != nil, object: obj, model: model))
         }
         var paired = Set<Int>()
-        func pair(_ i: Int, _ j: Int) { paired.insert(i); paired.insert(j) }
+        func compatible(_ i: Int, _ j: Int) -> Bool {
+            let a = events[i], b = events[j]
+            return a.agent == b.agent && a.usage == b.usage
+                && (a.requestID == nil || b.requestID == nil || a.requestID == b.requestID)
+                && (a.model == nil || b.model == nil || a.model == b.model)
+        }
+        func pair(_ i: Int, _ j: Int) {
+            // 匹配成功后，缺模型的 record 也可使用另一侧明确记录的模型。
+            for (target, source) in [(i, j), (j, i)] where events[target].model == nil {
+                if let model = events[source].model {
+                    events[target].model = model
+                    events[target].object["model"] = model
+                }
+            }
+            paired.insert(i); paired.insert(j)
+        }
         // 仅在同 ID 两侧各一条且用量一致时，才作为可验证的关联。
         var loopsByID: [String: [Int]] = [:], recordsByID: [String: [Int]] = [:]
         for i in events.indices {
@@ -707,21 +769,36 @@ enum TokenAggregator {
         }
         for (id, loops) in loopsByID {
             guard loops.count == 1, let records = recordsByID[id], records.count == 1,
-                  events[loops[0]].usage == events[records[0]].usage else { continue }
+                  compatible(loops[0], records[0]) else { continue }
             pair(loops[0], records[0])
+        }
+        var byRequest: [Int: [Int]] = [:]
+        for i in events.indices {
+            if let request = events[i].requestIndex { byRequest[request, default: []].append(i) }
+        }
+        for group in byRequest.values {
+            let records = group.filter { events[$0].kind == "usage.record" }
+            let loops = group.filter { events[$0].kind == "context.append_loop_event" }
+            guard records.count == 1, loops.count == 1,
+                  !paired.contains(records[0]), !paired.contains(loops[0]), compatible(records[0], loops[0]) else { continue }
+            pair(records[0], loops[0])
         }
         // 不凭用量和日期推断：没有冲突 ID 时，限相邻用量事件且时间非常接近。
         if events.count > 1 {
             for i in 0..<(events.count - 1) {
                 let j = i + 1, a = events[i], b = events[j]
-                guard !paired.contains(i), !paired.contains(j), a.kind != b.kind, a.usage == b.usage,
+                guard !paired.contains(i), !paired.contains(j), a.kind != b.kind, compatible(i, j),
                       b.lineIndex - a.lineIndex <= 20, abs(a.milliseconds - b.milliseconds) <= 5_000,
-                      a.requestID == nil || b.requestID == nil || a.requestID == b.requestID else { continue }
+                      !(a.hasRequestContext && a.requestIndex == nil),
+                      !(b.hasRequestContext && b.requestIndex == nil),
+                      a.requestIndex == nil || b.requestIndex == nil || a.requestIndex == b.requestIndex else { continue }
                 pair(i, j)
             }
         }
         let skip = Set(events.indices.filter { paired.contains($0) && events[$0].kind == "context.append_loop_event" }.map { events[$0].lineIndex })
-        for (index, line) in lines.enumerated() where !skip.contains(index) {
+        for event in events where !skip.contains(event.lineIndex) {
+            guard let data = try? JSONSerialization.data(withJSONObject: event.object),
+                  let line = String(data: data, encoding: .utf8) else { continue }
             parseLines(line, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
         }
         st.preferUsageRecord = events.contains { $0.kind == "usage.record" }
@@ -3028,7 +3105,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     output: stat.map { Fmt.tokens($0.output) } ?? "--",
                     models: (stat?.models ?? [:]).filter { $0.value.total > 0 }
                         .sorted { $0.value.total != $1.value.total ? $0.value.total > $1.value.total : $0.key < $1.key }
-                        .map { UsagePanelModel.TokenModel(name: $0.key, total: Fmt.tokens($0.value.total),
+                        .map { UsagePanelModel.TokenModel(name: TokenAggregator.modelDisplayName($0.key), total: Fmt.tokens($0.value.total),
                             input: Fmt.tokens($0.value.input), output: Fmt.tokens($0.value.output)) })
             }
             var notices: [UsagePanelModel.Notice] = []
@@ -3574,6 +3651,78 @@ enum KimiOfflineRegression {
             try expect(mixedHistory.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
                        && mixedHistory.modelDays[modelDayKey]?["未知模型"] == [7, 1],
                        "mirrored and legacy Work models were not reconciled")
+
+            // 真实 Work 格式：请求带模型，step.end 不带模型，工具执行可让镜像延迟数分钟。
+            func requestRow(_ model: String, _ step: String, _ ms: Double, kind: String = "loop") -> [String: Any] {
+                ["type": "llm.request", "agentId": "main", "model": model,
+                 "kind": kind, "turnStep": step, "time": ms]
+            }
+            func stepRow(_ step: Int, _ ms: Double) -> [String: Any] {
+                ["type": "context.append_loop_event", "agentId": "main", "time": ms,
+                 "event": ["type": "step.end", "turnId": "0", "step": step, "usage": kimiUsage]]
+            }
+            func parseWork(_ rows: [[String: Any]]) throws -> TokenAggregator.FileScanState {
+                var result = TokenAggregator.FileScanState()
+                try TokenAggregator.parseWorkLines(rows.map(jsonLine).joined(separator: "\n"), cutoffKey: "0000-00-00", into: &result)
+                return result
+            }
+            let scopedRecord: [String: Any] = ["type": "usage.record", "agentId": "main",
+                                               "time": eventMS, "usage": kimiUsage]
+            let delayedRows = [requestRow("k3d1-agent", "0.1", eventMS - 1000), scopedRecord]
+                + Array(repeating: ["type": "tool.finished", "agentId": "main"], count: 30)
+                + [stepRow(1, eventMS + 480_000)]
+            let delayedWork = try parseWork(delayedRows)
+            try expect(totals(delayedWork) == [35, 2]
+                       && delayedWork.modelDays[modelDayKey]?["k3d1-agent"] == [35, 2]
+                       && delayedWork.modelDays[modelDayKey]?["未知模型"] == nil,
+                       "request-scoped delayed mirror lost its model or was double-counted")
+            let switchedWork = try parseWork([
+                requestRow("k2d8-preview", "0.1", eventMS - 1000), stepRow(1, eventMS),
+                requestRow("k3d1-agent", "0.2", eventMS + 1000), stepRow(2, eventMS + 2000)])
+            try expect(totals(switchedWork) == [70, 4]
+                       && switchedWork.modelDays[modelDayKey]?["k2d8-preview"] == [35, 2]
+                       && switchedWork.modelDays[modelDayKey]?["k3d1-agent"] == [35, 2],
+                       "loop-only model switching used a session-wide model")
+            let subagentSummary: [String: Any] = ["type": "subagent.completed", "time": eventMS,
+                                                  "usage": ["inputOther": 9999, "output": 999]]
+            let summaryWork = try parseWork(delayedRows + [subagentSummary])
+            try expect(totals(summaryWork) == [35, 2], "subagent summary was added to per-call Work usage")
+            let differentStepWork = try parseWork([
+                requestRow("k3d1-agent", "0.2", eventMS - 1000), scopedRecord, stepRow(1, eventMS + 480_000)])
+            try expect(totals(differentStepWork) == [70, 4]
+                       && differentStepWork.modelDays[modelDayKey]?["未知模型"] == [35, 2],
+                       "different turn/step was attributed to the active request")
+            let closeDifferentStep = try parseWork([
+                requestRow("k3d1-agent", "0.2", eventMS - 1000), scopedRecord, stepRow(1, eventMS + 1)])
+            try expect(totals(closeDifferentStep) == [70, 4], "nearby different steps were merged by legacy fallback")
+            var otherAgentLoop = stepRow(1, eventMS + 1)
+            otherAgentLoop["agentId"] = "agent-0"
+            let otherAgentWork = try parseWork([
+                requestRow("k3d1-agent", "0.1", eventMS - 1000), scopedRecord, otherAgentLoop])
+            try expect(totals(otherAgentWork) == [70, 4]
+                       && otherAgentWork.modelDays[modelDayKey]?["未知模型"] == [35, 2],
+                       "different agents shared a model or mirror pairing")
+            let compactionWork = try parseWork([
+                requestRow("k3d1-agent", "", eventMS - 1000, kind: "compaction"), scopedRecord])
+            try expect(totals(compactionWork) == [35, 2]
+                       && compactionWork.modelDays[modelDayKey]?["k3d1-agent"] == [35, 2],
+                       "unmirrored compaction usage was lost")
+            // loop-only 文件的请求上下文跨两次刷新仍能用于归属，并替换旧模型缓存。
+            let loopOnlyPath = workRoot + "/loop-only.jsonl"
+            try (try jsonLine(requestRow("k2d8-preview", "0.1", eventMS - 1000)) + "\n")
+                .write(toFile: loopOnlyPath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
+            let loopAppend = try FileHandle(forWritingTo: URL(fileURLWithPath: loopOnlyPath))
+            loopAppend.seekToEndOfFile()
+            loopAppend.write(Data((try jsonLine(stepRow(1, eventMS)) + "\n").utf8))
+            try loopAppend.close()
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
+            // 枚举器会将 /var 规范化为 /private/var。
+            let loopOnlyKey = workFiles.keys.first { $0.hasSuffix("/loop-only.jsonl") }
+            try expect(loopOnlyKey.flatMap { workFiles[$0]?.modelDays[modelDayKey]?["k2d8-preview"] } == [35, 2],
+                       "request model context was lost across loop-only refreshes")
+            try FileManager.default.removeItem(atPath: loopOnlyPath)
+            if let loopOnlyKey { workFiles.removeValue(forKey: loopOnlyKey) }
             let oldJSON = Data("{\"work\":{},\"cli\":{}}".utf8)
             try expect((try? JSONDecoder().decode(TokenAggregator.ScanState.self, from: oldJSON)) != nil, "old cache cannot decode")
 
@@ -3597,6 +3746,37 @@ enum KimiOfflineRegression {
             try expect(windows.2.input == 150 && windows.2.output == 15
                        && windows.2.models["k3.1-pro"]?.input == 90 && windows.2.models["k3.1-pro"]?.output == 9,
                        "thirty-day model breakdown does not reconcile")
+
+            // API 别名跨来源/旧缓存合并为四类，各窗口输入输出保持一致。
+            var aliasFile = TokenAggregator.FileScanState()
+            aliasFile.modelDays = [
+                offsetDay(0): ["kimi-code/k3.1-pro": [10, 1], "k3.1-pro": [20, 2],
+                               "kimi-code/k3-256k": [30, 3], "k3-256k": [40, 4],
+                               "k3": [50, 5], "kimi-code/kimi-for-coding": [60, 6]],
+                offsetDay(-2): ["kimi-code/k3.1-pro": [7, 1]],
+                offsetDay(-8): ["kimi-code/kimi-for-coding": [3, 1]]
+            ]
+            let aliasWindows = TokenAggregator.buckets(["legacy-cache": aliasFile],
+                extraModelDays: [offsetDay(0): ["kimi-code/k3.1-pro": [1, 1]]])
+            try expect(aliasWindows.0.input == 211 && aliasWindows.0.output == 22
+                       && aliasWindows.1.input == 218 && aliasWindows.1.output == 23
+                       && aliasWindows.2.input == 221 && aliasWindows.2.output == 24,
+                       "model alias merging changed window totals")
+            for stat in [aliasWindows.0, aliasWindows.1, aliasWindows.2] {
+                try expect(Set(stat.models.keys) == Set(["k3.1-pro", "k3-256k", "k3", "kimi-for-coding"])
+                           && stat.models.values.reduce(0, { $0 + $1.input }) == stat.input
+                           && stat.models.values.reduce(0, { $0 + $1.output }) == stat.output,
+                           "model alias tree does not reconcile or distinct model IDs were merged")
+            }
+            try expect(aliasWindows.0.models["k3.1-pro"]?.input == 31
+                       && aliasWindows.0.models["k3-256k"]?.input == 70
+                       && TokenAggregator.normalizedModel(" KIMI-CODE/K3.1-PRO ") == "k3.1-pro"
+                       && TokenAggregator.normalizedModel("kimi-code/k3.1-pro-highspeed") == "k3.1-pro-highspeed"
+                       && TokenAggregator.modelDisplayName("kimi-code/k3.1-pro") == "K3.1 Pro"
+                       && TokenAggregator.modelDisplayName("k3-256k") == "K3-256k"
+                       && TokenAggregator.modelDisplayName("k3") == "K3"
+                       && TokenAggregator.modelDisplayName("kimi-for-coding") == "Kimi for Coding",
+                       "canonical model names or display names are wrong")
 
             // 相同用量隔数小时是两次调用；午夜附近的镜像仍能配对。
             func workRow(_ kind: String, _ ms: Double, _ id: String? = nil) -> [String: Any] {
@@ -3625,7 +3805,7 @@ enum KimiOfflineRegression {
                 legacyWork[key]?.modelDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧模型": [999, 999]]]
             }
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &legacyWork)
-            try expect(legacyWork.values.first?.scanRevision == 3 && legacyWork.values.first.map(totals) == [35, 2]
+            try expect(legacyWork.values.first?.scanRevision == 4 && legacyWork.values.first.map(totals) == [35, 2]
                        && legacyWork.values.first?.modelDays.values.first?["旧模型"] == nil,
                        "v6 old revision was not rebuilt")
 

@@ -480,6 +480,14 @@ echo "build" >> "$MOCK_LOG"
         self.assertFalse(any(line.startswith("git tag") for line in self.log_lines()))
         self.assertFalse(any(line.startswith("git push") for line in self.log_lines()))
 
+    def test_menu_bar_appearance_reconcile_never_hides_status_item(self):
+        source = (ROOT / f"{EXECUTABLE}.swift").read_text()
+        self.assertNotIn("lastBarNudge", source)
+        self.assertNotIn("statusItem.isVisible = false", source)
+        self.assertIn("statusItem.button?.observe(\\.effectiveAppearance)", source)
+        self.assertIn("self?.reconcileBarAppearance()", source)
+        self.assertIn("img.cacheMode = .never", source)
+
     def test_update_process_preserves_user_file_permissions(self):
         source = (ROOT / f"{EXECUTABLE}.swift").read_text()
         controller = source.split("final class UpdateProgressController", 1)[1].split("// MARK: - 版本与更新检查", 1)[0]

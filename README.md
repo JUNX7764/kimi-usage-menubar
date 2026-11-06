@@ -9,7 +9,7 @@
 
 **本地统计会话用量，不上传会话记录。**
 
-<img src="docs/images/kimi-usage.png" alt="KimiUsage 面板：Kimi 额度、重置时间和 Token 用量" width="360">
+<img src="docs/images/kimi-usage.png" alt="KimiUsage 面板：Kimi 额度、重置时间和 Token 用量" width="360"> <img src="docs/images/kimi-usage-model-breakdown.png" alt="展开周期后的各模型 Token 用量明细" width="360">
 
 *界面展示的是示例数据。*
 
@@ -18,9 +18,10 @@
 - **随时看额度**：菜单栏显示 5 小时和 7 天剩余额度；点开可查看月度额度。
 - **知道何时恢复**：查看各额度的重置时间，方便安排使用。
 - **了解使用情况**：查看 Kimi Work 和 API 客户端今天、近 7 天及近 30 天的 Token 用量；点击任一周期整行可展开或收起各模型的总量、输入和输出，刷新后保留展开状态。
+- **随时刷新和启动**：额度自动刷新，也可以手动刷新所有数据；支持开机自启。
 - **及时发现异常**：数据更新失败或过期时，面板会给出提示。
 
-Token 统计来自本机可读取的会话记录，覆盖 Kimi Work、Kimi Code CLI、ZCode、Proma、Claude Code、Hermes Agent 等支持的来源；API 客户端部分只统计识别到的 Kimi / Moonshot 用量，不能视为所有设备或所有模型的总用量。
+Token 统计来自本机可读取的会话记录，覆盖 Kimi Work、Kimi Code CLI、ZCode、Proma、Claude Code、Hermes Agent 等支持的来源；API 客户端部分只统计识别到的 Kimi / Moonshot 用量，不能视为所有设备或所有模型的总用量。近 7 天和近 30 天均包含今天。
 
 ## 安装
 
@@ -32,7 +33,7 @@ Token 统计来自本机可读取的会话记录，覆盖 Kimi Work、Kimi Code 
 
 ## 更新
 
-有新版本时，面板会提示更新。点击后可以在应用内查看下载和安装进度，完成后自动重启。也可点击面板底部的版本号手动检查。
+有新版本时，面板会提示更新。点击后可以在应用内查看下载和安装进度；关闭面板后更新会继续，再次打开可查看进度，完成后自动重启。也可点击面板底部的版本号手动检查。
 
 从旧版升级到首次支持应用内进度的版本时，仍会打开一次终端窗口；此后更新使用新界面。
 

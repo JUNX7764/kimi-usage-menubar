@@ -1,72 +1,57 @@
-<!-- 元信息 -->
-<!-- artifact: 02-architecture | feature: project | modules: - -->
-# reliable-release-update-20261102 架构设计文档
+# KimiUsage 当前架构概览
 
-> **文档说明**：项目级架构设计产出物，记录选型、ADR 决策与模块边界；ADR 追加式维护。
->
-> **版本**：V1.0.0
-> **最后更新**：{{DATE}}
->
-> 注：`{{...}}` 为跨文档占位符；`{例如：...}` 为填写提示；含占位符的块不参与机械校验。引用块 `>` 中为填写指导，填写后可删除。
+> 状态：当前架构摘要。最后核对：2026-11-06。
+> 本文解释模块与边界，函数级行为以源码和测试为准。
 
----
+## 1. 应用形态
 
-## 1. 文档信息 (Document Info)
+KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前 Swift 实现集中在 `KimiUsage.swift`，无 Swift Package 依赖。面板使用原生 `NSPopover`，不是 SwiftUI 面板。
 
-### 1.1 版本记录
+应用身份保持为：
 
-| 版本号 | 修改日期 | 修改人 | 修改内容 | 备注 |
-| :--- | :--- | :--- | :--- | :--- |
-| V1.0.0 | {{DATE}} | {{OWNER}} | 初始版本 | - |
+- 仓库：`JUNX7764/kimi-usage-menubar`
+- Bundle / LaunchAgent：`com.local.kimi-usage`
+- 应用：`KimiUsage.app`
 
-### 1.2 文档责任人
+## 2. 模块边界
 
-| 角色 | 姓名 | 职责 |
-| :--- | :--- | :--- |
-| 责任人 | {{OWNER}} | 本阶段产出、自检与送验 |
+| 模块 | 当前职责 |
+|---|---|
+| `CredStore` | 读取 Kimi 桌面端配置；月度认证续期时合并并原子写回 |
+| `Fetcher` | 查询 5 小时、7 天和月度额度 |
+| `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
+| `UpdateChecker` | 检查 GitHub Release 和更新资产 |
+| `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
+| `UsagePanelController` | 原生 Popover、额度与模型明细交互 |
+| `AppDelegate` | 生命周期、刷新调度、自启和状态聚合 |
+| `KimiOfflineRegression` | 使用临时目录与假数据的离线自检 |
 
-### 1.3 FlowGuard 阶段信息
+单文件是当前实现状态，不是永久架构约束。后续拆分时优先分离凭据、网络、Token 聚合、更新和 UI。
 
-| 字段 | 值 |
-|:---|:---|
-| 任务 | reliable-release-update-20261102 |
-| 父任务 | - |
-| 阶段 | 02-architecture |
-| 阶段状态 | pending |
-| 规格事实源 | external |
-| 原生产物 | README.md |
-| 批准依据 | - |
-| 前置指纹 | - |
-| 验收指纹 | - |
+## 3. 主要数据流
 
+### 额度与认证
 
----
+Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度与错误合并 → Popover 和诊断状态。
 
-## 2. 选型 (Technology Choices)
+401 续期是当前配置写回路径。写回必须保留客户端并发轮换结果、原子替换和仅所有者权限；认证字段不得写入日志、缓存、测试或提交。
 
-| 维度 | 选型 | 理由 |
-| :--- | :--- | :--- |
-| {例如：编排核} | {例如：Python 标准库} | {例如：零依赖分发} |
+### 本地 Token
 
----
+本地 JSONL / SQLite → 只读扫描与来源去重 → `scan-state-v6.json` → 今日、近 7 日、近 30 日及模型明细。
 
-## 3. ADR 列表 (Architecture Decisions)
+原始会话与数据库只读。缺少模型名、来源不可读、重复日志和 SQLite 中途失败必须按既定边界降级，不能将部分结果当成完整成功。
 
-> 追加式：禁止改写既有条目；新增条目带 `feature: <来源功能>` 标注。
+### 自动更新
 
-- ADR-{{编号}} | feature: {{来源}} | 状态: {{proposed/accepted}} —— {{决策一句话}}
-  - 背景：{{...}}；备选：{{...}}；后果：{{...}}
+GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、版本、签名与离线自检 → 暂存 → 停止目标进程 → 换包 → 健康检查 → 成功清理或失败回滚。
 
----
+更新器只处理当前应用路径和 `com.local.kimi-usage`，不得按名称模糊终止其他进程。
 
-## 4. 模块边界 (Module Boundaries)
+## 4. 信任边界
 
-| 模块 | 职责 | 依赖方向 |
-| :--- | :--- | :--- |
-| {{MODULE}} | {{职责}} | {{依赖}} |
----
-
-**文档版本**：V1.0.0
-**创建日期**：{{DATE}}
-**最后更新**：{{DATE}}
-**文档状态**：✅ 待评审
+- Kimi 接口与本地客户端格式可能变化，解析失败必须显式降级。
+- 本地配置写回与官方客户端之间没有共同文件锁，已知并发窗口不能宣称完全消除。
+- GitHub Release 与 SHA256 来自同一信任源；ad-hoc 签名不提供独立发布者身份验证。
+- 离线 mock、真实接口验证和真实安装验收是不同证据。
+- 当前没有 CI 强制发布门禁，也没有完整系统版本兼容性矩阵。

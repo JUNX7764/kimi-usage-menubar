@@ -9,3 +9,6 @@ icon_1024x1024.png
 
 # Python 测试缓存
 __pycache__/
+
+# 视觉预览截图
+.preview-shots/

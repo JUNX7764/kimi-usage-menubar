@@ -1163,6 +1163,16 @@ enum Fmt {
         f.dateFormat = "MM-dd HH:mm"
         return f
     }()
+    private static let resetDateTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MM-dd EEE HH:mm"
+        return f
+    }()
+    static func resetDateTime(_ d: Date?) -> String {
+        guard let d = d else { return "" }
+        return resetDateTimeFmt.string(from: d)
+    }
     static func time(_ d: Date?) -> String {
         guard let d = d else { return "" }
         return timeFmt.string(from: d)
@@ -3094,7 +3104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var notices: [UsagePanelModel.Notice] = []
             if stale { notices.append(notice("⚠ 已过期 · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")", .warning)) }
             if let error = error { notices.append(notice("刷新失败：\(error) · 最后成功 \(last.map { Fmt.dayTime($0) } ?? "--")", .error)) }
-            return .init(title: title, resetText: reset.map { Fmt.dayTime($0) } ?? "时间未知",
+            return .init(title: title, resetText: reset.map { Fmt.resetDateTime($0) } ?? "时间未知",
                          remaining: remaining(used).map { Int(($0 * 100).rounded()) }, notices: notices)
         }
         func section(_ title: String, _ accent: PanelAccent, _ values: [TokenStat?], _ error: String?, _ last: Date?, _ stale: Bool) -> UsagePanelModel.TokenSection {
@@ -3367,6 +3377,13 @@ enum KimiOfflineRegression {
         do {
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: root) }
+
+            var calendar = Calendar(identifier: .gregorian)
+            calendar.timeZone = .current
+            let resetDate = calendar.date(from: DateComponents(year: 2026, month: 11, day: 10, hour: 6, minute: 15))!
+            try expect(Fmt.resetDateTime(resetDate) == "11-10 周二 06:15", "reset weekday formatting changed")
+            try expect(Fmt.dayTime(resetDate) == "11-10 06:15", "existing date formatting changed")
+            try expect(Fmt.resetDateTime(nil).isEmpty, "missing reset date formatting changed")
 
             try expect(UsageNumber.finite(Double.nan) == nil, "NaN accepted")
             try expect(UsageNumber.finite("Infinity") == nil, "Infinity accepted")

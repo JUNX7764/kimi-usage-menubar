@@ -2125,11 +2125,11 @@ final class QuotaProgressView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 4
+        layer?.cornerRadius = 3
         layer?.masksToBounds = true
-        fill.cornerRadius = 4
+        fill.cornerRadius = 3
         layer?.addSublayer(fill)
-        heightAnchor.constraint(equalToConstant: 8).isActive = true
+        heightAnchor.constraint(equalToConstant: 6).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -3324,10 +3324,10 @@ private final class ShareBarView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 2
+        layer?.cornerRadius = 3
         layer?.masksToBounds = true
         layer?.addSublayer(fill)
-        heightAnchor.constraint(equalToConstant: 4).isActive = true
+        heightAnchor.constraint(equalToConstant: 6).isActive = true
         widthAnchor.constraint(equalToConstant: 64).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }

@@ -992,7 +992,9 @@ enum TokenAggregator {
         func value(_ current: Double, _ previous: Double) -> Comparison.Value {
             if current == previous { return .flat }
             if previous == 0 { return .added(current) }
-            return .percent((current - previous) / previous * 100)
+            let pct = (current - previous) / previous * 100
+            if abs(pct) < 0.05 { return .flat }   // GLM 同款：一位小数下防 ±0.0%
+            return .percent(pct)
         }
         let dayDetail = "比较区间 \(mmdd(key(-1)))–\(mmdd(key(0)))（今日未结束）· （最近1日总量−前1日总量）÷前1日总量"
         let weekDetail = "比较区间 \(mmdd(key(-13)))–\(mmdd(key(-7))) 与 \(mmdd(key(-6)))–\(mmdd(key(0)))（今日未结束）· （最近7日总量−前7日总量）÷前7日总量"
@@ -3164,54 +3166,67 @@ private final class DailyBriefSectionView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// 固定对比条：底色与卡片统一；增深蓝、减绿；具体日期区间入悬停与 VoiceOver。
+/// 固定对比条：架构对齐 GLMUsage GLMComparisonStrip——30pt 圆角条、两项均分、中缝竖线、
+/// 非数值（持平/数据不足）弱化色；数值色沿用 Kimi 语义（增深蓝 / 减绿）。
 private final class ComparisonRowView: NSView {
     init(day: UsagePanelModel.BriefComparison, week: UsagePanelModel.BriefComparison) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 10)
-        row.addArrangedSubview(Self.item(day))
-        let divider = PanelUI.separator()
-        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
-        row.addArrangedSubview(divider)
-        row.addArrangedSubview(Self.item(week))
+        layer?.cornerRadius = 7
+        heightAnchor.constraint(equalToConstant: 30).isActive = true
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 0)
+        row.distribution = .fillEqually
+        row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7)
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+            row.heightAnchor.constraint(equalToConstant: 30),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4)
         ])
+        let items = [(day, "今日（未结束）与前一日比较"), (week, "最近 7 日（含今日）与此前 7 日比较")]
+        for (index, item) in items.enumerated() {
+            if index > 0 {
+                let divider = PanelUI.separator()
+                divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+                divider.heightAnchor.constraint(equalToConstant: 16).isActive = true
+                row.addArrangedSubview(divider)
+            }
+            let half = NSView()
+            half.translatesAutoresizingMaskIntoConstraints = false
+            half.toolTip = "\(item.1) · \(item.0.detail)"
+            half.setAccessibilityLabel("\(item.0.label) \(item.0.text)，\(item.0.detail)")
+            let content = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
+            content.translatesAutoresizingMaskIntoConstraints = false
+            let caption = PanelUI.label(item.0.label, size: 10, color: .secondaryLabelColor, wrapping: false)
+            let valueColor = NSColor(name: nil) { appearance in
+                switch item.0.direction {
+                case .up: return PanelAccent.codex.color
+                case .down: return RemainingColorTier.green.color(for: appearance)
+                case .flat: return .secondaryLabelColor
+                }
+            }
+            let value = PanelUI.label(item.0.text, size: 11, weight: .semibold, color: valueColor,
+                wrapping: false, monospacedDigits: true)
+            value.setContentHuggingPriority(.required, for: .horizontal)
+            value.setContentCompressionResistancePriority(.required, for: .horizontal)
+            content.addArrangedSubview(caption)
+            content.addArrangedSubview(value)
+            half.addSubview(content)
+            NSLayoutConstraint.activate([
+                content.centerXAnchor.constraint(equalTo: half.centerXAnchor),
+                content.centerYAnchor.constraint(equalTo: half.centerYAnchor)
+            ])
+            row.addArrangedSubview(half)
+        }
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    private static func item(_ comparison: UsagePanelModel.BriefComparison) -> NSView {
-        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        let label = PanelUI.label(comparison.label, size: 11, color: .secondaryLabelColor, wrapping: false)
-        let color: NSColor = NSColor(name: nil) { appearance in
-            switch comparison.direction {
-            case .up: return PanelAccent.codex.color
-            case .down: return RemainingColorTier.green.color(for: appearance)
-            case .flat: return .secondaryLabelColor
-            }
-        }
-        let value = PanelUI.label(comparison.text, size: 11, weight: .medium, color: color,
-            wrapping: false, monospacedDigits: true)
-        value.setContentHuggingPriority(.required, for: .horizontal)
-        value.setContentCompressionResistancePriority(.required, for: .horizontal)
-        row.addArrangedSubview(label)
-        row.addArrangedSubview(value)
-        row.toolTip = comparison.detail
-        row.setAccessibilityLabel("\(comparison.label) \(comparison.text)，\(comparison.detail)")
-        return row
-    }
 
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
-            self.layer?.cornerRadius = 8
+            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.055).cgColor
         }
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -3329,7 +3344,7 @@ private final class ShareBarView: NSView {
         layer?.masksToBounds = true
         layer?.addSublayer(fill)
         heightAnchor.constraint(equalToConstant: 6).isActive = true
-        widthAnchor.constraint(equalToConstant: 64).isActive = true
+        widthAnchor.constraint(equalToConstant: 84).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -3353,7 +3368,8 @@ private final class ShareBarView: NSView {
     }
 }
 
-/// 工具行：名称 + 占比条 + 总量；状态/输入/输出/占比入悬停与 VoiceOver（v0.4 规格）。
+/// 工具行：名称 + 占比条 + 总量；固定列宽保证跨行对齐（占比条 84 ｜ % 34 ｜ 总量 64）。
+/// 状态/输入/输出/占比入悬停与 VoiceOver（v0.4 规格）。
 private final class ToolRowView: NSView {
     init(row: UsagePanelModel.ToolRow) {
         super.init(frame: .zero)
@@ -3364,18 +3380,20 @@ private final class ToolRowView: NSView {
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         main.addArrangedSubview(name)
         main.addArrangedSubview(PanelUI.spacer())
-        let shareGroup = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        shareGroup.addArrangedSubview(ShareBarView(ratio: CGFloat(row.share)))
+        let bar = ShareBarView(ratio: CGFloat(row.share))
+        main.addArrangedSubview(bar)
         let shareLabel = PanelUI.label(row.shareText, size: 10, color: .secondaryLabelColor,
             wrapping: false, monospacedDigits: true)
         shareLabel.alignment = .right
         shareLabel.setContentHuggingPriority(.required, for: .horizontal)
-        shareLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
-        shareGroup.addArrangedSubview(shareLabel)
-        main.addArrangedSubview(shareGroup)
+        shareLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        shareLabel.widthAnchor.constraint(equalToConstant: 34).isActive = true
+        main.addArrangedSubview(shareLabel)
         let total = PanelUI.label(row.total, size: 11, weight: .semibold, wrapping: false, monospacedDigits: true)
+        total.alignment = .right
         total.setContentHuggingPriority(.required, for: .horizontal)
         total.setContentCompressionResistancePriority(.required, for: .horizontal)
+        total.widthAnchor.constraint(equalToConstant: 64).isActive = true
         main.addArrangedSubview(total)
         addSubview(main)
         PanelUI.pin(main, to: self)
@@ -3384,7 +3402,6 @@ private final class ToolRowView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
-
 private final class PanelFooterView: NSView {
     init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController,
          buttonFactory: (NSMenuItem, PanelActionButton.Style, String?) -> PanelActionButton) {
@@ -3859,24 +3876,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // 覆盖可证实时缺键 = 真实 0；否则缺失占位，不补零伪装趋势
             return UsagePanelModel.BriefDay(label: label, total: 0, input: 0, output: 0, covered: coverageOK, isToday: offset == 0)
         }
+        // 比较条架构与文案对齐 GLMUsage：日环比/7日环比、%+.1f%% 中性数值、新增带数值
         func comparisonItem(_ label: String, _ value: TokenAggregator.Comparison.Value,
                             _ detail: String) -> UsagePanelModel.BriefComparison {
             switch value {
             case .percent(let pct):
                 return UsagePanelModel.BriefComparison(label: label,
-                    text: "\(pct < 0 ? "−" : "+")\(String(format: "%.1f", abs(pct)))%",
+                    text: String(format: "%+.1f%%", pct),
                     direction: pct < 0 ? .down : .up, detail: detail)
             case .flat:
                 return UsagePanelModel.BriefComparison(label: label, text: "持平", direction: .flat, detail: detail)
-            case .added:
-                return UsagePanelModel.BriefComparison(label: label, text: "新增", direction: .up, detail: detail)
+            case .added(let total):
+                return UsagePanelModel.BriefComparison(label: label, text: "新增 \(Fmt.tokens(total))",
+                    direction: .up, detail: detail)
             case .insufficient:
                 return UsagePanelModel.BriefComparison(label: label, text: "数据不足", direction: .flat, detail: detail)
             }
         }
         let brief = UsagePanelModel.BriefSection(days: (-29...0).map(briefDay),
-            day: comparisonItem("较昨日", comparison.day, comparison.dayDetail),
-            week: comparisonItem("较前 7 天", comparison.week, comparison.weekDetail),
+            day: comparisonItem("日环比", comparison.day, comparison.dayDetail),
+            week: comparisonItem("7日环比", comparison.week, comparison.weekDetail),
             notices: [])
         func fixedOrder(_ id: TokenAggregator.ToolID) -> Int {
             TokenAggregator.ToolID.allCases.firstIndex(of: id) ?? .max
@@ -4407,6 +4426,13 @@ enum KimiOfflineRegression {
             addedDaily[TokenAggregator.dayKey(0, from: cutNow)] = [5, 5]
             let addedComp = TokenAggregator.comparisons(daily: addedDaily, staleTokensInWindow: 0, now: cutNow)
             if case .added = addedComp.day {} else { try expect(false, "base-zero day should be added") }
+            // GLM 同款持平阈值：|pct| < 0.05 归持平（防 ±0.0%）
+            let flatThresholdDaily: [String: [Double]] = [
+                TokenAggregator.dayKey(0, from: cutNow): [1_000_000, 0],
+                TokenAggregator.dayKey(-1, from: cutNow): [1_000_001, 0]
+            ]
+            let flatThresholdComp = TokenAggregator.comparisons(daily: flatThresholdDaily, staleTokensInWindow: 0, now: cutNow)
+            if case .flat = flatThresholdComp.day {} else { try expect(false, "|pct|<0.05 should be flat") }
             let staleComp = TokenAggregator.comparisons(daily: daily, staleTokensInWindow: 0.5, now: cutNow)
             if case .insufficient = staleComp.day {} else { try expect(false, "stale day must be insufficient") }
             if case .insufficient = staleComp.week {} else { try expect(false, "stale week must be insufficient") }

@@ -196,6 +196,9 @@ struct UsageData {
     var monthUsed: Double?         // 0..1
     var monthReset: Date?
     var planName: String?          // 订阅套餐名（GetSubscription subscription.goods.title）
+    var accountName: String?       // 登录账号昵称（GET /api/user name）
+    var accountPhone: String?      // 登录账号手机号（服务端已打码）；Kimi 账号可能无 email，头部账号行用
+    var accountFetched: Bool = false
     var tokensToday: TokenStat?
     var tokens7d: TokenStat?
     var tokens30d: TokenStat?
@@ -1277,6 +1280,43 @@ enum Fetcher {
             result = parseMonthUsagePayload(obj)
         }.resume()
     }
+
+    // MARK: 登录账号信息（GET www.kimi.com/api/user，头部账号行）
+
+    /// 昵称与手机号。手机号由服务端打码返回（如 185****5369），客户端原样展示不自行加工；
+    /// 昵称缺失回退 shared_user_name；空串一律视为缺失。
+    static func parseKimiAccountPayload(_ obj: [String: Any]) -> (name: String?, phone: String?) {
+        func clean(_ key: String) -> String? {
+            guard let s = obj[key] as? String else { return nil }
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return t.isEmpty ? nil : t
+        }
+        return (clean("name") ?? clean("shared_user_name"), clean("phone"))
+    }
+
+    static func fetchKimiAccount(webToken: String,
+                                 completion: @escaping (_ name: String?, _ phone: String?, _ error: String?) -> Void) {
+        guard let url = URL(string: "https://www.kimi.com/api/user") else {
+            completion(nil, nil, "bad url"); return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 15)
+        req.setValue("Bearer \(webToken)", forHTTPHeaderField: "Authorization")
+        req.setValue("mac", forHTTPHeaderField: "x-msh-platform")
+        req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
+        req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            guard err == nil, let data = data,
+                  let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let reason = (resp as? HTTPURLResponse).map { "HTTP \($0.statusCode)" }
+                    ?? err?.localizedDescription ?? "bad response"
+                completion(nil, nil, reason); return
+            }
+            let parsed = parseKimiAccountPayload(obj)
+            completion(parsed.name, parsed.phone, nil)
+        }.resume()
+    }
 }
 
 // MARK: - 菜单栏堆叠两行文字渲染
@@ -1835,7 +1875,7 @@ struct UsagePanelModel {
     var updateItem: NSMenuItem?
     var title: String
     var planName: String?        // 套餐名标签（缺失隐藏）
-    var email: String?
+    var accountLine: String?     // 头部账号行（CodexUsage 同款布局：标题行下一行账号信息）
     var quotas: [Quota]
     var resetCards: ResetSection?
     var tibo: TiboSection?
@@ -2072,9 +2112,9 @@ final class PanelHeaderView: NSView {
         }
         titleRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(titleRow, to: titles)
-        if let email = model.email, !email.isEmpty {
-            let emailLabel = PanelUI.label(email, size: 11, color: .secondaryLabelColor)
-            PanelUI.addFullWidth(emailLabel, to: titles)
+        if let accountLine = model.accountLine, !accountLine.isEmpty {
+            let accountLabel = PanelUI.label(accountLine, size: 11, color: .secondaryLabelColor)
+            PanelUI.addFullWidth(accountLabel, to: titles)
         }
         row.addArrangedSubview(titles)
         addSubview(row)
@@ -3611,6 +3651,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             merged.monthError = "no web token"
         }
 
+        // 头部账号行（CodexUsage 头部同款）：昵称 + 服务端打码手机号；401 走与月度相同的 refresh→重试链
+        if includeSlow, let token = CredStore.load().webToken, !token.isEmpty {
+            merged.accountFetched = true
+            group.enter()
+            func applyAccount(_ name: String?, _ phone: String?) {
+                mergeLock.lock()
+                merged.accountName = name
+                merged.accountPhone = phone
+                mergeLock.unlock()
+                group.leave()
+            }
+            Fetcher.fetchKimiAccount(webToken: token) { name, phone, err in
+                if let err = err, err.contains("401") {
+                    Fetcher.refreshWebToken { newToken in
+                        if let newToken = newToken {
+                            Fetcher.fetchKimiAccount(webToken: newToken) { n2, p2, _ in applyAccount(n2, p2) }
+                        } else {
+                            group.leave()   // 续期失败：本轮不改写，保留旧值
+                        }
+                    }
+                } else {
+                    applyAccount(name, phone)
+                }
+            }
+        }
+
         if includeSlow {
             group.enter()
             DispatchQueue.global(qos: .utility).async {
@@ -3652,6 +3718,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !includeSlow {
                 merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset; merged.monthError = old.monthError
                 merged.planName = old.planName
+                merged.accountName = old.accountName; merged.accountPhone = old.accountPhone
                 merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
                 merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
                 merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
@@ -3661,6 +3728,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
                 if merged.monthError != nil { merged.planName = old.planName }
+                // 账号行：本轮拉到哪个字段用哪个，缺的保留旧值；未拉取（无 web token）整组保留
+                if merged.accountFetched {
+                    if merged.accountName == nil { merged.accountName = old.accountName }
+                    if merged.accountPhone == nil { merged.accountPhone = old.accountPhone }
+                } else {
+                    merged.accountName = old.accountName; merged.accountPhone = old.accountPhone
+                }
                 // 即使部分来源失败，也显示健康来源的新贡献和失败来源的缓存。
 
             }
@@ -3791,6 +3865,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
             "version": BuildInfo.version,
             "planName": usage.planName ?? "",
+            "accountName": usage.accountName ?? "",
+            "accountPhone": usage.accountPhone ?? "",
             "updateAvailable": UpdateChecker.shared.available,
             "lastSuccessAt": [
                 "fiveHour": lastFiveHourSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? "",
@@ -3955,8 +4031,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.workTokensError ?? usage.cliTokensError,
             usage.workTokensError != nil ? workTokensLastSuccessAt : cliTokensLastSuccessAt,
             tokensStale)
+        // 头部账号行：昵称（打码手机号）；账号无手机号时回退昵称，两者皆缺则隐藏该行
+        let accountLine: String? = {
+            switch (usage.accountName, usage.accountPhone) {
+            case let (name?, phone?): return "\(name)（\(phone)）"
+            case let (nil, phone?): return phone
+            case let (name?, nil): return name
+            default: return nil
+            }
+        }()
         panelController.update(model: UsagePanelModel(updateItem: update,
-            title: "Kimi 用量", planName: usage.planName, email: nil,
+            title: "Kimi 用量", planName: usage.planName, accountLine: accountLine,
             quotas: [quota("5 小时", usage.fiveHourUsed, usage.fiveHourReset, usage.fiveHourError, lastFiveHourSuccessAt, fiveHourStale),
                      quota("7 天", usage.sevenDayUsed, usage.sevenDayReset, usage.sevenDayError, lastSevenDaySuccessAt, sevenDayStale),
                      quota("月度", usage.monthUsed, usage.monthReset, usage.monthError, lastMonthSuccessAt, monthStale)],
@@ -3984,6 +4069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.fiveHourUsed = 0; usage.sevenDayUsed = 0; usage.monthUsed = 0
         }
         usage.planName = "Allegretto"
+        usage.accountName = "Junxiao"; usage.accountPhone = "185****5369"
         usage.fiveHourReset = now.addingTimeInterval(18000); usage.sevenDayReset = now.addingTimeInterval(604800); usage.monthReset = now.addingTimeInterval(2592000)
         func previewStat(_ input: Double, _ output: Double, _ first: [Double], _ second: [Double]) -> TokenStat {
             var stat = TokenStat(input: input, output: output)
@@ -4368,6 +4454,17 @@ enum KimiOfflineRegression {
                 "subscription": ["goods": ["title": ""]],
                 "balances": [["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]]
             ]).planName == nil, "empty plan title was accepted")
+
+            // 头部账号行解析：昵称回退 shared_user_name、打码手机号原样保留、空串视为缺失
+            let account = Fetcher.parseKimiAccountPayload(["name": "Junxiao", "phone": "185****5369"])
+            try expect(account.name == "Junxiao" && account.phone == "185****5369",
+                       "kimi account name/phone lost")
+            let accountFallback = Fetcher.parseKimiAccountPayload(["shared_user_name": "昵称", "phone": "   "])
+            try expect(accountFallback.name == "昵称" && accountFallback.phone == nil,
+                       "kimi account fallback or blank-phone guard wrong")
+            try expect(Fetcher.parseKimiAccountPayload([:]).name == nil
+                       && Fetcher.parseKimiAccountPayload([:]).phone == nil,
+                       "missing kimi account fields were fabricated")
 
             // 扫描失败面：已安装来源全部不可读才置错；未安装/部分可读/仅 hermes 成功均不置错
             try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: nil) != nil,
@@ -4953,7 +5050,7 @@ enum KimiOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.4.0",
                        "prerelease not skipped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, cache no-op, update check release version compare/assets)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

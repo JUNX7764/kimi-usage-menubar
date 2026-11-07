@@ -3048,8 +3048,9 @@ final class DailyBarChartView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         guard bounds.width > 1, bounds.height > 1 else { return }
         let slot = bounds.width / CGFloat(max(dayList.count, 1))
+        // 柱宽固定 6pt（用户 2026-11-07 指定），槽位居中；极端窄面板才收缩，最小 2pt
+        let barWidth = min(6, max(2, slot - 1))
         for (index, day) in dayList.enumerated() {
-            let barWidth = max(2, slot - 3)
             let x = CGFloat(index) * slot + (slot - barWidth) / 2
             let rect: NSRect
             if day.covered {

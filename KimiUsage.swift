@@ -207,6 +207,11 @@ struct UsageData {
     var monthError: String?
     var workTokensError: String?   // Work 会话目录已安装但不可读（保留旧值、不推进成功时间）
     var cliTokensError: String?    // API 客户端来源全部不可读（同上）
+    // v1.5 用量洞察：合并视图（Work + API 客户端）、逐日序列与逐工具贡献，同一扫描快照派生
+    var mergedTokens: (today: TokenStat, week: TokenStat, month: TokenStat)?
+    var daily: [String: [Double]] = [:]
+    var tools: [TokenAggregator.ToolStats] = []
+    var staleTokensInWindow: Double = 0
     var updatedAt: Date = Date()
 }
 
@@ -364,12 +369,17 @@ enum TokenAggregator {
         catch { NSLog("[KimiUsage] scan cache save failed: %@", error.localizedDescription) }
     }
 
-    /// 双路统计 + 失败面：work/cli 各自的错误（已安装来源全部不可读时非 nil）
+    /// 双路统计 + 失败面：work/cli 各自的错误（已安装来源全部不可读时非 nil）。
+    /// merged / daily / tools 为 v1.5 用量洞察的合并视图：与 work+cli 同一扫描快照派生，
+    /// 逐工具窗口之和 = 合并总量（原始精度）。
     struct BothStats {
         var work: (TokenStat, TokenStat, TokenStat)
         var cli: (TokenStat, TokenStat, TokenStat)
         var workError: String?
         var cliError: String?
+        var merged: (today: TokenStat, week: TokenStat, month: TokenStat)
+        var daily: [String: [Double]]
+        var tools: [ToolStats]
     }
 
     /// Kimi Work 本地会话统计
@@ -399,11 +409,30 @@ enum TokenAggregator {
         // 旧缓存没有模型维度时保留总量并归入未知模型；数据库恢复后会自动替换为真实模型。
         let zcodeModels = st.zcodeModelDays ?? (st.zcodeDays ?? [:]).mapValues { ["未知模型": $0] }
         let extraModels = mergeSourceModelDays(st.hermes?.modelDays ?? [:], zcodeModels)
+        // v1.5 用量洞察：逐工具贡献（Work + 5 类 API 客户端），与上方窗口同一扫描快照。
+        var tools: [ToolStats] = [
+            fileToolStats(id: .work, roots: [sessionsRoot], okRoots: workScan.okRoots, files: st.work),
+            fileToolStats(id: .cli, roots: [apiSessionsRoots[0]], okRoots: cliScan.okRoots, files: st.cli),
+            fileToolStats(id: .proma, roots: Array(apiSessionsRoots[1...2]), okRoots: cliScan.okRoots, files: st.cli),
+            fileToolStats(id: .claude, roots: [apiSessionsRoots[3]], okRoots: cliScan.okRoots, files: st.cli)
+        ]
+        if hermesOK != nil {
+            tools.append(ToolStats(id: .hermes, modelDays: st.hermes?.modelDays ?? [:],
+                                   installed: true, ok: hermesOK == true))
+        }
+        if zcodeOK != nil {
+            tools.append(ToolStats(id: .zcode, modelDays: zcodeModels, installed: true, ok: zcodeOK == true))
+        }
+        var mergedDays: ModelDays = [:]
+        for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
             cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
-                                  hermesOK: hermesOK, zcodeOK: zcodeOK))
+                                  hermesOK: hermesOK, zcodeOK: zcodeOK),
+            merged: statWindows(mergedDays),
+            daily: dailyTotals(mergedDays),
+            tools: tools)
     }
 
     static func mergeSourceDays(_ first: [String: [Double]], _ second: [String: [Double]]) -> [String: [Double]] {
@@ -443,10 +472,18 @@ enum TokenAggregator {
         return nil
     }
 
-    /// 窗口起算日：含今天共 7 / 30 个日历日（2026-11-03 起；此前为 8 / 31 天）
-    static func windowCutoffs(now: Date) -> (d7: String, d30: String) {
-        (dayFmt.string(from: now.addingTimeInterval(-6 * 86400)),
-         dayFmt.string(from: now.addingTimeInterval(-29 * 86400)))
+    /// 本地日历日键（yyyy-MM-dd）：与 dayFmt 同口径，但支持注入 Calendar 以便测试 DST/跨月。
+    static func dayKey(_ offset: Int, from now: Date, calendar: Calendar = .current) -> String {
+        let date = calendar.date(byAdding: .day, value: offset, to: now)
+            ?? now.addingTimeInterval(Double(offset) * 86400)
+        let c = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// 窗口起算日：含今天共 7 / 30 个日历日（Calendar 日历日运算，覆盖 DST 与跨月；
+    /// 此前为固定 86400 秒回退，跨夏令时日界会漂移一天）
+    static func windowCutoffs(now: Date, calendar: Calendar = .current) -> (d7: String, d30: String) {
+        (dayKey(-6, from: now, calendar: calendar), dayKey(-29, from: now, calendar: calendar))
     }
 
     /// 兼容既有调用；主刷新使用 aggregateBoth 合并扫描和缓存写入。
@@ -460,7 +497,7 @@ enum TokenAggregator {
     /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回。
     /// 枚举器产出的 url.path 是 realpath 形式（如 /var → /private/var；URL 的
     /// resolvingSymlinksInPath 不解析根级链接），前缀清理必须同口径才能匹配上
-    private static func realPath(_ p: String) -> String {
+    static func realPath(_ p: String) -> String {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         guard realpath(p, &buf) != nil else { return p }
         return String(cString: buf)
@@ -470,7 +507,7 @@ enum TokenAggregator {
     /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）。
     /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面
     static func scan(roots: [String], kimiOnly: Bool,
-                     into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int) {
+                     into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int, okRoots: [String]) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
@@ -545,7 +582,7 @@ enum TokenAggregator {
         for path in vanished {
             files.removeValue(forKey: path)
         }
-        return (installed, enumedRoots.count)
+        return (installed, enumedRoots.count, enumedRoots)
     }
 
     // hermes 用量库（sqlite，只读打开，绝不写入）
@@ -871,25 +908,20 @@ enum TokenAggregator {
         }
     }
 
-    /// 按日 × 模型聚合同步生成窗口汇总与明细，保证各模型之和等于周期总量。
-    static func buckets(_ files: [String: FileScanState], extraModelDays: ModelDays = [:])
-        -> (TokenStat, TokenStat, TokenStat) {
-        let now = Date()
+    /// 从按日 × 模型聚合计算三个窗口（今天及含今天的近 7 / 30 个日历日）。
+    /// 模型名须已归一；各模型之和等于周期总量；日图与周期共用同一份数据。
+    static func statWindows(_ days: ModelDays, now: Date = Date())
+        -> (today: TokenStat, week: TokenStat, month: TokenStat) {
         let todayKey = dayFmt.string(from: now)
         let (d7Key, d30Key) = windowCutoffs(now: now)
         var today = TokenStat(), week = TokenStat(), month = TokenStat()
-        var allDays: ModelDays = [:]
-        for (_, st) in files {
-            allDays = mergeSourceModelDays(allDays, st.modelDays)
-        }
-        allDays = mergeSourceModelDays(allDays, extraModelDays)
         func add(_ value: [Double], model: String, to stat: inout TokenStat) {
             stat.input += value[0]; stat.output += value[1]
             var current = stat.models[model] ?? ModelTokenStat()
             current.input += value[0]; current.output += value[1]
             stat.models[model] = current
         }
-        for (day, models) in allDays where day >= d30Key {
+        for (day, models) in days where day >= d30Key {
             for (model, value) in models {
                 add(value, model: model, to: &month)
                 if day >= d7Key { add(value, model: model, to: &week) }
@@ -897,6 +929,160 @@ enum TokenAggregator {
             }
         }
         return (today, week, month)
+    }
+
+    /// 按日 × 模型聚合同步生成窗口汇总与明细，保证各模型之和等于周期总量。
+    static func buckets(_ files: [String: FileScanState], extraModelDays: ModelDays = [:])
+        -> (TokenStat, TokenStat, TokenStat) {
+        var allDays: ModelDays = [:]
+        for (_, st) in files {
+            allDays = mergeSourceModelDays(allDays, st.modelDays)
+        }
+        allDays = mergeSourceModelDays(allDays, extraModelDays)
+        return statWindows(allDays)
+    }
+
+    /// 合并视图的逐日总量（不补零；缺键是否为真实 0 由覆盖状态决定）。
+    static func dailyTotals(_ days: ModelDays) -> [String: [Double]] {
+        var result: [String: [Double]] = [:]
+        for (day, models) in days {
+            var total = result[day] ?? [0, 0]
+            for (_, value) in models {
+                total[0] += value[0]; total[1] += value[1]
+            }
+            result[day] = total
+        }
+        return result
+    }
+
+    /// 用量简析的固定对比项（较昨日 / 较前 7 天）。
+    /// 区间以 D=今天为基准、本地日历日运算；仅当覆盖可证实（失败来源在区间内无贡献）才出百分比。
+    struct Comparison {
+        enum Value {
+            case percent(Double)   // 相对变化（%）
+            case flat              // 两期持平（含两期均为 0）
+            case added(Double)     // 基期为 0、本期为正：不产生无穷百分比
+            case insufficient      // 覆盖未证实，不编造百分比
+        }
+        let day: Value
+        let week: Value
+        let dayDetail: String      // 具体日期区间与公式（悬停 / VoiceOver）
+        let weekDetail: String
+    }
+
+    static func comparisons(daily: [String: [Double]], staleTokensInWindow: Double,
+                            now: Date = Date(), calendar: Calendar = .current) -> Comparison {
+        func key(_ offset: Int) -> String { dayKey(offset, from: now, calendar: calendar) }
+        func mmdd(_ key: String) -> String {
+            let parts = key.split(separator: "-")
+            return parts.count == 3 ? "\(parts[1])/\(parts[2])" : key
+        }
+        func total(_ from: Int, _ to: Int) -> Double {
+            var sum = 0.0
+            for offset in from...to {
+                if let value = daily[key(offset)] { sum += value[0] + value[1] }
+            }
+            return sum
+        }
+        if staleTokensInWindow > 0 {
+            return Comparison(day: .insufficient, week: .insufficient,
+                              dayDetail: "部分来源读取失败，覆盖未证实",
+                              weekDetail: "部分来源读取失败，覆盖未证实")
+        }
+        func value(_ current: Double, _ previous: Double) -> Comparison.Value {
+            if current == previous { return .flat }
+            if previous == 0 { return .added(current) }
+            return .percent((current - previous) / previous * 100)
+        }
+        let dayDetail = "比较区间 \(mmdd(key(-1)))–\(mmdd(key(0)))（今日未结束）· （最近1日总量−前1日总量）÷前1日总量"
+        let weekDetail = "比较区间 \(mmdd(key(-13)))–\(mmdd(key(-7))) 与 \(mmdd(key(-6)))–\(mmdd(key(0)))（今日未结束）· （最近7日总量−前7日总量）÷前7日总量"
+        return Comparison(day: value(total(0, 0), total(-1, -1)),
+                          week: value(total(-6, 0), total(-13, -7)),
+                          dayDetail: dayDetail, weekDetail: weekDetail)
+    }
+
+    /// 失败来源（保留旧快照）在比较区间 [D-13, D] 内的贡献量；> 0 时比较不可证实。
+    static func staleTokensInWindow(tools: [ToolStats], now: Date = Date(),
+                                    calendar: Calendar = .current) -> Double {
+        let startKey = dayKey(-13, from: now, calendar: calendar)
+        var total = 0.0
+        for tool in tools where tool.installed && !tool.ok {
+            for (day, models) in tool.modelDays where day >= startKey {
+                for (_, value) in models { total += value[0] + value[1] }
+            }
+        }
+        return total
+    }
+
+    // MARK: 逐工具维度（v1.5 用量洞察）
+
+    /// 面板「工具明细」的来源维度：Work 与 5 类 API 客户端各自独立聚合。
+    enum ToolID: String, CaseIterable {
+        case work, cli, proma, claude, hermes, zcode
+
+        var displayName: String {
+            switch self {
+            case .work: return "Kimi Work"
+            case .cli: return "Kimi CLI"
+            case .proma: return "Proma"
+            case .claude: return "Claude Code"
+            case .hermes: return "Hermes"
+            case .zcode: return "ZCode"
+            }
+        }
+    }
+
+    struct ToolStats {
+        let id: ToolID
+        let modelDays: ModelDays
+        let installed: Bool
+        let ok: Bool   // 本轮读取成功；installed 且 !ok = 保留上次快照（stale）
+        func windows(now: Date = Date()) -> (today: TokenStat, week: TokenStat, month: TokenStat) {
+            statWindows(modelDays, now: now)
+        }
+    }
+
+    /// CLI 会话文件路径 → 工具归属（两侧都过 realpath，与扫描同口径）。
+    static func toolID(forSessionPath rawPath: String, roots: [String] = apiSessionsRoots) -> ToolID {
+        let path = realPath(rawPath)
+        func under(_ root: String) -> Bool {
+            let base = realPath(root)
+            return path == base || path.hasPrefix(base + "/")
+        }
+        if roots.count > 3 {
+            if under(roots[3]) { return .claude }
+            if under(roots[2]) || under(roots[1]) { return .proma }
+            if under(roots[0]) { return .cli }
+        }
+        return .cli
+    }
+
+    /// 从文件状态字典聚合单个工具的按日 × 模型贡献。
+    private static func toolModelDays(_ files: [String: FileScanState],
+                                      under roots: [String] = []) -> ModelDays {
+        var days: ModelDays = [:]
+        for (path, st) in files {
+            if !roots.isEmpty && !roots.contains(where: { root in
+                let base = realPath(root)
+                return path == base || path.hasPrefix(base + "/")
+            }) { continue }
+            days = mergeSourceModelDays(days, st.modelDays)
+        }
+        return days
+    }
+
+    /// 组装逐工具贡献与安装/读取状态。okRoots 为本轮枚举成功的 realpath 集合；
+    /// 失败 root 的旧快照贡献保留（工具明细标「部分记录 · 缓存」）。
+    private static func fileToolStats(id: ToolID, roots: [String], okRoots: [String],
+                                      files: [String: FileScanState]) -> ToolStats {
+        var installed = false
+        var ok = true
+        for root in roots {
+            guard FileManager.default.fileExists(atPath: root) else { continue }
+            installed = true
+            if !okRoots.contains(realPath(root)) { ok = false }
+        }
+        return ToolStats(id: id, modelDays: toolModelDays(files, under: roots), installed: installed, ok: ok)
     }
 }
 
@@ -1610,15 +1796,50 @@ struct UsagePanelModel {
         var buckets: [TokenBucket]
         var notices: [Notice]
     }
+    enum ComparisonDirection { case up, down, flat }
+    struct BriefDay {
+        var label: String        // MM/DD
+        var total: Double
+        var input: Double
+        var output: Double
+        var covered: Bool        // false = 覆盖未证实：缺失占位，不补零
+        var isToday: Bool
+    }
+    struct BriefComparison {
+        var label: String        // 较昨日 / 较前 7 天
+        var text: String         // +17.7% / −3.3% / 持平 / 新增 / 数据不足
+        var direction: ComparisonDirection
+        var detail: String       // 具体日期区间与公式（悬停 / VoiceOver）
+    }
+    struct BriefSection {
+        var days: [BriefDay]
+        var day: BriefComparison
+        var week: BriefComparison
+        var notices: [Notice]
+    }
+    struct ToolRow {
+        var name: String
+        var total: String
+        var share: Double        // 0...1
+        var shareText: String
+        var status: String
+        var detail: String       // 悬停 / VoiceOver：状态 · 输入 · 输出 · 占比
+    }
+    struct ToolsSection {
+        var periods: [[ToolRow]] // [今日, 近 7 天, 近 30 天]
+        var notices: [Notice]
+    }
 
     var updateItem: NSMenuItem?
     var title: String
+    var planName: String?        // 套餐名标签（缺失隐藏）
     var email: String?
     var quotas: [Quota]
     var resetCards: ResetSection?
     var tibo: TiboSection?
-    var codexTokens: TokenSection
-    var externalTokens: TokenSection?
+    var usage: TokenSection      // 用量情况：合并本机全部来源，口径见 docs/DEVELOPMENT.md
+    var brief: BriefSection      // 用量简析：近 30 天日图 + 较昨日/较前 7 天
+    var tools: ToolsSection      // 工具明细：逐来源占比
     var notices: [Notice]
     var lastAttempt: String
     var version: String
@@ -1838,8 +2059,17 @@ final class PanelHeaderView: NSView {
         row.addArrangedSubview(icon)
         let titles = PanelUI.stack(spacing: 2)
         titles.alignment = .leading
+        let titleRow = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         let title = PanelUI.label(model.title, size: 15, weight: .semibold, wrapping: false)
-        PanelUI.addFullWidth(title, to: titles)
+        titleRow.addArrangedSubview(title)
+        if let plan = model.planName, !plan.isEmpty {
+            let tag = PlanTagView(text: plan)
+            tag.toolTip = plan
+            tag.setAccessibilityLabel("套餐 \(plan)")
+            titleRow.addArrangedSubview(tag)
+        }
+        titleRow.addArrangedSubview(PanelUI.spacer())
+        PanelUI.addFullWidth(titleRow, to: titles)
         if let email = model.email, !email.isEmpty {
             let emailLabel = PanelUI.label(email, size: 11, color: .secondaryLabelColor)
             PanelUI.addFullWidth(emailLabel, to: titles)
@@ -1849,6 +2079,41 @@ final class PanelHeaderView: NSView {
         PanelUI.pin(row, to: self)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 套餐名标签：中性底色次要文字，过长截断、悬停可读全称。
+final class PlanTagView: NSView {
+    private let label: NSTextField
+    init(text: String) {
+        label = PanelUI.label(text, size: 11, color: .secondaryLabelColor, wrapping: false)
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 7),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -7),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 150),
+            heightAnchor.constraint(equalToConstant: 18)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+            self.layer?.cornerRadius = 5
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
 }
 
 final class QuotaProgressView: NSView {
@@ -1971,10 +2236,11 @@ final class ResetCardSectionView: PanelCardView {
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onClose: (() -> Void)?
     var onCheckUpdate: (() -> Void)?
-    private var codexExpanded = true
-    private var externalExpanded = true
-    private var expandedCodexBuckets: Set<Int> = []
-    private var expandedExternalBuckets: Set<Int> = []
+    private var usageExpanded = true
+    private var briefExpanded = true
+    private var toolsExpanded = false
+    private var toolPeriodIndex = 1   // 工具明细默认「7 天」（板块折叠状态独立于周期选择）
+    private var expandedUsageBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
@@ -2144,14 +2410,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
         }
-        addContentRow(TokenSectionView(model: model.codexTokens, expanded: codexExpanded,
-            expandedBuckets: expandedCodexBuckets, target: self, action: #selector(toggleCodex),
-            bucketAction: #selector(toggleCodexBucket(_:))))
-        if let external = model.externalTokens {
-            addContentRow(TokenSectionView(model: external, expanded: externalExpanded,
-                expandedBuckets: expandedExternalBuckets, target: self, action: #selector(toggleExternal),
-                bucketAction: #selector(toggleExternalBucket(_:))))
-        }
+        addContentRow(TokenSectionView(model: model.usage, expanded: usageExpanded,
+            expandedBuckets: expandedUsageBuckets, target: self, action: #selector(toggleUsage),
+            bucketAction: #selector(toggleUsageBucket(_:))))
+        addContentRow(DailyBriefSectionView(model: model.brief, expanded: briefExpanded,
+            target: self, action: #selector(toggleBrief)))
+        addContentRow(ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
+            target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools)))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
     }
@@ -2170,16 +2435,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         CATransaction.commit()
     }
-    @objc private func toggleCodex() { codexExpanded.toggle(); refreshPanelLayout() }
-    @objc private func toggleExternal() { externalExpanded.toggle(); refreshPanelLayout() }
-    @objc private func toggleCodexBucket(_ sender: NSButton) {
-        if expandedCodexBuckets.contains(sender.tag) { expandedCodexBuckets.remove(sender.tag) }
-        else { expandedCodexBuckets.insert(sender.tag) }
+    @objc private func toggleUsage() { usageExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleBrief() { briefExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleTools() { toolsExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleToolPeriod(_ sender: NSButton) {
+        guard sender.tag != toolPeriodIndex else { return }
+        toolPeriodIndex = sender.tag
         refreshPanelLayout()
     }
-    @objc private func toggleExternalBucket(_ sender: NSButton) {
-        if expandedExternalBuckets.contains(sender.tag) { expandedExternalBuckets.remove(sender.tag) }
-        else { expandedExternalBuckets.insert(sender.tag) }
+    @objc private func toggleUsageBucket(_ sender: NSButton) {
+        if expandedUsageBuckets.contains(sender.tag) { expandedUsageBuckets.remove(sender.tag) }
+        else { expandedUsageBuckets.insert(sender.tag) }
         refreshPanelLayout()
     }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
@@ -2275,7 +2541,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             (view as? NSTextField).map { [$0.stringValue] } ?? []
                 + view.subviews.flatMap { labels($0) }
         }
-        guard isOpen, codexExpanded, externalExpanded else { return false }
+        guard isOpen, usageExpanded, briefExpanded else { return false }
         if expectScroll {
             guard scrollToEndForPreview(), let model = model else { return false }
             let oldOrigin = scrollView.contentView.bounds.origin
@@ -2284,22 +2550,22 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             let refreshedOrigin = scrollView.contentView.bounds.origin
             guard isOpen, abs(refreshedOrigin.y - oldOrigin.y) < 1 else { return false }
             let sender = NSButton(); sender.tag = 0
-            toggleCodexBucket(sender)
+            toggleUsageBucket(sender)
             let expandedOrigin = scrollView.contentView.bounds.origin
             let expected = scrollView.contentView.constrainBoundsRect(NSRect(origin: oldOrigin, size: scrollView.contentView.bounds.size)).origin
             guard isOpen, abs(expandedOrigin.y - expected.y) < 1 else { return false }
-            toggleCodexBucket(sender)
+            toggleUsageBucket(sender)
             let collapsedOrigin = scrollView.contentView.bounds.origin
             let collapsedExpected = scrollView.contentView.constrainBoundsRect(NSRect(origin: expandedOrigin, size: scrollView.contentView.bounds.size)).origin
             guard isOpen, abs(collapsedOrigin.y - collapsedExpected.y) < 1 else { return false }
             print("KimiUsage nonzero scroll: before=\(oldOrigin.y) refresh=\(refreshedOrigin.y) expand=\(expandedOrigin.y) collapse=\(collapsedOrigin.y)")
         }
         guard let model = model else { return false }
-        let expectedErrors = (model.codexTokens.notices + (model.externalTokens?.notices ?? []))
+        let expectedErrors = model.usage.notices
             .map { $0.text }.filter { $0.contains("统计失败") }
         let requiresErrors = CommandLine.arguments.contains("--visual-preview-states") || CommandLine.arguments.contains("--visual-preview-long")
-        guard !requiresErrors || expectedErrors.count == 2 else {
-            fputs("KimiUsage visual test: expected two fixture errors, got \(expectedErrors.count)\n", stderr); return false
+        guard !requiresErrors || expectedErrors.count == 1 else {
+            fputs("KimiUsage visual test: expected one fixture usage error, got \(expectedErrors.count)\n", stderr); return false
         }
         func verifyErrors(_ stage: String) -> Bool {
             let actual = labels(stack).filter { $0.contains("统计失败") }
@@ -2309,20 +2575,20 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return true
         }
         guard verifyErrors("initial") else { return false }
-        toggleCodex()
-        guard !codexExpanded, externalExpanded, verifyErrors("first collapse") else {
+        toggleUsage()
+        guard !usageExpanded, briefExpanded, verifyErrors("first collapse") else {
             fputs("KimiUsage visual test: first collapse state or notices\n", stderr); return false
         }
-        toggleExternal()
-        guard !codexExpanded, !externalExpanded, verifyErrors("second collapse") else {
+        toggleBrief()
+        guard !usageExpanded, !briefExpanded, verifyErrors("second collapse") else {
             fputs("KimiUsage visual test: second collapse state or notices\n", stderr); return false
         }
-        toggleCodex()
-        guard codexExpanded, !externalExpanded else {
+        toggleUsage()
+        guard usageExpanded, !briefExpanded else {
             fputs("KimiUsage visual test: first expansion state\n", stderr); return false
         }
-        toggleExternal()
-        guard codexExpanded, externalExpanded, verifyErrors("re-expanded") else {
+        toggleBrief()
+        guard usageExpanded, briefExpanded, verifyErrors("re-expanded") else {
             fputs("KimiUsage visual test: second expansion state or notices\n", stderr); return false
         }
         guard verifyTokenBucketInteractionsForPreview() else {
@@ -2332,8 +2598,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func expandAllTokenBucketsForPreview() {
-        expandedCodexBuckets = [0, 1, 2]
-        expandedExternalBuckets = [0, 1, 2]
+        expandedUsageBuckets = [0, 1, 2]
+        refreshPanelLayout()
+    }
+
+    /// 视觉预览：展开工具明细（默认折叠，单独开关验证行布局）
+    func expandToolsForPreview() {
+        toolsExpanded = true
         refreshPanelLayout()
     }
 
@@ -2353,7 +2624,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func numericColumnsAligned() -> Bool {
             contentController.view.layoutSubtreeIfNeeded()
             stack.layoutSubtreeIfNeeded()
-            let summary = rows(#selector(toggleCodexBucket(_:)))[0].cells
+            let summary = rows(#selector(toggleUsageBucket(_:)))[0].cells
             guard let detail = details().first else { return false }
             for index in 1..<4 {
                 let summaryLabel = summary.columnLabels[index]
@@ -2365,26 +2636,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             }
             return true
         }
-        guard rows(#selector(toggleCodexBucket(_:))).count == 3,
-              rows(#selector(toggleExternalBucket(_:))).count == 3,
-              rows(#selector(toggleCodexBucket(_:))).allSatisfy({ $0.verifyHoverForPreview() }),
-              rows(#selector(toggleExternalBucket(_:))).allSatisfy({ $0.verifyHoverForPreview() }),
+        guard rows(#selector(toggleUsageBucket(_:))).count == 3,
+              rows(#selector(toggleUsageBucket(_:))).allSatisfy({ $0.verifyHoverForPreview() }),
               detailCount() == 0 else { return false }
         for (index, expected) in [(0, 2), (1, 4), (2, 6)] {
-            rows(#selector(toggleCodexBucket(_:)))[index].performClick(nil)
+            rows(#selector(toggleUsageBucket(_:)))[index].performClick(nil)
             guard detailCount() == expected else { return false }
             if index == 0, !numericColumnsAligned() { return false }
         }
-        rows(#selector(toggleCodexBucket(_:)))[1].performClick(nil)
-        guard detailCount() == 4 else { return false }
-        for (index, expected) in [(0, 6), (1, 8), (2, 10)] {
-            rows(#selector(toggleExternalBucket(_:)))[index].performClick(nil)
-            guard detailCount() == expected else { return false }
-        }
-        rows(#selector(toggleExternalBucket(_:)))[1].performClick(nil)
-        guard detailCount() == 8, let model = model else { return false }
+        rows(#selector(toggleUsageBucket(_:)))[1].performClick(nil)
+        guard detailCount() == 4, let model = model else { return false }
         update(model: model)
-        return expandedCodexBuckets == [0, 2] && expandedExternalBuckets == [0, 2] && detailCount() == 8
+        return expandedUsageBuckets == [0, 2] && detailCount() == 4
     }
 
     // Runs against one real popover after AppKit has settled the initial presentation.
@@ -2393,9 +2656,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func row() -> TokenBucketRow? {
             func all(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { all($0) } }
             return all(stack).compactMap { $0 as? TokenBucketRow }
-                .first { $0.action == #selector(toggleCodexBucket(_:)) && $0.tag == 0 }
+                .first { $0.action == #selector(toggleUsageBucket(_:)) && $0.tag == 0 }
         }
-        toggleExternal()
+        toggleBrief()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             guard self.isOpen, let window = self.contentController.view.window,
                   let button = self.anchorButton, let buttonWindow = button.window,
@@ -2675,6 +2938,452 @@ private final class TokenSectionView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+/// 用量简析的近 30 天柱状图：整列命中、图内浮层即时读值、今日未结束描边、缺失占位不补零。
+/// 柱条在 draw(_:) 内一次性绘制（避免逐列 layer 帧与布局时序竞争）；列视图只做命中/焦点/VoiceOver。
+final class ChartOverlayView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+            self.layer?.borderColor = NSColor.separatorColor.cgColor
+            self.layer?.borderWidth = 0.5
+            self.layer?.cornerRadius = 6
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+final class DailyBarChartView: NSView {
+    static let barAreaHeight: CGFloat = 50
+    private let dayList: [UsagePanelModel.BriefDay]
+    private let peak: Double
+    private var hitColumns: [DayColumnView] = []
+    private var hoveredIndex: Int? { didSet { needsDisplay = true } }
+    private let overlay = ChartOverlayView()
+    private let overlayLabel: NSTextField
+
+    init(days: [UsagePanelModel.BriefDay], accent: PanelAccent) {
+        dayList = days
+        peak = max(days.map { $0.total }.max() ?? 0, 1)
+        let label = PanelUI.label("", size: 10, color: .labelColor, wrapping: false)
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.lineBreakMode = .byTruncatingTail
+        overlayLabel = label
+        overlay.wantsLayer = true
+        overlay.isHidden = true
+        overlay.addSubview(label)
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        var built: [DayColumnView] = []
+        for (index, day) in days.enumerated() {
+            let column = DayColumnView(index: index)
+            column.onHoverChange = { [weak self] index, entered in
+                self?.setOverlay(index: index, visible: entered)
+            }
+            column.setAccessibilityLabel(Self.accessibilityText(for: day))
+            // 水平栈的 .bottom 对齐不拉伸高度：逐列固定高度，命中区才覆盖整个绘图区
+            column.heightAnchor.constraint(equalToConstant: Self.barAreaHeight).isActive = true
+            built.append(column)
+        }
+        hitColumns = built
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .bottom, spacing: 0)
+        row.distribution = .fillEqually
+        for column in hitColumns { row.addArrangedSubview(column) }
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        addSubview(overlay)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor),
+            row.heightAnchor.constraint(equalToConstant: Self.barAreaHeight),
+            overlay.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            overlay.centerXAnchor.constraint(equalTo: centerXAnchor),
+            overlay.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -8),
+            overlayLabel.topAnchor.constraint(equalTo: overlay.topAnchor, constant: 3),
+            overlayLabel.bottomAnchor.constraint(equalTo: overlay.bottomAnchor, constant: -3),
+            overlayLabel.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 7),
+            overlayLabel.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -7)
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityLabel("近 30 天每日总 Token 柱状图")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        needsDisplay = true
+    }
+
+    private static func accessibilityText(for day: UsagePanelModel.BriefDay) -> String {
+        let base = "\(day.label)，\(day.covered ? "总量 \(Fmt.tokens(day.total))，输入 \(Fmt.tokens(day.input))，输出 \(Fmt.tokens(day.output)) Token" : "无记录，覆盖未证实")"
+        return day.isToday ? base + "，今日未结束" : base
+    }
+
+    private func setOverlay(index: Int, visible: Bool) {
+        guard hitColumns.indices.contains(index) else { return }
+        hoveredIndex = visible ? index : nil
+        guard visible else {
+            overlay.isHidden = true
+            return
+        }
+        let day = dayList[index]
+        overlayLabel.stringValue = Self.accessibilityText(for: day)
+        layoutSubtreeIfNeeded()
+        let columnFrame = hitColumns[index].frame
+        let width = overlay.fittingSize.width
+        var originX = columnFrame.midX - width / 2
+        originX = max(4, min(originX, bounds.width - width - 4))
+        overlay.layer?.cornerRadius = 6
+        overlay.frame = NSRect(x: originX, y: bounds.height - overlay.fittingSize.height - 1,
+                               width: width, height: overlay.fittingSize.height)
+        overlay.isHidden = false
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard bounds.width > 1, bounds.height > 1 else { return }
+        let slot = bounds.width / CGFloat(max(dayList.count, 1))
+        for (index, day) in dayList.enumerated() {
+            let barWidth = max(2, slot - 3)
+            let x = CGFloat(index) * slot + (slot - barWidth) / 2
+            let rect: NSRect
+            if day.covered {
+                let height = max(bounds.height * CGFloat(min(1, day.total / peak)), 2)
+                rect = NSRect(x: x, y: 0, width: barWidth, height: height)
+                (PanelAccent.codex.color.withAlphaComponent(index == hoveredIndex || day.isToday ? 0.9 : 0.5)).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+                if day.isToday {   // 今日未结束：描边单独标识
+                    PanelAccent.codex.color.setStroke()
+                    let border = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 2, yRadius: 2)
+                    border.lineWidth = 1
+                    border.stroke()
+                }
+            } else {
+                // 覆盖未证实：缺失占位，不补零伪装趋势
+                rect = NSRect(x: x, y: 0, width: barWidth, height: bounds.height)
+                NSColor.labelColor.withAlphaComponent(0.1).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+            }
+        }
+    }
+
+    /// 透明命中列：悬停 / 键盘焦点触发浮层，VoiceOver 逐柱读值；不参与绘制。
+    final class DayColumnView: NSButton {
+        let index: Int
+        var onHoverChange: ((Int, Bool) -> Void)?
+
+        init(index: Int) {
+            self.index = index
+            super.init(frame: .zero)
+            translatesAutoresizingMaskIntoConstraints = false
+            isBordered = false
+            title = ""
+            setAccessibilityElement(true)
+            setAccessibilityRole(.button)
+        }
+        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for area in trackingAreas { removeTrackingArea(area) }
+            addTrackingArea(NSTrackingArea(rect: bounds,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self, userInfo: nil))
+        }
+        override func mouseEntered(with event: NSEvent) { onHoverChange?(index, true) }
+        override func mouseExited(with event: NSEvent) { onHoverChange?(index, false) }
+        override func becomeFirstResponder() -> Bool {
+            onHoverChange?(index, true)
+            return super.becomeFirstResponder()
+        }
+        override func resignFirstResponder() -> Bool {
+            onHoverChange?(index, false)
+            return super.resignFirstResponder()
+        }
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            bounds.contains(convert(point, from: superview)) ? self : nil
+        }
+    }
+}
+
+/// 用量简析板块：chart.bar.fill 深蓝图标，独立折叠，默认展开；无主数值（Kimi 无官方累计接口）。
+private final class DailyBriefSectionView: NSView {
+    init(model: UsagePanelModel.BriefSection, expanded: Bool, target: AnyObject, action: Selector) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 6)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        header.addArrangedSubview(PanelUI.symbol("chart.bar.fill", size: 14, color: PanelAccent.codex.color))
+        header.addArrangedSubview(PanelUI.label("用量简析", size: 12, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
+            accessibilityDescription: expanded ? "折叠用量简析" : "展开用量简析")!,
+            target: target, action: action)
+        toggle.isBordered = false
+        toggle.contentTintColor = .secondaryLabelColor
+        toggle.toolTip = expanded ? "折叠" : "展开"
+        toggle.setAccessibilityLabel(expanded ? "折叠用量简析" : "展开用量简析")
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        header.addArrangedSubview(toggle)
+        PanelUI.addFullWidth(header, to: root)
+        if expanded {
+            let chart = DailyBarChartView(days: model.days, accent: .codex)
+            PanelUI.addFullWidth(chart, to: root)
+            chart.heightAnchor.constraint(equalToConstant: DailyBarChartView.barAreaHeight).isActive = true
+            chart.setContentCompressionResistancePriority(.required, for: .vertical)
+            let axis = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+            let first = model.days.first
+            let last = model.days.last
+            let firstLabel = PanelUI.label(first?.label ?? "", size: 10, color: .secondaryLabelColor,
+                wrapping: false, monospacedDigits: true)
+            let caption = PanelUI.label("每日柱状图 · 近 30 天", size: 10, color: .secondaryLabelColor, wrapping: false)
+            caption.alignment = .center
+            let lastLabel = PanelUI.label(last?.label ?? "", size: 10, color: .secondaryLabelColor,
+                wrapping: false, monospacedDigits: true)
+            lastLabel.alignment = .right
+            axis.addArrangedSubview(firstLabel)
+            axis.addArrangedSubview(caption)
+            axis.addArrangedSubview(lastLabel)
+            firstLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            lastLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            PanelUI.addFullWidth(axis, to: root)
+            root.setCustomSpacing(8, after: axis)
+            PanelUI.addFullWidth(ComparisonRowView(day: model.day, week: model.week), to: root)
+            for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
+        }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 固定对比条：底色与卡片统一；增深蓝、减绿；具体日期区间入悬停与 VoiceOver。
+private final class ComparisonRowView: NSView {
+    init(day: UsagePanelModel.BriefComparison, week: UsagePanelModel.BriefComparison) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 10)
+        row.addArrangedSubview(Self.item(day))
+        let divider = PanelUI.separator()
+        divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
+        row.addArrangedSubview(divider)
+        row.addArrangedSubview(Self.item(week))
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 7),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -7)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private static func item(_ comparison: UsagePanelModel.BriefComparison) -> NSView {
+        let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        let label = PanelUI.label(comparison.label, size: 11, color: .secondaryLabelColor, wrapping: false)
+        let color: NSColor = NSColor(name: nil) { appearance in
+            switch comparison.direction {
+            case .up: return PanelAccent.codex.color
+            case .down: return RemainingColorTier.green.color(for: appearance)
+            case .flat: return .secondaryLabelColor
+            }
+        }
+        let value = PanelUI.label(comparison.text, size: 11, weight: .medium, color: color,
+            wrapping: false, monospacedDigits: true)
+        value.setContentHuggingPriority(.required, for: .horizontal)
+        value.setContentCompressionResistancePriority(.required, for: .horizontal)
+        row.addArrangedSubview(label)
+        row.addArrangedSubview(value)
+        row.toolTip = comparison.detail
+        row.setAccessibilityLabel("\(comparison.label) \(comparison.text)，\(comparison.detail)")
+        return row
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.05).cgColor
+            self.layer?.cornerRadius = 8
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+/// 工具明细：list.bullet 深蓝图标、默认折叠、标题行内深蓝周期按钮、行=名称+占比条+总量。
+private final class ToolBreakdownView: NSView {
+    init(model: UsagePanelModel.ToolsSection, periodIndex: Int, expanded: Bool,
+         target: AnyObject, periodAction: Selector, toggleAction: Selector) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 5)
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        header.addArrangedSubview(PanelUI.symbol("list.bullet", size: 14, color: PanelAccent.codex.color))
+        header.addArrangedSubview(PanelUI.label("工具明细", size: 12, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        let periodNames = ["今日", "7 天", "30 天"]
+        let periods = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 2)
+        for (index, name) in periodNames.enumerated() {
+            let button = ToolPeriodButton(title: name)
+            button.tag = index
+            button.selected = index == periodIndex
+            button.target = target
+            button.action = periodAction
+            button.setAccessibilityLabel("工具明细周期：\(name)")
+            periods.addArrangedSubview(button)
+        }
+        header.addArrangedSubview(periods)
+        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
+            accessibilityDescription: expanded ? "折叠工具明细" : "展开工具明细")!,
+            target: target, action: toggleAction)
+        toggle.isBordered = false
+        toggle.contentTintColor = .secondaryLabelColor
+        toggle.toolTip = expanded ? "折叠" : "展开"
+        toggle.setAccessibilityLabel(expanded ? "折叠工具明细" : "展开工具明细")
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        header.addArrangedSubview(toggle)
+        PanelUI.addFullWidth(header, to: root)
+        if expanded {
+            let rows = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : []
+            if rows.isEmpty {
+                PanelUI.addFullWidth(PanelUI.label("本周期暂无用量", size: 11, color: .secondaryLabelColor), to: root)
+            }
+            for (index, row) in rows.enumerated() {
+                let view = ToolRowView(row: row)
+                PanelUI.addFullWidth(view, to: root)
+                if index == rows.count - 1 { root.setCustomSpacing(4, after: view) }
+            }
+            for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
+        }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 紧凑周期按钮：选中深蓝实底白字，未选中浅蓝底蓝字（Codex 同款语义、Kimi 深蓝）。
+private final class ToolPeriodButton: NSButton {
+    var selected = false { didSet { refreshStyle() } }
+
+    init(title: String) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        isBordered = false
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        font = .systemFont(ofSize: 10, weight: .medium)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.labelColor])
+        heightAnchor.constraint(equalToConstant: 18).isActive = true
+        widthAnchor.constraint(greaterThanOrEqualToConstant: 34).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func refreshStyle() {
+        let title = attributedTitle.string
+        let isSelected = selected
+        let textColor = NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            if isSelected {
+                return dark ? NSColor(red: 0.06, green: 0.11, blue: 0.19, alpha: 1) : .white
+            }
+            return PanelAccent.codex.color
+        }
+        attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: textColor])
+        layer?.backgroundColor = (isSelected
+            ? PanelAccent.codex.color
+            : PanelAccent.codex.color.withAlphaComponent(0.14)).cgColor
+        needsDisplay = true
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshStyle()
+    }
+}
+
+/// 细占比条：分母为同周期同一快照的合并总量。
+private final class ShareBarView: NSView {
+    private let fill = CALayer()
+    var ratio: CGFloat = 0 { didSet { needsLayout = true } }
+
+    init(ratio: CGFloat) {
+        self.ratio = ratio
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 2
+        layer?.masksToBounds = true
+        layer?.addSublayer(fill)
+        heightAnchor.constraint(equalToConstant: 4).isActive = true
+        widthAnchor.constraint(equalToConstant: 64).isActive = true
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
+            self.fill.backgroundColor = PanelAccent.codex.color.withAlphaComponent(0.8).cgColor
+        }
+    }
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        fill.frame = NSRect(x: 0, y: 0, width: bounds.width * max(0, min(1, ratio)), height: bounds.height)
+        CATransaction.commit()
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+/// 工具行：名称 + 占比条 + 总量；状态/输入/输出/占比入悬停与 VoiceOver（v0.4 规格）。
+private final class ToolRowView: NSView {
+    init(row: UsagePanelModel.ToolRow) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let main = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        let name = PanelUI.label(row.name, size: 11, weight: .medium, wrapping: false)
+        name.lineBreakMode = .byTruncatingTail
+        name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        main.addArrangedSubview(name)
+        main.addArrangedSubview(PanelUI.spacer())
+        let shareGroup = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+        shareGroup.addArrangedSubview(ShareBarView(ratio: CGFloat(row.share)))
+        let shareLabel = PanelUI.label(row.shareText, size: 10, color: .secondaryLabelColor,
+            wrapping: false, monospacedDigits: true)
+        shareLabel.alignment = .right
+        shareLabel.setContentHuggingPriority(.required, for: .horizontal)
+        shareLabel.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        shareGroup.addArrangedSubview(shareLabel)
+        main.addArrangedSubview(shareGroup)
+        let total = PanelUI.label(row.total, size: 11, weight: .semibold, wrapping: false, monospacedDigits: true)
+        total.setContentHuggingPriority(.required, for: .horizontal)
+        total.setContentCompressionResistancePriority(.required, for: .horizontal)
+        main.addArrangedSubview(total)
+        addSubview(main)
+        PanelUI.pin(main, to: self)
+        toolTip = row.detail
+        setAccessibilityLabel("\(row.name)，\(row.detail)")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 private final class PanelFooterView: NSView {
     init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController,
          buttonFactory: (NSMenuItem, PanelActionButton.Style, String?) -> PanelActionButton) {
@@ -2883,6 +3592,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.cliTokensToday = d.cli.0; merged.cliTokens7d = d.cli.1; merged.cliTokens30d = d.cli.2
                 merged.workTokensError = d.workError
                 merged.cliTokensError = d.cliError
+                merged.mergedTokens = d.merged
+                merged.daily = d.daily
+                merged.tools = d.tools
+                merged.staleTokensInWindow = TokenAggregator.staleTokensInWindow(tools: d.tools)
                 mergeLock.unlock()
                 group.leave()
             }
@@ -2914,6 +3627,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
                 merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
                 merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
+                merged.mergedTokens = old.mergedTokens; merged.daily = old.daily
+                merged.tools = old.tools; merged.staleTokensInWindow = old.staleTokensInWindow
             } else {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
@@ -3129,14 +3844,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let login = item("开机自启", #selector(onToggleLogin))
         login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
+        // v1.5 用量洞察：用量情况（合并 Work + API 客户端）+ 用量简析 + 工具明细，同一扫描快照
+        let coverageOK = usage.workTokensError == nil && usage.cliTokensError == nil
+        let comparison = TokenAggregator.comparisons(daily: usage.daily, staleTokensInWindow: usage.staleTokensInWindow)
+        func briefDay(_ offset: Int) -> UsagePanelModel.BriefDay {
+            let key = TokenAggregator.dayKey(offset, from: Date())
+            let parts = key.split(separator: "-")
+            let label = parts.count == 3 ? "\(parts[1])/\(parts[2])" : key
+            if let value = usage.daily[key] {
+                return UsagePanelModel.BriefDay(label: label, total: value[0] + value[1], input: value[0],
+                                                output: value[1], covered: true, isToday: offset == 0)
+            }
+            // 覆盖可证实时缺键 = 真实 0；否则缺失占位，不补零伪装趋势
+            return UsagePanelModel.BriefDay(label: label, total: 0, input: 0, output: 0, covered: coverageOK, isToday: offset == 0)
+        }
+        func comparisonItem(_ label: String, _ value: TokenAggregator.Comparison.Value,
+                            _ detail: String) -> UsagePanelModel.BriefComparison {
+            switch value {
+            case .percent(let pct):
+                return UsagePanelModel.BriefComparison(label: label,
+                    text: "\(pct < 0 ? "−" : "+")\(String(format: "%.1f", abs(pct)))%",
+                    direction: pct < 0 ? .down : .up, detail: detail)
+            case .flat:
+                return UsagePanelModel.BriefComparison(label: label, text: "持平", direction: .flat, detail: detail)
+            case .added:
+                return UsagePanelModel.BriefComparison(label: label, text: "新增", direction: .up, detail: detail)
+            case .insufficient:
+                return UsagePanelModel.BriefComparison(label: label, text: "数据不足", direction: .flat, detail: detail)
+            }
+        }
+        let brief = UsagePanelModel.BriefSection(days: (-29...0).map(briefDay),
+            day: comparisonItem("较昨日", comparison.day, comparison.dayDetail),
+            week: comparisonItem("较前 7 天", comparison.week, comparison.weekDetail),
+            notices: [])
+        func fixedOrder(_ id: TokenAggregator.ToolID) -> Int {
+            TokenAggregator.ToolID.allCases.firstIndex(of: id) ?? .max
+        }
+        let mergedTotals = [usage.mergedTokens?.today.total ?? 0,
+                            usage.mergedTokens?.week.total ?? 0,
+                            usage.mergedTokens?.month.total ?? 0]
+        func toolRows(_ index: Int) -> [UsagePanelModel.ToolRow] {
+            // 不存在且没有记录的来源不占行空间；失败来源保留行与旧值并标缓存
+            let active = usage.tools.filter { $0.installed || !$0.modelDays.isEmpty }
+            let sorted = active.sorted { lhs, rhs in
+                let lhsWindow = lhs.windows()
+                let rhsWindow = rhs.windows()
+                let lhsTotal = [lhsWindow.today.total, lhsWindow.week.total, lhsWindow.month.total][index]
+                let rhsTotal = [rhsWindow.today.total, rhsWindow.week.total, rhsWindow.month.total][index]
+                if lhsTotal != rhsTotal { return lhsTotal > rhsTotal }
+                return fixedOrder(lhs.id) < fixedOrder(rhs.id)
+            }
+            return sorted.compactMap { tool in
+                let window = tool.windows()
+                let stat = [window.today, window.week, window.month][index]
+                let denominator = mergedTotals[index]
+                let share = denominator > 0 ? stat.total / denominator : 0
+                let status: String
+                switch tool.id {
+                case .hermes:
+                    status = !tool.ok ? "部分记录 · 缓存" : (tool.modelDays.isEmpty ? "可读取 · 无记录" : "可读取 · 近似归日")
+                case .work, .cli, .proma, .claude, .zcode:
+                    if !tool.installed { status = "标准路径未发现" }
+                    else if !tool.ok { status = "部分记录 · 缓存" }
+                    else if tool.modelDays.isEmpty { status = "可读取 · 无记录" }
+                    else { status = "可读取" }
+                }
+                let sharePct = Int((share * 100).rounded())
+                let detail = "\(status) · 输入 \(Fmt.tokens(stat.input)) · 输出 \(Fmt.tokens(stat.output)) · 占比 \(sharePct)%"
+                return UsagePanelModel.ToolRow(name: tool.id.displayName, total: Fmt.tokens(stat.total),
+                    share: share, shareText: "\(sharePct)%", status: status, detail: detail)
+            }
+        }
+        let toolsSection = UsagePanelModel.ToolsSection(periods: [toolRows(0), toolRows(1), toolRows(2)], notices: [])
+        let usageSection = section("用量情况", .codex,
+            [usage.mergedTokens?.today, usage.mergedTokens?.week, usage.mergedTokens?.month],
+            usage.workTokensError ?? usage.cliTokensError,
+            usage.workTokensError != nil ? workTokensLastSuccessAt : cliTokensLastSuccessAt,
+            tokensStale)
         panelController.update(model: UsagePanelModel(updateItem: update,
-            title: "Kimi 余额" + (usage.planName.map { "（\($0) 套餐）" } ?? ""), email: nil,
+            title: "Kimi 用量", planName: usage.planName, email: nil,
             quotas: [quota("5 小时", usage.fiveHourUsed, usage.fiveHourReset, usage.fiveHourError, lastFiveHourSuccessAt, fiveHourStale),
                      quota("7 天", usage.sevenDayUsed, usage.sevenDayReset, usage.sevenDayError, lastSevenDaySuccessAt, sevenDayStale),
                      quota("月度", usage.monthUsed, usage.monthReset, usage.monthError, lastMonthSuccessAt, monthStale)],
             resetCards: nil, tibo: nil,
-            codexTokens: section("Kimi Work 用量", .codex, [usage.tokensToday, usage.tokens7d, usage.tokens30d], usage.workTokensError, workTokensLastSuccessAt, tokensStale),
-            externalTokens: section("API 客户端用量 · 仅 Kimi 模型", .external, [usage.cliTokensToday, usage.cliTokens7d, usage.cliTokens30d], usage.cliTokensError, cliTokensLastSuccessAt, cliTokensStale),
+            usage: usageSection,
+            brief: brief,
+            tools: toolsSection,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
             refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
     }
@@ -3170,7 +3963,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.cliTokensToday = previewStat(5400000, 230000, [4000000, 180000], [1400000, 50000])
         usage.cliTokens7d = previewStat(61000000, 890000, [45000000, 700000], [16000000, 190000])
         usage.cliTokens30d = previewStat(440000000, 2100000, [320000000, 1500000], [120000000, 600000])
-        if args.contains("--visual-preview-empty") { usage = UsageData() }
+        if args.contains("--visual-preview-empty") {
+            usage = UsageData()
+        } else {
+            // v1.5 用量洞察预览：合并窗口 + 近 30 天日序列 + 逐工具贡献（与评审原型演示数据同款）
+            let workPattern: [Double] = [0.9, 1.1, 1.2, 1.0, 1.4, 1.3, 1.1, 1.5, 1.2, 1.4, 1.0, 1.6, 1.2,
+                                         1.3, 1.5, 1.1, 1.2, 1.4, 1.3, 1.6, 1.1, 1.2, 1.4, 1.1, 1.6, 1.0,
+                                         1.35, 1.4, 1.4, 1.55]
+            let apiPattern: [Double] = [7, 9, 8, 8.5, 9, 9.26, 11]
+            // 日序列锚定真实今天：图表与比较条演示健康分支；额度冻结区仍锚定固定预览时间
+            let chartNow = Date()
+            func previewWorkDays() -> TokenAggregator.ModelDays {
+                var days: TokenAggregator.ModelDays = [:]
+                for (index, value) in workPattern.enumerated() {
+                    days[TokenAggregator.dayKey(index - 29, from: chartNow)] =
+                        ["k3.1-pro": [value * 0.88e6 * 0.8, value * 0.12e6 * 0.8],
+                         "k3-256k": [value * 0.88e6 * 0.2, value * 0.12e6 * 0.2]]
+                }
+                return days
+            }
+            func previewAPIDays(_ share: Double) -> TokenAggregator.ModelDays {
+                var days: TokenAggregator.ModelDays = [:]
+                for (index, value) in workPattern.enumerated() {
+                    let api = (index >= 23 ? apiPattern[index - 23] : value * 7) * 1e6 * share
+                    days[TokenAggregator.dayKey(index - 29, from: chartNow)] =
+                        ["k3.1-pro": [api * 0.9 * 0.7, api * 0.1 * 0.7],
+                         "k3-256k": [api * 0.9 * 0.3, api * 0.1 * 0.3]]
+                }
+                return days
+            }
+            usage.tools = [
+                TokenAggregator.ToolStats(id: .work, modelDays: previewWorkDays(), installed: true, ok: true),
+                TokenAggregator.ToolStats(id: .cli, modelDays: previewAPIDays(0.36), installed: true, ok: true),
+                TokenAggregator.ToolStats(id: .proma, modelDays: previewAPIDays(0.24), installed: true, ok: true),
+                TokenAggregator.ToolStats(id: .claude, modelDays: previewAPIDays(0.18), installed: true, ok: true),
+                TokenAggregator.ToolStats(id: .zcode, modelDays: previewAPIDays(0.1), installed: true, ok: true),
+                TokenAggregator.ToolStats(id: .hermes, modelDays: previewAPIDays(0.12), installed: true, ok: true)
+            ]
+            var allDays: TokenAggregator.ModelDays = [:]
+            var dailyTotals: [String: [Double]] = [:]
+            for tool in usage.tools {
+                allDays = TokenAggregator.mergeSourceModelDays(allDays, tool.modelDays)
+                for (key, models) in tool.modelDays {
+                    var total = dailyTotals[key] ?? [0, 0]
+                    for (_, value) in models { total[0] += value[0]; total[1] += value[1] }
+                    dailyTotals[key] = total
+                }
+            }
+            usage.daily = dailyTotals
+            usage.mergedTokens = TokenAggregator.statWindows(allDays, now: chartNow)
+            usage.staleTokensInWindow = 0
+            if args.contains("--visual-preview-states") || args.contains("--visual-preview-long") {
+                usage.staleTokensInWindow = 1   // 演示比较条「数据不足」分支
+            }
+        }
         // 更新进度行预览：updating 为下载中 62%；updating-install 为安装重启阶段（含重启预告）
         if args.contains("--visual-preview-updating-install") {
             UpdateProgressController.shared.simulateForPreview(phase: .installing, fraction: 100)
@@ -3187,6 +4033,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self, let button = self.statusItem.button else { return }
             self.panelController.toggle(anchoredTo: button)
             if args.contains("--visual-preview-models") { self.panelController.expandAllTokenBucketsForPreview() }
+            if args.contains("--visual-preview-tools") { self.panelController.expandToolsForPreview() }
             if args.contains("--visual-preview-test") {
                 guard self.panelController.verifyPreviewInteractions(expectScroll: args.contains("--visual-preview-long")) else {
                     fputs("KimiUsage visual interaction test: FAIL\n", stderr); exit(1)
@@ -3495,12 +4342,103 @@ enum KimiOfflineRegression {
                        "partial failure was not reported")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: nil) == nil,
                        "not-installed sqlite sources were reported as failure")
-            // 窗口口径：含今天共 7/30 个日历日（起算日 = 今天 −6/−29 天，此前 8/31 天）
+            // 窗口口径：含今天共 7/30 个日历日（Calendar 运算；固定 86400 秒在 DST 日界会漂移一天）
             let cutNow = Date(timeIntervalSince1970: 1_800_000_000)
             let cuts = TokenAggregator.windowCutoffs(now: cutNow)
-            try expect(cuts.d7 == TokenAggregator.dayFmt.string(from: cutNow.addingTimeInterval(-6 * 86400))
-                       && cuts.d30 == TokenAggregator.dayFmt.string(from: cutNow.addingTimeInterval(-29 * 86400)),
+            try expect(cuts.d7 == TokenAggregator.dayKey(-6, from: cutNow)
+                       && cuts.d30 == TokenAggregator.dayKey(-29, from: cutNow),
                        "7/30 calendar-day window cutoffs drifted")
+            // DST 回归：America/New_York 2026-03-09 00:30（EDT）前推 6 个日历日应为 03-03；
+            // 固定 86400 秒会落到 03-02 23:30（EST）导致日界漂移一天。
+            var dstCalendar = Calendar(identifier: .gregorian)
+            dstCalendar.timeZone = TimeZone(identifier: "America/New_York")!
+            var dstComponents = DateComponents()
+            dstComponents.year = 2026; dstComponents.month = 3; dstComponents.day = 9
+            dstComponents.hour = 0; dstComponents.minute = 30
+            let dstNow = dstCalendar.date(from: dstComponents)!
+            let dstCuts = TokenAggregator.windowCutoffs(now: dstNow, calendar: dstCalendar)
+            try expect(dstCuts.d7 == "2026-03-03" && dstCuts.d30 == "2026-02-08",
+                       "calendar-day window drifted across DST boundary")
+
+            // v1.5 用量洞察：statWindows 边界与模型闭合
+            var windowDays: TokenAggregator.ModelDays = [:]
+            windowDays[TokenAggregator.dayKey(0, from: cutNow)] = ["k3": [10, 2]]
+            windowDays[TokenAggregator.dayKey(-5, from: cutNow)] = ["k3": [1, 1]]
+            windowDays[TokenAggregator.dayKey(-7, from: cutNow)] = ["k3": [5, 5]]
+            windowDays[TokenAggregator.dayKey(-29, from: cutNow)] = ["k3": [7, 1]]
+            windowDays[TokenAggregator.dayKey(-31, from: cutNow)] = ["k3": [100, 100]]
+            let windowStats = TokenAggregator.statWindows(windowDays, now: cutNow)
+            try expect(windowStats.today.total == 12 && windowStats.week.total == 14 && windowStats.month.total == 32,
+                       "statWindows day-window boundaries drifted")
+            try expect(windowStats.month.models["k3"]?.total == 32, "statWindows model sum drifted")
+
+            // 逐工具窗口之和 = 合并总量（原始精度）
+            let toolA = TokenAggregator.ToolStats(id: .work, modelDays: windowDays, installed: true, ok: true)
+            let toolB = TokenAggregator.ToolStats(id: .hermes, modelDays: windowDays, installed: true, ok: true)
+            var mergedDays: TokenAggregator.ModelDays = [:]
+            for tool in [toolA, toolB] {
+                mergedDays = TokenAggregator.mergeSourceModelDays(mergedDays, tool.modelDays)
+            }
+            let mergedWindows = TokenAggregator.statWindows(mergedDays, now: cutNow)
+            try expect(mergedWindows.month.total == toolA.windows(now: cutNow).month.total + toolB.windows(now: cutNow).month.total,
+                       "tool windows did not sum to merged total")
+            let dailyFold = TokenAggregator.dailyTotals(windowDays)
+            try expect(dailyFold[TokenAggregator.dayKey(0, from: cutNow)] == [10, 2], "dailyTotals fold drifted")
+
+            // 比较条：百分比 / 持平 / 新增 / 数据不足
+            var daily: [String: [Double]] = [:]
+            daily[TokenAggregator.dayKey(0, from: cutNow)] = [12, 0]
+            daily[TokenAggregator.dayKey(-1, from: cutNow)] = [10, 0]
+            daily[TokenAggregator.dayKey(-2, from: cutNow)] = [0, 0]
+            daily[TokenAggregator.dayKey(-6, from: cutNow)] = [4, 0]
+            daily[TokenAggregator.dayKey(-13, from: cutNow)] = [20, 0]
+            let comp = TokenAggregator.comparisons(daily: daily, staleTokensInWindow: 0, now: cutNow)
+            if case .percent(let dayPct) = comp.day {
+                try expect(abs(dayPct - 20) < 0.001, "较昨日 percent drifted")
+            } else { try expect(false, "较昨日 should be percent") }
+            if case .percent(let weekPct) = comp.week {
+                try expect(abs(weekPct - 30) < 0.001, "较前7天 percent drifted")
+            } else { try expect(false, "较前7天 should be percent") }
+            let zeroComp = TokenAggregator.comparisons(daily: [:], staleTokensInWindow: 0, now: cutNow)
+            if case .flat = zeroComp.day {} else { try expect(false, "empty coverage day should be flat") }
+            if case .flat = zeroComp.week {} else { try expect(false, "empty coverage week should be flat") }
+            var addedDaily: [String: [Double]] = [:]
+            addedDaily[TokenAggregator.dayKey(0, from: cutNow)] = [5, 5]
+            let addedComp = TokenAggregator.comparisons(daily: addedDaily, staleTokensInWindow: 0, now: cutNow)
+            if case .added = addedComp.day {} else { try expect(false, "base-zero day should be added") }
+            let staleComp = TokenAggregator.comparisons(daily: daily, staleTokensInWindow: 0.5, now: cutNow)
+            if case .insufficient = staleComp.day {} else { try expect(false, "stale day must be insufficient") }
+            if case .insufficient = staleComp.week {} else { try expect(false, "stale week must be insufficient") }
+
+            // 陈旧贡献只在失败来源上统计，且只看 [D-13, D]
+            let staleTool = TokenAggregator.ToolStats(id: .proma, modelDays: windowDays, installed: true, ok: false)
+            try expect(TokenAggregator.staleTokensInWindow(tools: [staleTool], now: cutNow) == 24,
+                       "stale contribution window mismatch")
+            let okTool = TokenAggregator.ToolStats(id: .proma, modelDays: windowDays, installed: true, ok: true)
+            try expect(TokenAggregator.staleTokensInWindow(tools: [okTool], now: cutNow) == 0,
+                       "ok tool counted as stale contribution")
+
+            // 逐工具归属：realpath 前缀匹配（临时目录模拟 CLI 根）
+            let cliRoot = root.appendingPathComponent("cli-roots/cli")
+            let promaRoot = root.appendingPathComponent("cli-roots/proma")
+            let claudeRoot = root.appendingPathComponent("cli-roots/claude")
+            let otherRoot = root.appendingPathComponent("cli-roots/other")
+            for dir in [cliRoot, promaRoot, claudeRoot, otherRoot] {
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            for (dir, name) in [(cliRoot, "a.jsonl"), (promaRoot, "b.jsonl"),
+                                (claudeRoot, "c.jsonl"), (otherRoot, "d.jsonl")] {
+                try Data().write(to: dir.appendingPathComponent(name))
+            }
+            let attributionRoots = [cliRoot.path, promaRoot.path, promaRoot.path, claudeRoot.path]
+            try expect(TokenAggregator.toolID(forSessionPath: cliRoot.appendingPathComponent("a.jsonl").path,
+                                              roots: attributionRoots) == .cli, "cli attribution drifted")
+            try expect(TokenAggregator.toolID(forSessionPath: promaRoot.appendingPathComponent("b.jsonl").path,
+                                              roots: attributionRoots) == .proma, "proma attribution drifted")
+            try expect(TokenAggregator.toolID(forSessionPath: claudeRoot.appendingPathComponent("c.jsonl").path,
+                                              roots: attributionRoots) == .claude, "claude attribution drifted")
+            try expect(TokenAggregator.toolID(forSessionPath: otherRoot.appendingPathComponent("d.jsonl").path,
+                                              roots: attributionRoots) == .cli, "unknown path fell back unexpectedly")
 
             let gate = RefreshGate()
             try expect(gate.begin(manual: false), "initial refresh gate did not open")

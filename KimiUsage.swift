@@ -2055,21 +2055,37 @@ final class PanelActionButton: NSButton {
 }
 
 class PanelCardView: NSView {
+    // Kimi 的四列用量表比 GLM 更占横向空间，采用比 GLM 14pt 更紧凑的内边距。
+    static let contentInset: CGFloat = 10
+    static let verticalInset: CGFloat = 10
+
     let contentStack = PanelUI.stack(spacing: 4)
 
-    init(padding: CGFloat = 12) {
+    init(padding: CGFloat? = nil) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 12
+        layer?.cornerRadius = 14
         layer?.borderWidth = 0.5
+        // 阴影绘制在卡片自身 layer 上，不能随圆角背景一起裁掉。
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowRadius = 11
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
+        let horizontalPadding = padding ?? Self.contentInset
+        let verticalPadding = padding ?? Self.verticalInset
         addSubview(contentStack)
         NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: padding),
-            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: padding),
-            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -padding),
-            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -padding)
+            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: verticalPadding),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: horizontalPadding),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -horizontalPadding),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -verticalPadding)
         ])
+    }
+
+    convenience init(containing view: NSView, padding: CGFloat? = nil) {
+        self.init(padding: padding)
+        PanelUI.addFullWidth(view, to: contentStack)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -2077,8 +2093,12 @@ class PanelCardView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor
+            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            layer?.backgroundColor = (dark
+                ? NSColor.labelColor.withAlphaComponent(0.055)
+                : NSColor.controlBackgroundColor.withAlphaComponent(0.82)).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(dark ? 0.14 : 0.09).cgColor
+            layer?.shadowOpacity = dark ? 0.03 : 0.06
         }
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -2238,6 +2258,24 @@ final class QuotaWindowView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
+/// 三个额度窗口与各自异常状态组成一张完整卡片；单行布局、文案和语义色保持原样。
+final class QuotaSectionView: PanelCardView {
+    init(quotas: [UsagePanelModel.Quota], compact: Bool) {
+        super.init()
+        contentStack.spacing = 6
+        let heading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
+        heading.alignment = .right
+        PanelUI.addFullWidth(heading, to: contentStack)
+        for (index, quota) in quotas.enumerated() {
+            let view = QuotaWindowView(model: quota, compact: compact)
+            PanelUI.addFullWidth(view, to: contentStack)
+            if index < quotas.count - 1 { contentStack.setCustomSpacing(8, after: view) }
+        }
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 final class ResetCardSectionView: PanelCardView {
     init(model: UsagePanelModel.ResetSection) {
         super.init(padding: 8)
@@ -2323,7 +2361,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private func configureContent() {
         let container = contentController.view
         container.wantsLayer = true
-        container.layer?.cornerRadius = 16
+        container.layer?.cornerRadius = 20
         container.layer?.masksToBounds = true
 
         effect.frame = container.bounds
@@ -2332,14 +2370,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
-        effect.layer?.cornerRadius = 16
+        effect.layer?.cornerRadius = 20
         effect.layer?.masksToBounds = true
         container.addSubview(effect)
 
         solid.frame = container.bounds
         solid.autoresizingMask = [.width, .height]
         solid.wantsLayer = true
-        solid.layer?.cornerRadius = 16
+        solid.layer?.cornerRadius = 20
         solid.layer?.masksToBounds = true
         container.addSubview(solid)
 
@@ -2372,7 +2410,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         ])
 
         stack.alignment = .centerX
-        stack.edgeInsets = NSEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        stack.spacing = 10
+        // 顶部与底部为卡片阴影预留绘制空间；滚动视图只裁主容器边缘。
+        stack.edgeInsets = NSEdgeInsets(top: 12, left: 16, bottom: 12, right: 16)
         scrollView.documentView = stack
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
@@ -2443,24 +2483,26 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             addContentRow(button)
         }
-        let quotaHeading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
-        quotaHeading.alignment = .right
-        addContentRow(quotaHeading)
-        for quota in model.quotas { addContentRow(QuotaWindowView(model: quota, compact: panelWidth < 400)) }
+        addContentRow(QuotaSectionView(quotas: model.quotas, compact: panelWidth < 400))
         if let reset = model.resetCards {
             addContentRow(ResetCardSectionView(model: reset))
         }
         if let tibo = model.tibo {
             addContentRow(makeTiboSection(tibo))
         }
-        addContentRow(TokenSectionView(model: model.usage, expanded: usageExpanded,
+        let usageView = TokenSectionView(model: model.usage, expanded: usageExpanded,
             expandedBuckets: expandedUsageBuckets, target: self, action: #selector(toggleUsage),
-            bucketAction: #selector(toggleUsageBucket(_:))))
-        addContentRow(DailyBriefSectionView(model: model.brief, expanded: briefExpanded,
+            bucketAction: #selector(toggleUsageBucket(_:)))
+        addContentRow(PanelCardView(containing: usageView))
+
+        let briefView = DailyBriefSectionView(model: model.brief, expanded: briefExpanded,
             selectedIndex: briefSelectedIndex, target: self, action: #selector(toggleBrief),
-            onSelect: { [weak self] index in self?.briefSelectedIndex = index }))
-        addContentRow(ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
-            target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools)))
+            onSelect: { [weak self] index in self?.briefSelectedIndex = index })
+        addContentRow(PanelCardView(containing: briefView))
+
+        let toolsView = ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
+            target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools))
+        addContentRow(PanelCardView(containing: toolsView))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
     }
@@ -3394,7 +3436,7 @@ private final class ShareBarView: NSView {
         layer?.masksToBounds = true
         layer?.addSublayer(fill)
         heightAnchor.constraint(equalToConstant: 6).isActive = true
-        widthAnchor.constraint(equalToConstant: 84).isActive = true
+        widthAnchor.constraint(equalToConstant: 72).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -3418,7 +3460,8 @@ private final class ShareBarView: NSView {
     }
 }
 
-/// 工具行：名称 + 占比条 + 总量；固定列宽保证跨行对齐（占比条 84 ｜ % 34 ｜ 总量 64）。
+/// 工具行：名称 + 占比条 + 总量；固定列宽保证跨行对齐（占比条 72 ｜ % 34 ｜ 总量 64）。
+/// 卡片内宽比旧面板少 20pt，占比条让出 12pt，避免默认宽度下 Claude Code 被截断。
 /// 状态/输入/输出/占比入悬停与 VoiceOver（v0.4 规格）。
 private final class ToolRowView: NSView {
     init(row: UsagePanelModel.ToolRow) {
@@ -4060,7 +4103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             panelController.previewAppearance = NSAppearance(named: .darkAqua)
         }
         if args.contains("--visual-preview-narrow") { panelController.previewWidth = 300 }
-        let now = Date(timeIntervalSince1970: 1_793_702_400)
+        // 健康预览使用当前时间，避免固定历史时间被现有过期规则标成 stale；异常分支仍由 states 显式注入。
+        let now = Date()
         lastAttemptAt = now
         lastFiveHourSuccessAt = now; lastSevenDaySuccessAt = now; lastMonthSuccessAt = now
         workTokensLastSuccessAt = now; cliTokensLastSuccessAt = now
@@ -4091,8 +4135,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                          1.3, 1.5, 1.1, 1.2, 1.4, 1.3, 1.6, 1.1, 1.2, 1.4, 1.1, 1.6, 1.0,
                                          1.35, 1.4, 1.4, 1.55]
             let apiPattern: [Double] = [7, 9, 8, 8.5, 9, 9.26, 11]
-            // 日序列锚定真实今天：图表与比较条演示健康分支；额度冻结区仍锚定固定预览时间
-            let chartNow = Date()
+            // 日序列与额度共用当前时间：图表、比较条和健康状态使用同一预览快照。
+            let chartNow = now
             func previewWorkDays() -> TokenAggregator.ModelDays {
                 var days: TokenAggregator.ModelDays = [:]
                 for (index, value) in workPattern.enumerated() {

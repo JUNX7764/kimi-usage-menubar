@@ -2263,8 +2263,14 @@ final class QuotaSectionView: PanelCardView {
     init(quotas: [UsagePanelModel.Quota], compact: Bool) {
         super.init()
         contentStack.spacing = 6
-        let heading = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
-        heading.alignment = .right
+        // 卡片头部沿用"重置卡"的图标+标题样式；"重置时间"继续右对齐充当列头。
+        let heading = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        heading.addArrangedSubview(PanelUI.symbol("timer", size: 15, color: PanelAccent.codex.color))
+        heading.addArrangedSubview(PanelUI.label("用量进度", size: 13, weight: .semibold, wrapping: false))
+        heading.addArrangedSubview(PanelUI.spacer())
+        let resetLabel = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
+        resetLabel.alignment = .right
+        heading.addArrangedSubview(resetLabel)
         PanelUI.addFullWidth(heading, to: contentStack)
         for (index, quota) in quotas.enumerated() {
             let view = QuotaWindowView(model: quota, compact: compact)

@@ -2242,6 +2242,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var briefExpanded = true
     private var toolsExpanded = false
     private var toolPeriodIndex = 1   // 工具明细默认「7 天」（板块折叠状态独立于周期选择）
+    private var briefSelectedIndex: Int?   // 用量简析选中日（重建保留；nil = 最新一日）
     private var expandedUsageBuckets: Set<Int> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
@@ -2416,7 +2417,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             expandedBuckets: expandedUsageBuckets, target: self, action: #selector(toggleUsage),
             bucketAction: #selector(toggleUsageBucket(_:))))
         addContentRow(DailyBriefSectionView(model: model.brief, expanded: briefExpanded,
-            target: self, action: #selector(toggleBrief)))
+            selectedIndex: briefSelectedIndex, target: self, action: #selector(toggleBrief),
+            onSelect: { [weak self] index in self?.briefSelectedIndex = index }))
         addContentRow(ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
             target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools)))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
@@ -2942,181 +2944,143 @@ private final class TokenSectionView: NSView {
 
 /// 用量简析的近 30 天柱状图：整列命中、图内浮层即时读值、今日未结束描边、缺失占位不补零。
 /// 柱条在 draw(_:) 内一次性绘制（避免逐列 layer 帧与布局时序竞争）；列视图只做命中/焦点/VoiceOver。
-final class ChartOverlayView: NSView {
-    override var wantsUpdateLayer: Bool { true }
-    override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-            self.layer?.borderColor = NSColor.separatorColor.cgColor
-            self.layer?.borderWidth = 0.5
-            self.layer?.cornerRadius = 6
-        }
+/// 用量简析每日柱状图画布：逻辑整体移植 GLMUsage GLMDailyChartCanvas（颜色为 Kimi 深蓝）。
+/// 选中制交互：悬停/点击/左右方向键切换，鼠标离开保留最后选中；缺失日缺口不画、不当 0；
+/// 命中覆盖整天宽度；面板重建经 configure(initialIndex:) 保留选择。
+final class DailyBarChartCanvas: NSView {
+    private var days: [UsagePanelModel.BriefDay] = []
+    private(set) var selectedIndex = 0
+    /// 选中变化回调（含悬停/点击/键盘）；上层记录状态用于面板重建，不触发刷新
+    var onSelect: ((Int) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override var acceptsFirstResponder: Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3).fill() }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
     }
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
+    }
+
+    var dayList: [UsagePanelModel.BriefDay] { days }
+
+    func configure(days: [UsagePanelModel.BriefDay], initialIndex: Int) {
+        self.days = days
+        selectedIndex = clamped(initialIndex)
         needsDisplay = true
+        updateAccessibilityValue()
     }
-}
 
-final class DailyBarChartView: NSView {
-    static let barAreaHeight: CGFloat = 50
-    private let dayList: [UsagePanelModel.BriefDay]
-    private let peak: Double
-    private var hitColumns: [DayColumnView] = []
-    private var hoveredIndex: Int? { didSet { needsDisplay = true } }
-    private let overlay = ChartOverlayView()
-    private let overlayLabel: NSTextField
-
-    init(days: [UsagePanelModel.BriefDay], accent: PanelAccent) {
-        dayList = days
-        peak = max(days.map { $0.total }.max() ?? 0, 1)
-        let label = PanelUI.label("", size: 10, color: .labelColor, wrapping: false)
-        label.alignment = .center
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.lineBreakMode = .byTruncatingTail
-        overlayLabel = label
-        overlay.wantsLayer = true
-        overlay.isHidden = true
-        overlay.addSubview(label)
-        super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
-        var built: [DayColumnView] = []
-        for (index, day) in days.enumerated() {
-            let column = DayColumnView(index: index)
-            column.onHoverChange = { [weak self] index, entered in
-                self?.setOverlay(index: index, visible: entered)
-            }
-            column.setAccessibilityLabel(Self.accessibilityText(for: day))
-            // 水平栈的 .bottom 对齐不拉伸高度：逐列固定高度，命中区才覆盖整个绘图区
-            column.heightAnchor.constraint(equalToConstant: Self.barAreaHeight).isActive = true
-            built.append(column)
-        }
-        hitColumns = built
-        let row = PanelUI.stack(orientation: .horizontal, alignment: .bottom, spacing: 0)
-        row.distribution = .fillEqually
-        for column in hitColumns { row.addArrangedSubview(column) }
-        row.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(row)
-        addSubview(overlay)
-        NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: topAnchor),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor),
-            row.bottomAnchor.constraint(equalTo: bottomAnchor),
-            row.heightAnchor.constraint(equalToConstant: Self.barAreaHeight),
-            overlay.topAnchor.constraint(equalTo: topAnchor, constant: 1),
-            overlay.centerXAnchor.constraint(equalTo: centerXAnchor),
-            overlay.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, constant: -8),
-            overlayLabel.topAnchor.constraint(equalTo: overlay.topAnchor, constant: 3),
-            overlayLabel.bottomAnchor.constraint(equalTo: overlay.bottomAnchor, constant: -3),
-            overlayLabel.leadingAnchor.constraint(equalTo: overlay.leadingAnchor, constant: 7),
-            overlayLabel.trailingAnchor.constraint(equalTo: overlay.trailingAnchor, constant: -7)
-        ])
-        setAccessibilityElement(true)
-        setAccessibilityLabel("近 30 天每日总 Token 柱状图")
+    private func clamped(_ index: Int) -> Int {
+        guard !days.isEmpty else { return 0 }
+        return max(0, min(days.count - 1, index))
     }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
+    private var columnWidth: CGFloat { bounds.width / CGFloat(max(1, days.count)) }
+
+    private func dayIndex(atX x: CGFloat) -> Int { clamped(Int(x / max(1, columnWidth))) }
+
+    private func select(_ index: Int) {
+        let next = clamped(index)
+        guard next != selectedIndex else { return }
+        selectedIndex = next
         needsDisplay = true
-    }
-
-    private static func accessibilityText(for day: UsagePanelModel.BriefDay) -> String {
-        let base = "\(day.label)，\(day.covered ? "总量 \(Fmt.tokens(day.total))，输入 \(Fmt.tokens(day.input))，输出 \(Fmt.tokens(day.output)) Token" : "无记录，覆盖未证实")"
-        return day.isToday ? base + "，今日未结束" : base
-    }
-
-    private func setOverlay(index: Int, visible: Bool) {
-        guard hitColumns.indices.contains(index) else { return }
-        hoveredIndex = visible ? index : nil
-        guard visible else {
-            overlay.isHidden = true
-            return
-        }
-        let day = dayList[index]
-        overlayLabel.stringValue = Self.accessibilityText(for: day)
-        layoutSubtreeIfNeeded()
-        let columnFrame = hitColumns[index].frame
-        let width = overlay.fittingSize.width
-        var originX = columnFrame.midX - width / 2
-        originX = max(4, min(originX, bounds.width - width - 4))
-        overlay.layer?.cornerRadius = 6
-        overlay.frame = NSRect(x: originX, y: bounds.height - overlay.fittingSize.height - 1,
-                               width: width, height: overlay.fittingSize.height)
-        overlay.isHidden = false
+        updateAccessibilityValue()
+        onSelect?(next)
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard bounds.width > 1, bounds.height > 1 else { return }
-        let slot = bounds.width / CGFloat(max(dayList.count, 1))
-        // 柱宽固定 6pt（用户 2026-11-07 指定），槽位居中；极端窄面板才收缩，最小 2pt
-        let barWidth = min(6, max(2, slot - 1))
-        for (index, day) in dayList.enumerated() {
-            let x = CGFloat(index) * slot + (slot - barWidth) / 2
-            let rect: NSRect
-            if day.covered {
-                let height = max(bounds.height * CGFloat(min(1, day.total / peak)), 2)
-                rect = NSRect(x: x, y: 0, width: barWidth, height: height)
-                (PanelAccent.codex.color.withAlphaComponent(index == hoveredIndex || day.isToday ? 0.9 : 0.5)).setFill()
-                NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
-                if day.isToday {   // 今日未结束：描边单独标识
-                    PanelAccent.codex.color.setStroke()
-                    let border = NSBezierPath(roundedRect: rect.insetBy(dx: 0.5, dy: 0.5), xRadius: 2, yRadius: 2)
-                    border.lineWidth = 1
-                    border.stroke()
-                }
+        // 基线：1pt 全宽发丝线（GLM 同款）
+        NSColor.labelColor.withAlphaComponent(0.15).setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
+        guard !days.isEmpty else { return }
+        let peak = max(days.map { $0.total }.max() ?? 0, 1)
+        let chartHeight = bounds.height - 3
+        let width = min(6, columnWidth)
+        let inset = (columnWidth - width) / 2
+        for (index, day) in days.enumerated() {
+            guard day.covered else { continue }   // 缺失日 = 缺口，不画、不当 0
+            let x = CGFloat(index) * columnWidth + inset
+            PanelAccent.codex.color.withAlphaComponent(index == selectedIndex ? 1 : 0.4).setFill()
+            if day.total == 0 {
+                NSRect(x: x, y: 1, width: width, height: 2).fill()   // 有记录的零日 = 基线短柱
             } else {
-                // 覆盖未证实：缺失占位，不补零伪装趋势
-                rect = NSRect(x: x, y: 0, width: barWidth, height: bounds.height)
-                NSColor.labelColor.withAlphaComponent(0.1).setFill()
-                NSBezierPath(roundedRect: rect, xRadius: 2, yRadius: 2).fill()
+                let height = max(3, chartHeight * CGFloat(min(1, day.total / peak)))
+                NSRect(x: x, y: 1, width: width, height: min(chartHeight, height)).fill()
             }
         }
     }
 
-    /// 透明命中列：悬停 / 键盘焦点触发浮层，VoiceOver 逐柱读值；不参与绘制。
-    final class DayColumnView: NSButton {
-        let index: Int
-        var onHoverChange: ((Int, Bool) -> Void)?
+    override func updateTrackingAreas() { installTrackingArea() }
+    // 面板重建、Popover 关开切换：不依赖 AppKit 时机，入窗/布局时主动重挂
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installTrackingArea()
+    }
+    override func layout() {
+        super.layout()
+        installTrackingArea()
+    }
+    private func installTrackingArea() {
+        if let old = trackingArea { removeTrackingArea(old); trackingArea = nil }
+        guard window != nil else { return }
+        let area = NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
 
-        init(index: Int) {
-            self.index = index
-            super.init(frame: .zero)
-            translatesAutoresizingMaskIntoConstraints = false
-            isBordered = false
-            title = ""
-            setAccessibilityElement(true)
-            setAccessibilityRole(.button)
+    override func mouseMoved(with event: NSEvent) {
+        select(dayIndex(atX: convert(event.locationInWindow, from: nil).x))
+    }
+    override func mouseDown(with event: NSEvent) {
+        select(dayIndex(atX: convert(event.locationInWindow, from: nil).x))
+        window?.makeFirstResponder(self)   // 点击后即可用方向键继续切换
+    }
+    // 鼠标离开图表：保留最后选中值，不跳回末日
+    override func mouseExited(with event: NSEvent) {}
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 123: select(selectedIndex - 1)   // ←
+        case 124: select(selectedIndex + 1)   // →
+        default: super.keyDown(with: event)
         }
-        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    }
 
-        override func updateTrackingAreas() {
-            super.updateTrackingAreas()
-            for area in trackingAreas { removeTrackingArea(area) }
-            addTrackingArea(NSTrackingArea(rect: bounds,
-                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
-                owner: self, userInfo: nil))
-        }
-        override func mouseEntered(with event: NSEvent) { onHoverChange?(index, true) }
-        override func mouseExited(with event: NSEvent) { onHoverChange?(index, false) }
-        override func becomeFirstResponder() -> Bool {
-            onHoverChange?(index, true)
-            return super.becomeFirstResponder()
-        }
-        override func resignFirstResponder() -> Bool {
-            onHoverChange?(index, false)
-            return super.resignFirstResponder()
-        }
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            bounds.contains(convert(point, from: superview)) ? self : nil
-        }
+    private func updateAccessibilityValue() {
+        guard days.indices.contains(selectedIndex) else { setAccessibilityValue(""); return }
+        let day = days[selectedIndex]
+        let value = day.covered ? "\(Fmt.tokens(day.total)) tokens" : "数据不足"
+        setAccessibilityValue("\(selectionDateText(day)) \(value)")
+    }
+
+    private func selectionDateText(_ day: UsagePanelModel.BriefDay) -> String {
+        let parts = day.label.split(separator: "/")
+        guard parts.count == 2 else { return day.label }
+        let base = "\(Int(parts[0]) ?? 0)月\(Int(parts[1]) ?? 0)日"
+        return day.isToday ? base + "（今日未结束）" : base
     }
 }
 
-/// 用量简析板块：chart.bar.fill 深蓝图标，独立折叠，默认展开；无主数值（Kimi 无官方累计接口）。
+/// 用量简析板块：chart.bar.fill 深蓝图标、独立折叠默认展开、无主数值；
+/// 每日图区逻辑移植 GLMUsage——选中行（日期左/数值右）→ 62pt 画布 → 首/中/末三刻度 → 比较条。
 private final class DailyBriefSectionView: NSView {
-    init(model: UsagePanelModel.BriefSection, expanded: Bool, target: AnyObject, action: Selector) {
+    private let dateLabel: NSTextField
+    private let valueLabel: NSTextField
+    private let canvas = DailyBarChartCanvas()
+
+    init(model: UsagePanelModel.BriefSection, expanded: Bool, selectedIndex: Int?,
+         target: AnyObject, action: Selector, onSelect: @escaping (Int) -> Void) {
+        dateLabel = PanelUI.label("", size: 11, color: .secondaryLabelColor, wrapping: false)
+        valueLabel = PanelUI.label("", size: 11, weight: .semibold, wrapping: false)
+        valueLabel.identifier = NSUserInterfaceItemIdentifier("kimi-brief-value")
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 6)
@@ -3135,35 +3099,78 @@ private final class DailyBriefSectionView: NSView {
         toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
         header.addArrangedSubview(toggle)
         PanelUI.addFullWidth(header, to: root)
+
         if expanded {
-            let chart = DailyBarChartView(days: model.days, accent: .codex)
-            PanelUI.addFullWidth(chart, to: root)
-            chart.heightAnchor.constraint(equalToConstant: DailyBarChartView.barAreaHeight).isActive = true
-            chart.setContentCompressionResistancePriority(.required, for: .vertical)
-            let axis = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-            let first = model.days.first
-            let last = model.days.last
-            let firstLabel = PanelUI.label(first?.label ?? "", size: 10, color: .secondaryLabelColor,
-                wrapping: false, monospacedDigits: true)
-            let caption = PanelUI.label("每日柱状图 · 近 30 天", size: 10, color: .secondaryLabelColor, wrapping: false)
-            caption.alignment = .center
-            let lastLabel = PanelUI.label(last?.label ?? "", size: 10, color: .secondaryLabelColor,
-                wrapping: false, monospacedDigits: true)
-            lastLabel.alignment = .right
-            axis.addArrangedSubview(firstLabel)
-            axis.addArrangedSubview(caption)
-            axis.addArrangedSubview(lastLabel)
-            firstLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            lastLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-            PanelUI.addFullWidth(axis, to: root)
-            root.setCustomSpacing(8, after: axis)
+            // 选中行：日期左 / 数值右；canvas 选中变化时原地更新，不重建面板（GLM 同款）
+            let selectionRow = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
+            selectionRow.addArrangedSubview(dateLabel)
+            selectionRow.addArrangedSubview(PanelUI.spacer())
+            valueLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+            selectionRow.addArrangedSubview(valueLabel)
+            PanelUI.addFullWidth(selectionRow, to: root)
+            root.setCustomSpacing(2, after: selectionRow)
+
+            if model.days.isEmpty {
+                dateLabel.stringValue = "暂不可用"
+                valueLabel.stringValue = ""
+                canvas.isHidden = true
+            } else {
+                canvas.configure(days: model.days, initialIndex: selectedIndex ?? model.days.count - 1)
+                canvas.focusRingType = .default
+                canvas.onSelect = { [weak self] index in
+                    self?.syncSelection(index)
+                    onSelect(index)
+                }
+                canvas.setAccessibilityLabel("近 30 天每日用量柱状图，可用左右方向键选择日期")
+                // 有意不设 setAccessibilityElement(true)：避免 Full Keyboard Access 的 Tab 遍历
+                // 跳过本视图；VoiceOver 用户经选中行两个文本标签获取选中日信息（GLM 实测结论）
+                canvas.heightAnchor.constraint(equalToConstant: 62).isActive = true
+                PanelUI.addFullWidth(canvas, to: root)
+            }
+
+            // 日期刻度：首/中/末（与柱图两端对齐，GLM 同款）
+            let ticks = PanelUI.stack(orientation: .horizontal, spacing: 0)
+            ticks.distribution = .fillEqually
+            if let first = model.days.first, let mid = model.days.indices.contains(model.days.count / 2) ? model.days[model.days.count / 2] : nil, let last = model.days.last {
+                for (tick, alignment) in [(first.label, NSTextAlignment.left),
+                                          (mid.label, NSTextAlignment.center),
+                                          (last.label, NSTextAlignment.right)] {
+                    let label = PanelUI.label(tick, size: 10, color: .secondaryLabelColor,
+                        wrapping: false, monospacedDigits: true)
+                    label.alignment = alignment
+                    ticks.addArrangedSubview(label)
+                }
+            }
+            PanelUI.addFullWidth(ticks, to: root)
+            root.setCustomSpacing(6, after: ticks)
+
             PanelUI.addFullWidth(ComparisonRowView(day: model.day, week: model.week), to: root)
             for notice in PanelUI.notices(model.notices) { PanelUI.addFullWidth(notice, to: root) }
+            if !model.days.isEmpty { syncSelection(canvas.selectedIndex) }
         }
         addSubview(root)
         PanelUI.pin(root, to: self)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 由 canvas 在选中变化时调用（含键盘/悬停）；直接改本块标签，不重建面板、不发请求
+    private func syncSelection(_ index: Int) {
+        guard days(indices: index) else { return }
+        let day = canvas.dayList[index]
+        dateLabel.stringValue = {
+            let parts = day.label.split(separator: "/")
+            let base = parts.count == 2 ? "\(Int(parts[0]) ?? 0)月\(Int(parts[1]) ?? 0)日" : day.label
+            return day.isToday ? base + "（今日未结束）" : base
+        }()
+        if day.covered {
+            valueLabel.stringValue = "\(Fmt.tokens(day.total)) Token"
+            valueLabel.textColor = .labelColor
+        } else {
+            valueLabel.stringValue = "数据不足"
+            valueLabel.textColor = .secondaryLabelColor
+        }
+    }
+    private func days(indices index: Int) -> Bool { canvas.dayList.indices.contains(index) }
 }
 
 /// 固定对比条：架构对齐 GLMUsage GLMComparisonStrip——30pt 圆角条、两项均分、中缝竖线、

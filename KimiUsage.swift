@@ -3195,10 +3195,13 @@ private final class ComparisonRowView: NSView {
         let items = [(day, "今日（未结束）与前一日比较"), (week, "最近 7 日（含今日）与此前 7 日比较")]
         for (index, item) in items.enumerated() {
             if index > 0 {
-                let divider = PanelUI.separator()
+                // GLM 同款：裸 NSBox 分隔线（PanelUI.separator 自带 height=1 会与 16pt 约束冲突塌陷）
+                let divider = NSBox()
+                divider.boxType = .separator
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                row.addArrangedSubview(divider)
                 divider.widthAnchor.constraint(equalToConstant: 1).isActive = true
                 divider.heightAnchor.constraint(equalToConstant: 16).isActive = true
-                row.addArrangedSubview(divider)
             }
             let half = NSView()
             half.translatesAutoresizingMaskIntoConstraints = false

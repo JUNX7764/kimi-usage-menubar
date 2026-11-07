@@ -3911,8 +3911,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             usage.mergedTokens?.week.total ?? 0,
                             usage.mergedTokens?.month.total ?? 0]
         func toolRows(_ index: Int) -> [UsagePanelModel.ToolRow] {
-            // 不存在且没有记录的来源不占行空间；失败来源保留行与旧值并标缓存
-            let active = usage.tools.filter { $0.installed || !$0.modelDays.isEmpty }
+            // 该周期使用量为 0 的来源直接隐藏（用户 2026-11-07 要求）；
+            // 失败来源若有历史贡献（>0）仍保留行并标缓存，全部为零时显示「本周期暂无用量」空态
+            let active = usage.tools.filter { tool in
+                let window = tool.windows()
+                return [window.today, window.week, window.month][index].total > 0
+            }
             let sorted = active.sorted { lhs, rhs in
                 let lhsWindow = lhs.windows()
                 let rhsWindow = rhs.windows()

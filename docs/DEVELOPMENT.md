@@ -1,7 +1,7 @@
 # KimiUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-07。
+> 最后核对：2026-11-08。
 
 ## 文档入口与效力
 
@@ -28,7 +28,7 @@
 ## 原理与数据边界
 
 - **凭据**：读取 Kimi 桌面端本地配置文件 `~/Library/Application Support/kimi-desktop/daimon-share/daimon/config.json`，不在本仓库保存任何凭据
-- **月度接口 401**：读取最新 refresh token；写回前重新读取最新 JSON，仅合并 Kimi Web 认证字段，以唯一临时文件和同目录原子替换保存，并限制为仅所有者可读写。若检测到 Kimi 客户端已轮换 access/refresh token，则保留客户端版本。由于官方客户端不使用共享文件锁，检查与替换之间仍无法完全消除并发写入窗口
+- **月度接口 401**：读取最新 refresh token；续期请求进程内单飞（月度与账号两条 401 链共享同一次刷新结果），写回前重新读取最新 JSON，仅合并 Kimi Web 认证字段，跨进程写入经 `flock` 互斥，以唯一临时文件和同目录原子替换保存，并限制为仅所有者可读写。若检测到 Kimi 客户端已轮换 access/refresh token，则保留客户端版本。由于官方客户端不使用共享文件锁，检查与替换之间仍无法完全消除并发写入窗口
 - **配额**：通过 Kimi 远程接口查询 5 小时、7 天和月度额度
 - **头部账号行**：`GET https://www.kimi.com/api/user`（Kimi Web 认证）取昵称与手机号；手机号由服务端打码返回，客户端原样展示。Kimi 账号可能为手机号/微信注册，无 email 字段，账号行显示「昵称（打码手机号）」，两者皆缺时隐藏。随月度接口同在慢轮刷新，401 走相同的 refresh→重试链，失败保留旧值
 - **面板卡片布局**：固定头部与底部操作区，中间滚动区按额度、用量情况、用量简析、工具明细分为四张卡片；卡片只重组现有视图，不改变数据快照、默认展开状态或更新链路。面板宽 330pt（窄预览 300pt），卡片圆角 14pt、内容边距 10pt，浅色以中性表面和轻阴影分层，深色以表面色差和描边为主。工具占比条固定 72pt，为完整工具名称保留空间；展开、收起和异步刷新仍实时调整 Popover 高度，超过屏幕可用高度 85% 后内部滚动。
@@ -62,7 +62,9 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
-视觉预览可附加 `--visual-preview-models`（展开模型明细）、`--visual-preview-tools`（展开工具明细）、`--visual-preview-dark`、`--visual-preview-narrow`、`--visual-preview-empty`、`--visual-preview-states` 或 `--visual-preview-long`。`--once` 会读取真实登录态并联网，不属于离线测试。
+视觉预览可附加 `--visual-preview-models`（展开模型明细）、`--visual-preview-tools`（展开工具明细）、`--visual-preview-dark`、`--visual-preview-narrow`、`--visual-preview-empty`、`--visual-preview-states` 或 `--visual-preview-long`。`--once` 会读取真实登录态并联网，不属于离线测试；等待超时（45s）以非零退出码报告。
+
+另有内部测试旗标（发布与用户路径不依赖）：`--visual-preview-full`、`-popover-test=<目录>`、`-update-test`、`-key-test`、`-updating`、`-updating-install`、`-output=<路径>`、`-scroll-end`。入口支持 `--help`；未识别的 `--` 旗标会打印错误并以退出码 2 拒绝启动，不会静默拉起常驻应用。
 
 ## 文件说明
 
@@ -71,9 +73,9 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `KimiUsage.swift` | 当前全部 Swift 源码；单文件 AppKit 菜单栏应用 |
 | `build.sh` | 编译、打包和 ad-hoc 签名 |
 | `Info.plist` | Bundle 身份、最低系统版本和菜单栏常驻配置 |
-| `AppIcon.icns` / `AppIcon.iconset/` | 应用图标 |
-| `icon_gen.py` | 图标生成脚本 |
-| `scripts/update.sh` | Release 下载、校验、暂存、换包和失败回滚 |
+| `AppIcon.icns` | 应用图标（`AppIcon.iconset/` 为本机生成中间产物，不入库） |
+| `scripts/icon_gen.swift` | 图标生成脚本 |
+| `scripts/update.sh` | Release 下载、校验、暂存、换包和失败回滚（含中断自愈） |
 | `scripts/release.sh` | 标签、构建、自检、资产校验和 GitHub Release 发布 |
 | `tests/script_test.py` | 更新、发布和签名故障的离线回归测试 |
 

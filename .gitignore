@@ -12,3 +12,7 @@ __pycache__/
 
 # 视觉预览截图
 .preview-shots/
+
+# 本机审查/部署工作台与发布产物
+.review/
+*.dmg

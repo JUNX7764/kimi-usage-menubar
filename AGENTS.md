@@ -3,9 +3,9 @@
 ## 项目地图
 
 - KimiUsage 是面向 Apple Silicon、macOS 13+ 的本地菜单栏工具。`KimiUsage.swift` 是单文件 AppKit/Foundation/SQLite3 应用，包含凭据读取、额度接口、本地 Token 聚合、原生 Popover、更新检查和离线测试；底部有顶层命令行入口，拆文件时需要调整 Swift 可执行入口。
-- `README.md` 为用户使用入口，`docs/DEVELOPMENT.md` 说明维护、统计口径与验证命令。`docs/project/` 目前包含尚未填完的模板，不能当作已实施的架构或发布事实；历史更新设计位于 `docs/features/reliable-release-update-20261102/`。
+- `README.md` 为用户使用入口，`docs/DEVELOPMENT.md` 说明维护、统计口径与验证命令；`docs/project/`（02-architecture / 07-standards / 10-release）是已填实的当前工程事实文档，与 DEVELOPMENT.md 同级效力，实现变化时同步更新。
 - `build.sh` 以 `swiftc -O -target arm64-apple-macos13.0` 编译，重建仓库内 `KimiUsage.app` 并做 ad-hoc 签名；构建版本来自 `git describe`，注入产物的 `CUBuildVersion`。需要保留现有运行包时，直接编译到会话工作台，避免覆盖它。
-- `scripts/update.sh` 接收目标 tag 和当前应用路径，校验 Release ZIP/SHA256、构建版本与签名完整性，暂存换包并在失败时尝试回滚。`scripts/release.sh vX.Y.Z` 涉及远端 tag 与 GitHub Release，是实际发布操作，不作为普通验证命令执行。
+- `scripts/update.sh` 接收目标 tag 和当前应用路径，校验 Release ZIP/SHA256、构建版本与签名完整性，暂存换包并在失败时尝试回滚；换包中断（SIGKILL/断电）后下次运行会经恢复标记自愈。update.sh 的步骤文案（"4/5"/"5/5"）被 Swift 侧 grep 用于判定更新阶段，受 `tests/script_test.py` 协议锁定，不可改文案。`scripts/release.sh vX.Y.Z` 涉及远端 tag 与 GitHub Release，是实际发布操作，不作为普通验证命令执行。
 - 本地数据路径由源码中的 `CredStore`、`TokenAggregator` 定义；认证信息来自 Kimi 桌面配置，续期会写回官方客户端配置。扫描覆盖 Work、CLI/Proma/Claude JSONL 与 ZCode/Hermes SQLite；缓存位于用户 Application Support/KimiUsage。审查与测试优先使用临时目录和假凭据，不输出真实 token 或会话正文。
 
 ## 验证入口

@@ -2265,7 +2265,7 @@ final class QuotaSectionView: PanelCardView {
         contentStack.spacing = 6
         // 卡片头部沿用"重置卡"的图标+标题样式；"重置时间"继续右对齐充当列头。
         let heading = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        heading.addArrangedSubview(PanelUI.symbol("timer", size: 15, color: PanelAccent.codex.color))
+        heading.addArrangedSubview(PanelUI.symbol("stopwatch", size: 14, color: PanelAccent.codex.color))
         heading.addArrangedSubview(PanelUI.label("用量进度", size: 13, weight: .semibold, wrapping: false))
         heading.addArrangedSubview(PanelUI.spacer())
         let resetLabel = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)

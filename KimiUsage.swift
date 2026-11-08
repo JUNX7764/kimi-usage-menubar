@@ -149,6 +149,13 @@ enum CredStore {
     /// changed either auth field during the request, keep its values and return the fresh access token.
     static func mergeWebTokens(at path: String, expected: WebTokens,
                                access: String, refresh: String?, now: Date = Date()) throws -> (access: String, wrote: Bool) {
+        // 跨进程互斥：App 与 --once CLI 可能并存，读-改-写窗口内互相覆盖会丢失刚轮换的凭据
+        // （flock 失败不阻断合并，退化为无锁路径；close 时自动释放锁）
+        let lockPath = (path as NSString).deletingLastPathComponent + "/.kimi-usage-cred.lock"
+        let lockFD = open(lockPath, O_WRONLY | O_CREAT, mode_t(0o600))
+        if lockFD >= 0 { _ = flock(lockFD, LOCK_EX) }
+        defer { if lockFD >= 0 { close(lockFD) } }
+
         guard let data = FileManager.default.contents(atPath: path),
               var obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               var credentials = obj["credentials"] as? [String: Any],
@@ -430,9 +437,10 @@ enum TokenAggregator {
         for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
-            workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
+            workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil,
+                                   failedFiles: workScan.failedFiles),
             cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
-                                  hermesOK: hermesOK, zcodeOK: zcodeOK),
+                                  hermesOK: hermesOK, zcodeOK: zcodeOK, failedFiles: cliScan.failedFiles),
             merged: statWindows(mergedDays),
             daily: dailyTotals(mergedDays),
             tools: tools)
@@ -467,11 +475,14 @@ enum TokenAggregator {
     /// 失败面判定：有已安装来源（目录 / sqlite 库存在）但无一可读 → 错误；
     /// 全部未安装（路径不存在）返回 nil——没装对应工具时该来源自然为 0，不算失败；
     /// 部分来源失败时返回提示，并保留失败来源最近一次贡献。
-    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil) -> String? {
+    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil,
+                            failedFiles: Int = 0) -> String? {
         let anySource = installed > 0 || hermesOK != nil || zcodeOK != nil
         let anySuccess = enumerated > 0 || hermesOK == true || zcodeOK == true
         if anySource && !anySuccess { return "会话目录 / 客户端用量数据库均不可读" }
         if enumerated < installed || hermesOK == false || zcodeOK == false { return "部分来源读取失败，显示上次数据" }
+        // 个别文件打不开（权限/损坏）时数值会安静变小，必须显式提示而不是静默缩水
+        if failedFiles > 0 { return "\(failedFiles) 个会话文件读取失败，统计可能偏少" }
         return nil
     }
 
@@ -508,15 +519,16 @@ enum TokenAggregator {
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
     /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）。
-    /// 返回 (已安装 root 数, 成功枚举 root 数)：目录不存在 = 未安装，不计入失败面
+    /// 返回 (已安装 root 数, 成功枚举 root 数, 单文件读取失败数)：目录不存在 = 未安装，不计入失败面
     static func scan(roots: [String], kimiOnly: Bool,
-                     into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int, okRoots: [String]) {
+                     into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int, okRoots: [String], failedFiles: Int) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
         let cutoffKey = dayFmt.string(from: cutoff)
         var seen = Set<String>()
         var enumedRoots: [String] = []
         var installed = 0
+        var failedFiles = 0
 
         for root in roots {
             var isDir: ObjCBool = false
@@ -536,7 +548,7 @@ enum TokenAggregator {
                 guard let vals = try? url.resourceValues(
                         forKeys: [.fileSizeKey, .contentModificationDateKey]),
                       let size = vals.fileSize
-                else { continue }
+                else { failedFiles += 1; continue }
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
                 // Work v4 按请求关联模型及双写；旧缓存即使文件未变也重建。
@@ -551,7 +563,7 @@ enum TokenAggregator {
                 // 截断/轮换：该文件的旧聚合已不可信，清零重扫
                 if sizeU < st.offset { st = FileScanState() }
 
-                guard let fh = try? FileHandle(forReadingFrom: url) else { continue }
+                guard let fh = try? FileHandle(forReadingFrom: url) else { failedFiles += 1; continue }
                 // Work 的请求与用量可跨刷新追加，变更时重扫，避免丢失请求上下文。
                 let rebuild = st.scanRevision != revision || !kimiOnly
                 if rebuild { st = FileScanState() }
@@ -561,7 +573,7 @@ enum TokenAggregator {
                 let text = String(data: data[..<lastNL], encoding: .utf8)
                 try? fh.close()
                 let consumed = st.offset + UInt64(lastNL + 1)
-                guard let text else { continue }
+                guard let text else { failedFiles += 1; continue }
                 if kimiOnly {
                     let trusted = realPath(root) == realPath(apiSessionsRoots[0])
                     parseLines(text, kimiOnly: true, cutoffKey: cutoffKey, allowMissingModel: trusted, into: &st)
@@ -585,7 +597,7 @@ enum TokenAggregator {
         for path in vanished {
             files.removeValue(forKey: path)
         }
-        return (installed, enumedRoots.count, enumedRoots)
+        return (installed, enumedRoots.count, enumedRoots, failedFiles)
     }
 
     // hermes 用量库（sqlite，只读打开，绝不写入）
@@ -598,7 +610,11 @@ enum TokenAggregator {
     static func scanHermes(into st: inout ScanState, at path: String = hermesDBPath) -> Bool {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
-        else { return false }
+        else {
+            // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
+            if db != nil { sqlite3_close(db) }
+            return false
+        }
         defer { sqlite3_close(db) }
         let sql = """
             SELECT session_id, model, billing_provider, billing_base_url, billing_mode, task,
@@ -677,7 +693,11 @@ enum TokenAggregator {
     static func scanZCodeModelDays(at path: String = zcodeDBPath, now: Date = Date()) -> ModelDays? {
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
-        else { return nil }
+        else {
+            // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
+            if db != nil { sqlite3_close(db) }
+            return nil
+        }
         defer { sqlite3_close(db) }
         let sql = """
             SELECT model_id, input_tokens, output_tokens, started_at
@@ -837,9 +857,7 @@ enum TokenAggregator {
         }
         let skip = Set(events.indices.filter { paired.contains($0) && events[$0].kind == "context.append_loop_event" }.map { events[$0].lineIndex })
         for event in events where !skip.contains(event.lineIndex) {
-            guard let data = try? JSONSerialization.data(withJSONObject: event.object),
-                  let line = String(data: data, encoding: .utf8) else { continue }
-            parseLines(line, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
+            parseLineObject(event.object, kimiOnly: false, cutoffKey: cutoffKey, into: &st)
         }
         st.preferUsageRecord = events.contains { $0.kind == "usage.record" }
     }
@@ -853,14 +871,24 @@ enum TokenAggregator {
             guard let data = line.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            // Proma result 行的 modelUsage / 顶层 usage 都是全会话累计汇总，逐条 assistant 行已含每次调用。
-            // 有些 result 没有 modelUsage，必须按 type 一并跳过，不能只判断 modelUsage 字段。
-            if obj["modelUsage"] != nil { continue }
+            parseLineObject(obj, kimiOnly: kimiOnly, cutoffKey: cutoffKey,
+                            preferUsageRecord: preferUsageRecord, allowMissingModel: allowMissingModel, into: &st)
+        }
+    }
+
+    /// 直接解析已反序列化的单行对象：parseWorkLines 已完成 JSON 解析与镜像配对，
+    /// 走此入口避免"再序列化整行 → 再解析一遍"的双重开销（口径与 parseLines 完全一致）。
+    static func parseLineObject(_ obj: [String: Any], kimiOnly: Bool,
+                                cutoffKey: String, preferUsageRecord: Bool = false, allowMissingModel: Bool = false,
+                                into st: inout FileScanState) {
+        // Proma result 行的 modelUsage / 顶层 usage 都是全会话累计汇总，逐条 assistant 行已含每次调用。
+        // 有些 result 没有 modelUsage，必须按 type 一并跳过，不能只判断 modelUsage 字段。
+        if obj["modelUsage"] != nil { return }
             let rowType = obj["type"] as? String
-            if kimiOnly && rowType == "result" { continue }
+            if kimiOnly && rowType == "result" { return }
             // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写。
             // API 只取前者；Kimi Work 旧文件只有 loop 时保留 loop，新文件出现 record 后只取 record。
-            if rowType == "context.append_loop_event" && (kimiOnly || preferUsageRecord) { continue }
+            if rowType == "context.append_loop_event" && (kimiOnly || preferUsageRecord) { return }
             // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
             let t: Date
             if let ms = obj["time"] as? Double {
@@ -869,18 +897,18 @@ enum TokenAggregator {
                 t = ts
             } else if let ms = obj["_createdAt"] as? Double {
                 t = Date(timeIntervalSince1970: ms / 1000)
-            } else { continue }
+            } else { return }
             // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
             let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
                 ?? obj["usage"] as? [String: Any]
                 ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
-            guard let usage = usage else { continue }
+            guard let usage = usage else { return }
             let event = obj["event"] as? [String: Any] ?? [:]
             let rawModel = (obj["message"] as? [String: Any])?["model"] as? String
                 ?? obj["model"] as? String ?? event["model"] as? String
             // 混接客户端只统计 Kimi 模型的行；可信旧格式与 Work 旧镜像归入未知模型。
             if kimiOnly {
-                guard isKimiModel(rawModel) || (allowMissingModel && (rawModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { continue }
+                guard isKimiModel(rawModel) || (allowMissingModel && (rawModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { return }
             }
             let model = normalizedModel(rawModel)
             // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
@@ -897,17 +925,16 @@ enum TokenAggregator {
                 else if let v = usage[k] as? Int { output += Double(v) }
             }
 
-            let dayKey = dayFmt.string(from: t)
-            if dayKey >= cutoffKey {
-                var day = st.days[dayKey] ?? [0, 0]
-                day[0] += input
-                day[1] += output
-                st.days[dayKey] = day
-                var modelDay = st.modelDays[dayKey]?[model] ?? [0, 0]
-                modelDay[0] += input
-                modelDay[1] += output
-                st.modelDays[dayKey, default: [:]][model] = modelDay
-            }
+        let dayKey = dayFmt.string(from: t)
+        if dayKey >= cutoffKey {
+            var day = st.days[dayKey] ?? [0, 0]
+            day[0] += input
+            day[1] += output
+            st.days[dayKey] = day
+            var modelDay = st.modelDays[dayKey]?[model] ?? [0, 0]
+            modelDay[0] += input
+            modelDay[1] += output
+            st.modelDays[dayKey, default: [:]][model] = modelDay
         }
     }
 
@@ -1128,7 +1155,29 @@ enum Fetcher {
     /// 用 refreshToken 自刷新 web token（GET /api/auth/token/refresh，Bearer 带 refreshToken）。
     /// 服务端每次会轮换 refresh_token，必须把新 token 对写回 config.json，否则刷新链会断。
     /// 成功返回新 accessToken（寿命 ~30 天），失败返回 nil。
+    ///
+    /// 单飞化：月度与账号两条 401 链可能同轮并发触发续期，并发使用同一 refreshToken
+    /// 会在服务端互相作废。同一时刻只发一次真实请求，其余调用方共享本次结果。
+    private static let refreshGateLock = NSLock()
+    private static var refreshInFlight = false
+    private static var refreshWaiters: [(String?) -> Void] = []
     static func refreshWebToken(completion: @escaping (String?) -> Void) {
+        refreshGateLock.lock()
+        refreshWaiters.append(completion)
+        guard !refreshInFlight else { refreshGateLock.unlock(); return }
+        refreshInFlight = true
+        refreshGateLock.unlock()
+        performRefreshWebToken { result in
+            refreshGateLock.lock()
+            refreshInFlight = false
+            let waiters = refreshWaiters
+            refreshWaiters = []
+            refreshGateLock.unlock()
+            for waiter in waiters { waiter(result) }
+        }
+    }
+
+    private static func performRefreshWebToken(completion: @escaping (String?) -> Void) {
         let path = CredStore.configPath
         // Re-read immediately before the request because the official desktop client may rotate tokens.
         guard let expected = CredStore.webTokens(at: path) else { completion(nil); return }
@@ -1219,16 +1268,21 @@ enum Fetcher {
 
         URLSession.shared.dataTask(with: req) { data, resp, err in
             defer { completion(result) }
-            guard err == nil, let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                let reason = err?.localizedDescription ?? "bad response"
-                result.fiveHourError = reason
-                result.sevenDayError = reason
+            // 先看 HTTP 状态码再解析：网关 5xx 返回 HTML 时也能报出真实状态码而非 "bad response"
+            if let err = err {
+                result.fiveHourError = err.localizedDescription
+                result.sevenDayError = err.localizedDescription
                 return
             }
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 result.fiveHourError = "HTTP \(http.statusCode)"
                 result.sevenDayError = "HTTP \(http.statusCode)"
+                return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                result.fiveHourError = "bad response"
+                result.sevenDayError = "bad response"
                 return
             }
             result = parseCodeUsagePayload(obj)
@@ -1268,13 +1322,18 @@ enum Fetcher {
 
         URLSession.shared.dataTask(with: req) { data, resp, err in
             defer { completion(result) }
-            guard err == nil, let data = data,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                result.monthError = err?.localizedDescription ?? "bad response"
+            // 先看 HTTP 状态码再解析（与 fetchKimiAccount 同序）：5xx HTML 报真实状态码
+            if let err = err {
+                result.monthError = err.localizedDescription
                 return
             }
             if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
                 result.monthError = "HTTP \(http.statusCode)"
+                return
+            }
+            guard let data = data,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                result.monthError = "bad response"
                 return
             }
             result = parseMonthUsagePayload(obj)
@@ -2133,7 +2192,9 @@ final class PanelHeaderView: NSView {
         titleRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(titleRow, to: titles)
         if let accountLine = model.accountLine, !accountLine.isEmpty {
-            let accountLabel = PanelUI.label(accountLine, size: 11, color: .secondaryLabelColor)
+            // 单行截断（同 PlanTag 惯例）：超长昵称不得换行撑高固定头部；全名进 toolTip
+            let accountLabel = PanelUI.label(accountLine, size: 11, color: .secondaryLabelColor, wrapping: false)
+            accountLabel.toolTip = accountLine
             PanelUI.addFullWidth(accountLabel, to: titles)
         }
         row.addArrangedSubview(titles)
@@ -2343,6 +2404,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private let scrollView = NSScrollView()
     private let stack = PanelUI.stack(spacing: 8)
     private var model: UsagePanelModel?
+    // 面板关闭时 update() 只存 model 不拆建视图，打开时一次性重建；
+    // 打开期间同一轮刷新的多次 update 合并到下一个 runloop 只重排一次。
+    private var needsRebuild = false
+    private var layoutScheduled = false
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
@@ -2429,7 +2494,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func update(model: UsagePanelModel) {
         self.model = model
-        if isOpen { refreshPanelLayout() } else { rebuildContent() }
+        if isOpen {
+            guard !layoutScheduled else { return }
+            layoutScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.layoutScheduled = false
+                self.refreshPanelLayout()
+            }
+        } else {
+            needsRebuild = true
+        }
     }
 
     private func clear(container: NSView) {
@@ -2775,7 +2850,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 next.performClick(nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                     let collapsed = window.frame
-                    guard stable(collapsed), collapsed.height < expanded.height - 1 else { return fail("collapse \(expanded) -> \(collapsed)") }
+                    guard stable(collapsed), collapsed.height < expanded.height - 1 else {
+                        return fail("collapse \(expanded) -> \(collapsed); shown=\(self.isOpen) sameWindow=\(self.contentController.view.window === window) sameController=\(self.popover.contentViewController === controller) sameDocument=\(self.scrollView.documentView === document) screen=\(String(describing: window.screen?.frame))")
+                    }
                     guard self.savePreviewImage(to: outputDirectory + "/collapsed.png") else { return fail("collapsed screenshot") }
                     print("KimiUsage popover test: PASS heights=\(initial.height),\(expanded.height),\(collapsed.height) maxY=\(initial.maxY),\(expanded.maxY),\(collapsed.maxY) anchor=\(anchor)")
                     exit(0)
@@ -2816,6 +2893,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private func show(anchoredTo button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         anchorButton = button
+        if needsRebuild { rebuildContent(); needsRebuild = false }
         layoutPanel(buttonWindow: buttonWindow)
         let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
         solid.opacity = reduceTransparency ? 1 : 0.9
@@ -2827,7 +2905,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     private func layoutPanel(buttonWindow: NSWindow) {
-        let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens[0]
+        guard let screen = buttonWindow.screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
         let desiredWidth = min(previewWidth ?? Self.maximumWidth, visible.width - 24)
         if desiredWidth != panelWidth {
@@ -2996,7 +3074,7 @@ private final class TokenSectionView: NSView {
         header.addArrangedSubview(PanelUI.symbol(model.accent.symbol, size: 14, color: model.accent.color))
         header.addArrangedSubview(PanelUI.label(model.title, size: 12, weight: .semibold, wrapping: false))
         header.addArrangedSubview(PanelUI.spacer())
-        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠用量" : "展开用量")!, target: target, action: action)
+        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠用量" : "展开用量") ?? NSImage(), target: target, action: action)
         toggle.isBordered = false
         toggle.contentTintColor = .secondaryLabelColor
         toggle.toolTip = expanded ? "折叠" : "展开"
@@ -3177,7 +3255,7 @@ private final class DailyBriefSectionView: NSView {
         header.addArrangedSubview(PanelUI.label("用量简析", size: 12, weight: .semibold, wrapping: false))
         header.addArrangedSubview(PanelUI.spacer())
         let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
-            accessibilityDescription: expanded ? "折叠用量简析" : "展开用量简析")!,
+            accessibilityDescription: expanded ? "折叠用量简析" : "展开用量简析") ?? NSImage(),
             target: target, action: action)
         toggle.isBordered = false
         toggle.contentTintColor = .secondaryLabelColor
@@ -3357,7 +3435,7 @@ private final class ToolBreakdownView: NSView {
         }
         header.addArrangedSubview(periods)
         let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
-            accessibilityDescription: expanded ? "折叠工具明细" : "展开工具明细")!,
+            accessibilityDescription: expanded ? "折叠工具明细" : "展开工具明细") ?? NSImage(),
             target: target, action: toggleAction)
         toggle.isBordered = false
         toggle.contentTintColor = .secondaryLabelColor
@@ -3563,6 +3641,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appearancePollTimer: Timer?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
+    // status.json 内容快照：内容未变时跳过磁盘写与日志（渲染每 10s 一次，多为重复内容）
+    private var lastStatusPayload: String?
     // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
     // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
     // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
@@ -3698,6 +3778,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else if includeSlow {
             merged.monthError = "no web token"
+            // 桌面端已登出：显式清空账号行，不再保留旧昵称/手机号
+            // （空串经头部 clean 后等价 nil，同时绕过"缺字段保留旧值"的合并）
+            merged.accountFetched = true
+            merged.accountName = ""
+            merged.accountPhone = ""
         }
 
         // 头部账号行（CodexUsage 头部同款）：昵称 + 服务端打码手机号；401 走与月度相同的 refresh→重试链
@@ -3842,17 +3927,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 
-    /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态。
-    /// 因此只重建不缓存的动态颜色图片，让实际菜单栏绘制上下文决定颜色。
+    /// 外观不一致既可能是按钮粘滞，也可能是深色壁纸或双屏的正常状态（合法常态）。
+    /// 一律走快照去重：主题真变了才重画；无变化时不重建图片、不写 status.json，
+    /// 否则外观长期不一致的机器上会每 5s 重画一次形成死循环。
     private func reconcileBarAppearance() {
-        guard let button = statusItem.button else { return }
-        let appDark = isDark(NSApp.effectiveAppearance)
-        let buttonDark = isDark(button.effectiveAppearance)
-        if buttonDark != appDark {
-            renderBar()
-        } else {
-            renderBarIfThemeChanged()
-        }
+        renderBarIfThemeChanged()
     }
 
     /// 仅当按钮解析出的明暗主题与上次渲染快照不同时才重画（防止 setImage↔KVO 循环）
@@ -3906,7 +3985,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let monthStatus: [String: Any] = [
             "remaining": remaining(usage.monthUsed) ?? -1.0,
             "error": usage.monthError ?? "",
-            "lastSuccessAt": lastMonthSuccessAt.map { ISO8601DateFormatter().string(from: $0) } ?? ""
+            "lastSuccessAt": lastMonthSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? ""
         ]
         var info: [String: Any] = [
             "line1": line1,
@@ -3959,9 +4038,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             info["windowVisible"] = false
         }
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
-            try? data.write(to: URL(fileURLWithPath: dir + "/status.json"))
+            let payload = String(data: data, encoding: .utf8) ?? ""
+            if payload != lastStatusPayload {
+                // 0600 原子写：status.json 含账号昵称/打码手机号等 PII，避免 0644 可被其他本地用户读取与半写状态
+                try? AtomicJSONFile.replace(data, at: dir + "/status.json", mode: 0o600)
+                NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
+                lastStatusPayload = payload
+            }
         }
-        NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
     }
 
     private func rebuildMenu() {
@@ -4082,7 +4166,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             tokensStale)
         // 头部账号行：昵称（打码手机号）；账号无手机号时回退昵称，两者皆缺则隐藏该行
         let accountLine: String? = {
-            switch (usage.accountName, usage.accountPhone) {
+            func clean(_ value: String?) -> String? {
+                guard let value = value,
+                      !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                return value
+            }
+            switch (clean(usage.accountName), clean(usage.accountPhone)) {
             case let (name?, phone?): return "\(name)（\(phone)）"
             case let (nil, phone?): return phone
             case let (name?, nil): return name
@@ -4336,26 +4425,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
-        if isLoginItemEnabled() {
-            try? FileManager.default.removeItem(atPath: launchAgentPath)
-        } else {
-            let exec = Bundle.main.executablePath ?? ""
-            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
-            let plist = """
-            <?xml version="1.0" encoding="UTF-8"?>
-            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-            <plist version="1.0">
-            <dict>
-                <key>Label</key><string>\(launchAgentLabel)</string>
-                <key>ProgramArguments</key>
-                <array><string>\(exec)</string></array>
-                <key>RunAtLoad</key><true/>
-                <key>KeepAlive</key>
-                <dict><key>SuccessfulExit</key><false/></dict>
-            </dict>
-            </plist>
-            """
-            try? plist.write(toFile: launchAgentPath, atomically: true, encoding: .utf8)
+        do {
+            if isLoginItemEnabled() {
+                try FileManager.default.removeItem(atPath: launchAgentPath)
+            } else {
+                // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
+                // launchd 静默忽略，开机自启失效且用户无感知
+                let exec = Bundle.main.executablePath ?? ""
+                // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
+                let plist: [String: Any] = [
+                    "Label": launchAgentLabel,
+                    "ProgramArguments": [exec],
+                    "RunAtLoad": true,
+                    "KeepAlive": ["SuccessfulExit": false]
+                ]
+                let data = try PropertyListSerialization.data(fromPropertyList: plist,
+                    format: .xml, options: 0)
+                try data.write(to: URL(fileURLWithPath: launchAgentPath))
+            }
+        } catch {
+            panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
+            NSLog("[KimiUsage] LaunchAgent toggle failed: %@", error.localizedDescription)
         }
         updateUI()
     }
@@ -5111,6 +5201,29 @@ enum KimiOfflineRegression {
 
 // MARK: - 入口（支持 --once 命令行自检）
 
+let cliArgs = CommandLine.arguments.dropFirst()
+if cliArgs.contains("--help") {
+    print("""
+    KimiUsage — Kimi 用量菜单栏工具（无参数启动常驻应用）
+
+    用法:
+      --self-test        离线回归自检（只用临时数据，不读凭据、不联网）
+      --tokens-once      只统计本地 token（不读凭据、不联网、不写缓存）
+      --once             拉一次线上额度 + 本地统计后退出（读凭据、联网、可能续期并写缓存）
+      --visual-preview…  原生面板离线预览（子选项见 docs/DEVELOPMENT.md）
+      --help             显示本说明
+    """)
+    exit(0)
+}
+// 未知旗标一律拒绝：静默拉起常驻 GUI 会让用户无从察觉拼写错误
+let knownLongFlags: Set<String> = ["--self-test", "--tokens-once", "--once", "--help"]
+if let unknown = cliArgs.first(where: {
+    $0.hasPrefix("--") && !knownLongFlags.contains($0) && !$0.hasPrefix("--visual-preview")
+}) {
+    fputs("KimiUsage: 未知参数 \(unknown)（--help 查看用法）\n", stderr)
+    exit(2)
+}
+
 if CommandLine.arguments.contains("--self-test") {
     exit(KimiOfflineRegression.run())
 }
@@ -5183,8 +5296,8 @@ if CommandLine.arguments.contains("--once") {
             }
         }
     } else { print("no kimiWeb token found") }
-    // 月度 401 时存在 刷新→重试 串行链（每段最长 15s），20s 会截断重试结果
-    _ = group.wait(timeout: .now() + 45)
+    // 月度 401 时存在 刷新→重试 串行链（每段最长 15s），45s 内应全部返回
+    let timedOut = group.wait(timeout: .now() + 45) == .timedOut
     onceLock.lock()
     let snapshot = merged
     onceLock.unlock()
@@ -5208,7 +5321,8 @@ if CommandLine.arguments.contains("--once") {
     print("api tokens 30d:   in=\(Fmt.tokens(cm.input)) out=\(Fmt.tokens(cm.output)) total=\(Fmt.tokens(cm.total))")
     if let e = snapshot.fiveHourError { print("5h error: \(e)") }
     if let e = snapshot.monthError { print("month error: \(e)") }
-    exit(0)
+    if timedOut { fputs("KimiUsage --once: 等待网络结果超时（45s），以上为部分数据\n", stderr) }
+    exit(timedOut ? 1 : 0)
 }
 
 let app = NSApplication.shared

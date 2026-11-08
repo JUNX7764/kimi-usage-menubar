@@ -11,7 +11,6 @@ MYUID="$(id -u)"
 AGENT_PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
 TMP=""
-KEEP_TMP=0
 WORK=""
 BACKUP=""
 INSTALLED=""
@@ -23,8 +22,37 @@ NEW_VERSION=""
 TARGET_TAG="$1"
 INSTALLED="$2"
 [[ "$TARGET_TAG" =~ ^v?[0-9]+(\.[0-9]+)+$ ]] || { echo "!! 目标版本无效"; exit 1; }
-[ -d "$INSTALLED" ] && [ "$(basename "$INSTALLED")" = "$APP_NAME" ] || { echo "!! 应用路径无效"; exit 1; }
+[ -d "$(dirname "$INSTALLED")" ] || { echo "!! 应用路径无效"; exit 1; }
 INSTALLED="$(cd "$(dirname "$INSTALLED")" && pwd -P)/${APP_NAME}"
+# 换包两步 mv 之间被 SIGKILL/断电的自愈标记：应用目录缺失时从这里找回暂存的旧包
+PENDING_MARK="$(dirname "$INSTALLED")/.${APP_NAME}.update-pending"
+
+heal_interrupted_update() {
+    [ -f "$PENDING_MARK" ] || return 0
+    local work
+    work="$(head -n 1 "$PENDING_MARK" 2>/dev/null || true)"
+    rm -f "$PENDING_MARK"
+    if [ -d "$INSTALLED" ]; then
+        # 应用目录还在：说明没走到换包半途，无需恢复
+        return 0
+    fi
+    local old="${work}/old/${APP_NAME}"
+    if [ -n "$work" ] && [ -d "$old" ]; then
+        echo "==> 检测到上次更新中断（应用目录缺失），从暂存目录恢复旧版本"
+        if mv "$old" "$INSTALLED" 2>/dev/null || cp -R "$old" "$INSTALLED" 2>/dev/null; then
+            rm -rf "$work"
+            echo "✅ 已恢复旧版本：${INSTALLED}"
+            return 0
+        fi
+    fi
+    echo "!! 上次更新中断且无法自动恢复（备份暂存目录：${work:-未知}）"
+    return 1
+}
+if ! heal_interrupted_update; then
+    exit 1
+fi
+
+[ -d "$INSTALLED" ] && [ "$(basename "$INSTALLED")" = "$APP_NAME" ] || { echo "!! 应用路径无效"; exit 1; }
 BINARY="${INSTALLED}/Contents/MacOS/${EXECUTABLE}"
 [ -x "$BINARY" ] || { echo "!! 当前应用缺少可执行文件"; exit 1; }
 # 从下载目录直接运行的应用会被 Gatekeeper 挂载到只读的 App Translocation 位置，
@@ -69,7 +97,10 @@ JXA
 
 start_and_wait() {
     if [ "$AGENT" = 1 ]; then
-        launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST" || { echo "!! LaunchAgent 加载失败，无法启动应用"; return 1; }
+        launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST" || {
+            echo "!! LaunchAgent 加载失败，尝试直接启动应用"
+            open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
+        }
     else
         open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
     fi
@@ -98,10 +129,19 @@ rollback() {
         if [ -d "$INSTALLED" ]; then
             rm -rf "$INSTALLED"
         fi
-        mv "$BACKUP" "$INSTALLED" || {
-            echo "!! 旧包恢复失败，备份保留在：${BACKUP}"
-            return 1
-        }
+        local restored=0
+        for _ in 1 2 3; do
+            if mv "$BACKUP" "$INSTALLED" 2>/dev/null; then restored=1; break; fi
+            sleep 1
+        done
+        if [ "$restored" = 0 ]; then
+            if cp -R "$BACKUP" "$INSTALLED" 2>/dev/null; then
+                echo "!! mv 恢复失败，已改用 cp 恢复（备份保留在：${BACKUP}）"
+            else
+                echo "!! 旧包恢复失败，备份保留在：${BACKUP}"
+                return 1
+            fi
+        fi
     fi
     start_and_wait
 }
@@ -112,8 +152,10 @@ on_exit() {
     if [ "$rc" -ne 0 ] && [ "$STOPPED" = 1 ] && [ "$SUCCESS" = 0 ]; then
         rollback || rc=$?
     fi
-    if [ "$KEEP_TMP" = 0 ]; then
-        rm -rf "$TMP"
+    rm -rf "$TMP"
+    # 应用目录存在（含回滚成功）即清掉自愈标记；缺失时保留，供下次运行自愈
+    if [ -e "$INSTALLED" ]; then
+        rm -f "$PENDING_MARK"
     fi
     if [ -n "$WORK" ]; then
         if [ -n "$BACKUP" ] && [ -e "$BACKUP" ]; then
@@ -129,7 +171,7 @@ trap on_exit EXIT
 echo "==> 1/5 查找并下载最新可安装 Release"
 # 不假设 releases/latest 一定带附件：人工建 Release 或上传中断时会留下空 Release。
 # 用 macOS 自带 JXA 解析 GitHub JSON，跳过 draft/prerelease 及 ZIP/SHA256 不完整的条目。
-if ! curl -fsSL --max-time 60 \
+if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 60 \
     -H 'Accept: application/vnd.github+json' -H 'User-Agent: KimiUsage-Updater' \
     -o "${TMP}/releases.json" "$API_URL"; then
     echo "!! Release 信息获取失败，请检查网络后重试"
@@ -179,14 +221,14 @@ DOWNLOAD_PROGRESS=--silent
 if [ -n "${UPDATE_PROGRESS_FILE:-}" ]; then
     DOWNLOAD_PROGRESS=--progress-bar
 fi
-if ! curl -fL "$DOWNLOAD_PROGRESS" --max-time 180 -o "${TMP}/KimiUsage.zip" "$ZIP_URL" 2>"${UPDATE_PROGRESS_FILE:-/dev/null}"; then
+if ! curl -fL "$DOWNLOAD_PROGRESS" --retry 2 --retry-delay 2 --max-time 180 -o "${TMP}/KimiUsage.zip" "$ZIP_URL" 2>"${UPDATE_PROGRESS_FILE:-/dev/null}"; then
     echo "!! 发布包下载失败，请稍后重试"
     exit 1
 fi
 
 echo "==> 2/5 校验发布包"
 # SHA256 校验：release.sh 随包上传 KimiUsage.zip.sha256，缺失或不匹配即中止
-if ! curl -fsSL --max-time 60 -o "${TMP}/KimiUsage.zip.sha256" "$SHA256_URL"; then
+if ! curl -fsSL --retry 2 --retry-delay 2 --max-time 60 -o "${TMP}/KimiUsage.zip.sha256" "$SHA256_URL"; then
     echo "!! 校验文件下载失败（Release 缺少 SHA256 或网络异常），已中止"
     exit 1
 fi
@@ -210,6 +252,8 @@ if ! NEW_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${NEW_AP
 fi
 [ "$NEW_VERSION" = "$TARGET_TAG" ] || { echo "!! 发布包构建版本与目标不符"; exit 1; }
 OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
+# 非 tag 构建（git describe 失败产物 unknown / 短 hash）无法比较版本，报错要可操作而不是误导
+[[ "$OLD_VERSION" =~ ^v?[0-9]+(\.[0-9]+)+(-.+)?$ ]] || { echo "!! 当前应用版本号不可比较（非 tag 构建：${OLD_VERSION}），请重新安装 Release 后再更新"; exit 1; }
 [ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
 if ! codesign --verify --deep --strict "$NEW_APP"; then
     echo "!! 新版本签名校验未通过，已中止"
@@ -256,6 +300,9 @@ if [ -n "$(target_pids)" ]; then
     echo "!! 旧进程仍未退出，取消换包"
     exit 1
 fi
+# 换包前落自愈标记：两步 mv 之间进程被杀时，下次运行 update.sh 可从此找回旧包
+printf '%s\n' "$WORK" > "${PENDING_MARK}.tmp.$$"
+mv "${PENDING_MARK}.tmp.$$" "$PENDING_MARK"
 mv "$INSTALLED" "$BACKUP"
 if ! mv "$STAGE" "$INSTALLED"; then
     echo "!! 新版本移入安装位置失败，将恢复旧版本"
@@ -268,6 +315,7 @@ fi
 
 echo "==> 5/5 启动并检查新版本"
 start_and_wait
+rm -f "$PENDING_MARK"
 rm -rf "$BACKUP"
 BACKUP=""
 rm -rf "$WORK"

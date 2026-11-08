@@ -26,7 +26,6 @@ REPO = setting("REPO")
 APP_NAME = setting("APP_NAME")
 EXECUTABLE = setting("EXECUTABLE")
 LABEL = setting("LABEL")
-NEEDS_PEAK_TEST = setting("NEEDS_PEAK_TEST", RELEASE) == "1"
 OTHER_LABELS = {"com.local.codex-usage", "com.local.glm-usage", "com.local.kimi-usage"} - {LABEL}
 
 
@@ -47,7 +46,9 @@ class ScriptTest(unittest.TestCase):
         self.real_mv = shutil.which("mv")
         self._write_mocks()
         self.bash_env = self.base / "bash_env"
-        self.bash_env.write_text('kill() { echo "kill $*" >> "$MOCK_LOG"; rm -f "$MOCK_STATE"; }\n')
+        self.bash_env.write_text(
+            'kill() { if [ "${MOCK_KILL_INEFFECTIVE:-0}" = 1 ]; then return 0; fi;'
+            ' echo "kill $*" >> "$MOCK_LOG"; rm -f "$MOCK_STATE"; }\n')
         zip_url = f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip"
         releases = [{
             "tag_name": "v2.0.0", "draft": False, "prerelease": False,
@@ -90,9 +91,15 @@ exec /usr/bin/mktemp "$@"
         self._mock("curl", r'''
 echo "curl $*" >> "$MOCK_LOG"
 out=""
+url=""
 while [ "$#" -gt 0 ]; do
-    if [ "$1" = "-o" ]; then out="$2"; shift 2; else shift; fi
+    if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi
+    case "$1" in http*) url="$1" ;; esac
+    shift
 done
+if [ -n "${MOCK_CURL_FAIL_URL_SUBSTR:-}" ] && [[ "$url" == *"$MOCK_CURL_FAIL_URL_SUBSTR"* ]]; then
+    exit 50
+fi
 case "$out" in
     *releases.json)
         printf '%s' "$MOCK_RELEASES_JSON" > "$out"
@@ -133,7 +140,7 @@ case "$1" in
     print) [ "${MOCK_AGENT_ACTIVE:-0}" = 1 ] || exit 1; printf "\tprogram = %s\n" "${MOCK_LOADED_BINARY:-$MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE}" ;;
     bootout)
         if [ "${MOCK_BOOTOUT_FAIL:-0}" = 1 ]; then exit 42; fi
-        rm -f "$MOCK_STATE"
+        [ "${MOCK_KILL_INEFFECTIVE:-0}" = 1 ] || rm -f "$MOCK_STATE"
         ;;
     bootstrap)
         if [ "${MOCK_BOOTSTRAP_FAIL:-0}" = 1 ]; then exit 49; fi
@@ -230,10 +237,6 @@ case "${1:-}" in
     --self-test)
         echo "self-test" >> "$MOCK_LOG"
         [ "${MOCK_SELF_TEST_FAIL:-0}" = 1 ] && exit 51
-        ;;
-    --peak-test)
-        echo "peak-test" >> "$MOCK_LOG"
-        [ "${MOCK_PEAK_TEST_FAIL:-0}" = 1 ] && exit 52
         ;;
 esac
 exit 0
@@ -388,12 +391,14 @@ exit 0
         self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
         self.assertTrue(self.state.exists())
 
-    def test_bootstrap_failure_rolls_back_and_reports(self):
+    def test_bootstrap_failure_falls_back_to_direct_launch(self):
+        # LaunchAgent 加载失败但新版本本身健康时，降级 open -n 直启而不是回滚更新
         installed = self.prepare_update()
         result = self.run_update(MOCK_BOOTSTRAP_FAIL="1")
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.marker(installed), "old")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
         self.assertIn("LaunchAgent 加载失败", result.stdout)
+        self.assertTrue(any(line.startswith("open -n") for line in self.log_lines()))
 
     def test_swap_failure_restores_old_app_and_restarts(self):
         installed = self.prepare_update()
@@ -419,6 +424,99 @@ exit 0
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
         self.assertFalse(any(line.startswith("mv ") for line in self.log_lines()))
+
+    def test_swap_step_protocol_is_locked_between_script_and_app(self):
+        # Swift 侧用 grep 文案（'4/5'/'5/5'）判定更新失败弹窗与 installing 阶段，
+        # 脚本措辞一旦改动协议即静默断裂；此测试双向锁定。
+        updater = UPDATE.read_text()
+        self.assertIn('echo "==> 4/5', updater)
+        self.assertIn('echo "==> 5/5', updater)
+        source = (ROOT / f"{EXECUTABLE}.swift").read_text()
+        self.assertIn("grep -q '4/5'", source)
+        self.assertIn('log.contains("4/5")', source)
+        self.assertIn('log.contains("5/5")', source)
+
+    def test_interrupted_swap_self_heals_then_updates(self):
+        installed = self.prepare_update()
+        work = self.apps / f".{APP_NAME}.update.crashtest"
+        old = work / "old" / APP_NAME
+        old.parent.mkdir(parents=True)
+        shutil.move(str(installed), str(old))
+        marker = self.apps / f".{APP_NAME}.update-pending"
+        marker.write_text(f"{work}\n")
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertFalse(marker.exists())
+        self.assertFalse(work.exists())
+
+    def test_pending_marker_without_crash_is_cleaned_up(self):
+        installed = self.prepare_update()
+        marker = self.apps / f".{APP_NAME}.update-pending"
+        marker.write_text(f"{self.apps}/nonexistent-work\n")
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertFalse(marker.exists())
+
+    def test_releases_json_download_failure_preserves_old_app(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_FAIL_URL_SUBSTR="api.github.com")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Release 信息获取失败", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertTrue(self.state.exists())
+
+    def test_zip_download_failure_preserves_old_app(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_FAIL_URL_SUBSTR=f"download/v2.0.0/{EXECUTABLE}.zip")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("发布包下载失败", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertTrue(self.state.exists())
+
+    def test_sha256_download_failure_preserves_old_app(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_CURL_FAIL_URL_SUBSTR=f"{EXECUTABLE}.zip.sha256")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("校验文件下载失败", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+
+    def test_unexpected_zip_url_is_rejected(self):
+        installed = self.prepare_update()
+        evil = [{
+            "tag_name": "v2.0.0", "draft": False, "prerelease": False,
+            "assets": [
+                {"name": f"{EXECUTABLE}.zip", "browser_download_url": f"https://evil.example.com/{EXECUTABLE}.zip"},
+                {"name": f"{EXECUTABLE}.zip.sha256",
+                 "browser_download_url": f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip.sha256"},
+            ],
+        }]
+        result = self.run_update(MOCK_RELEASES_JSON=json.dumps(evil))
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("非预期的 ZIP 地址", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+
+    def test_old_process_stuck_aborts_before_swap(self):
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_KILL_INEFFECTIVE="1")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("旧进程仍未退出", result.stdout)
+        self.assertEqual(self.marker(installed), "old")
+        self.assertTrue(installed.exists())
+
+    def test_unparseable_current_version_reports_instead_of_misleading(self):
+        installed = self.prepare_update()
+        info_path = installed / "Contents" / "Info.plist"
+        with info_path.open("rb") as f:
+            info = plistlib.load(f)
+        info["CUBuildVersion"] = "unknown"
+        with info_path.open("wb") as f:
+            plistlib.dump(info, f)
+        result = self.run_update()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("版本号不可比较", result.stdout)
+        self.assertNotIn("目标版本必须高于当前应用", result.stdout)
 
     def test_wrong_payload_version_is_rejected(self):
         installed = self.prepare_update()
@@ -497,8 +595,6 @@ echo "build" >> "$MOCK_LOG"
         self.assertLess(lines.index("self-test"), push)
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("codesign --verify")), push)
         self.assertLess(next(i for i, line in enumerate(lines) if line.startswith("unzip -t")), push)
-        if NEEDS_PEAK_TEST:
-            self.assertLess(lines.index("peak-test"), push)
         gh_line = next(line for line in lines if line.startswith("gh release create"))
         self.assertIn(f"{EXECUTABLE}.zip.sha256", gh_line)
 
@@ -521,15 +617,6 @@ echo "build" >> "$MOCK_LOG"
         self.assertFalse(any(line.startswith("git push") for line in lines))
         self.assertFalse(any(line.startswith("gh release create") for line in lines))
         self.assertTrue(any("tag -d v9.9.9" in line for line in lines), lines)
-
-    def test_peak_test_failure_blocks_remote_operations(self):
-        if not NEEDS_PEAK_TEST:
-            self.skipTest("this project has no peak test")
-        project = self.prepare_release()
-        result = self.run_release(project, MOCK_PEAK_TEST_FAIL="1")
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertFalse(any(line.startswith("git push") for line in self.log_lines()))
-        self.assertFalse(any(line.startswith("gh release create") for line in self.log_lines()))
 
     def test_wrong_origin_is_rejected_before_tagging(self):
         project = self.prepare_release()

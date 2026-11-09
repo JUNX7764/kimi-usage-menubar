@@ -2999,13 +2999,20 @@ private final class TokenDetailRow: NSView {
 }
 
 private final class TokenBucketRow: NSButton {
+    // 无模型明细的行为禁用态（isEnabled 见下），不接受键盘焦点
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 { performClick(nil) } else { super.keyDown(with: event) }
+    }
     let cells: TokenDetailRow
     private var hovered = false { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
 
     init(bucket: UsagePanelModel.TokenBucket, accent: PanelAccent, expanded: Bool,
          tag: Int, target: AnyObject, action: Selector) {
-        cells = TokenDetailRow(values: [bucket.summaryLabel, bucket.total, bucket.input, bucket.output],
+        // 折叠箭头 ›/⌄ 对齐 CodexUsage 用量情况行；禁用行（无模型明细）不带箭头，避免死 affordance
+        let arrow = bucket.models.isEmpty ? "" : (expanded ? "⌄ " : "› ")
+        cells = TokenDetailRow(values: [arrow + bucket.summaryLabel, bucket.total, bucket.input, bucket.output],
             header: false, accent: accent)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false

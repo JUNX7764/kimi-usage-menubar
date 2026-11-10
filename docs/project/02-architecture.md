@@ -1,6 +1,6 @@
 # KimiUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-06。
+> 状态：当前架构摘要。最后核对：2026-11-10。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -18,7 +18,7 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当�
 | 模块 | 当前职责 |
 |---|---|
 | `CredStore` | 读取 Kimi 桌面端配置；月度认证续期时合并并原子写回 |
-| `Fetcher` | 查询 5 小时、7 天和月度额度 |
+| `Fetcher` | 查询 5 小时、7 天、月度额度与账号信息；Transport 可注入，401 续期重试支持离线测试 |
 | `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |

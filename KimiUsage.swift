@@ -2341,11 +2341,33 @@ final class PanelHeaderView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// 套餐名标签：中性底色次要文字，过长截断、悬停可读全称。
+/// 套餐名标签：新旧套餐分别显示原名，仅共用视觉等级。
 final class PlanTagView: NSView {
     private let label: NSTextField
+    private let tierColor: NSColor
+
+    static func presentation(for text: String) -> (name: String, color: NSColor) {
+        let hex: UInt32
+        let name = text.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let displayName: String
+        switch name {
+        case "FREE": hex = 0x949BA6; displayName = name
+        case "GO", "ANDANTE": hex = 0x16A6A1; displayName = name
+        case "PLUS", "MODERATO": hex = 0x2887E8; displayName = name
+        case "PRO", "ALLEGRETTO": hex = 0x8B5CF6; displayName = name
+        case "MAX", "ALLEGRO": hex = 0xE2A23A; displayName = name
+        case "ULTRA", "VIVACE": hex = 0xE46B45; displayName = name
+        default: hex = 0x949BA6; displayName = "UNKNOWN"
+        }
+        return (displayName, NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
+                       green: CGFloat((hex >> 8) & 0xff) / 255,
+                       blue: CGFloat(hex & 0xff) / 255, alpha: 1))
+    }
+
     init(text: String) {
-        label = PanelUI.label(text, size: 11, color: .secondaryLabelColor, wrapping: false)
+        let presentation = Self.presentation(for: text)
+        tierColor = presentation.color
+        label = PanelUI.label(presentation.name, size: 11, color: tierColor, wrapping: false)
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -2366,7 +2388,8 @@ final class PlanTagView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+            let dark = self.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            self.layer?.backgroundColor = self.tierColor.withAlphaComponent(dark ? 0.20 : 0.12).cgColor
             self.layer?.cornerRadius = 5
         }
     }
@@ -3983,8 +4006,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.scanCompleted = old.scanCompleted
             } else {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
-                // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
-                if merged.monthError != nil { merged.planName = old.planName }
+                // 失败时保留旧套餐；明确退出登录则清空，避免显示上一账号的标签。
+                if webToken == nil { merged.planName = nil }
+                else if merged.planName == nil && merged.monthError != nil { merged.planName = old.planName }
                 // 账号行：本轮拉到哪个字段用哪个，缺的保留旧值；未拉取（无 web token）整组保留
                 if merged.accountFetched {
                     if merged.accountName == nil { merged.accountName = old.accountName }
@@ -4763,6 +4787,23 @@ enum KimiOfflineRegression {
                 }
             }
 
+            for (name, hex) in [("Free", 0x949BA6), ("Go", 0x16A6A1), ("Andante", 0x16A6A1),
+                                ("Plus", 0x2887E8), ("Moderato", 0x2887E8),
+                                ("Pro", 0x8B5CF6), ("Allegretto", 0x8B5CF6),
+                                ("Max", 0xE2A23A), ("Allegro", 0xE2A23A),
+                                ("Ultra", 0xE46B45), ("Vivace", 0xE46B45),
+                                ("Provisional", 0x949BA6)] {
+                let result = PlanTagView.presentation(for: " \(name.lowercased()) ")
+                try expect(result.name == (name == "Provisional" ? "UNKNOWN" : name.uppercased()),
+                           "incorrect plan name for \(name)")
+                guard let color = result.color.usingColorSpace(.sRGB) else {
+                    try expect(false, "missing plan color for \(name)"); continue
+                }
+                try expect(abs(color.redComponent - CGFloat((hex >> 16) & 0xff) / 255) < 0.001 &&
+                           abs(color.greenComponent - CGFloat((hex >> 8) & 0xff) / 255) < 0.001 &&
+                           abs(color.blueComponent - CGFloat(hex & 0xff) / 255) < 0.001,
+                           "incorrect plan color for \(name)")
+            }
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")
             try expect(absent.sevenDayUsed == nil && absent.sevenDayError != nil, "missing 7D was not rejected")

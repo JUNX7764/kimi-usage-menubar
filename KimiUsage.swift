@@ -2352,11 +2352,11 @@ final class PlanTagView: NSView {
         let displayName: String
         switch name {
         case "FREE": hex = 0x949BA6; displayName = name
-        case "GO", "ANDANTE": hex = 0x16A6A1; displayName = name
-        case "PLUS", "MODERATO": hex = 0x2887E8; displayName = name
-        case "PRO", "ALLEGRETTO": hex = 0x8B5CF6; displayName = name
-        case "MAX", "ALLEGRO": hex = 0xE2A23A; displayName = name
-        case "ULTRA", "VIVACE": hex = 0xE46B45; displayName = name
+        case "GO", "ANDANTE": hex = 0x16A6A1; displayName = name == "ANDANTE" ? "Andante" : name
+        case "PLUS", "MODERATO": hex = 0x2887E8; displayName = name == "MODERATO" ? "Moderato" : name
+        case "PRO", "ALLEGRETTO": hex = 0x8B5CF6; displayName = name == "ALLEGRETTO" ? "Allegretto" : name
+        case "MAX", "ALLEGRO": hex = 0xE2A23A; displayName = name == "ALLEGRO" ? "Allegro" : name
+        case "ULTRA", "VIVACE": hex = 0xE46B45; displayName = name == "VIVACE" ? "Vivace" : name
         default: hex = 0x949BA6; displayName = "UNKNOWN"
         }
         return (displayName, NSColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
@@ -4794,7 +4794,9 @@ enum KimiOfflineRegression {
                                 ("Ultra", 0xE46B45), ("Vivace", 0xE46B45),
                                 ("Provisional", 0x949BA6)] {
                 let result = PlanTagView.presentation(for: " \(name.lowercased()) ")
-                try expect(result.name == (name == "Provisional" ? "UNKNOWN" : name.uppercased()),
+                let legacyNames = ["Andante", "Moderato", "Allegretto", "Allegro", "Vivace"]
+                let expectedName = name == "Provisional" ? "UNKNOWN" : (legacyNames.contains(name) ? name : name.uppercased())
+                try expect(result.name == expectedName,
                            "incorrect plan name for \(name)")
                 guard let color = result.color.usingColorSpace(.sRGB) else {
                     try expect(false, "missing plan color for \(name)"); continue

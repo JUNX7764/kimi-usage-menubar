@@ -107,6 +107,36 @@ enum DataFreshness {
     }
 }
 
+/// 日图覆盖口径：有记录的日期恒为已覆盖；缺键日只有在首轮扫描完成且本轮无失败来源时
+/// 才可证为真实 0，否则缺失占位（数据不足），绝不补零伪装趋势。
+enum DailyCoverage {
+    static func missingDayCovered(scanCompleted: Bool, workError: String?, cliError: String?) -> Bool {
+        scanCompleted && workError == nil && cliError == nil
+    }
+}
+
+/// status.json 写盘去重策略：内容指纹不含心跳时间（lastAttemptAt 每轮都变），
+/// 内容变化立即写入；内容不变时仅按心跳间隔（60s）降频写一次，保留诊断活性。
+struct StatusWritePolicy {
+    var lastWrite: Date?
+    let heartbeatInterval: TimeInterval
+
+    init(heartbeatInterval: TimeInterval = 60) {
+        self.heartbeatInterval = heartbeatInterval
+    }
+
+    /// 只判定本次是否需要写入；必须由调用方在原子写成功后调用 didWrite。
+    /// 写盘失败不推进心跳，下一次渲染仍可补写。
+    func shouldWrite(contentChanged: Bool, now: Date) -> Bool {
+        let heartbeatDue = lastWrite.map { now.timeIntervalSince($0) >= heartbeatInterval } ?? true
+        return contentChanged || heartbeatDue
+    }
+
+    mutating func didWrite(at now: Date) {
+        lastWrite = now
+    }
+}
+
 // MARK: - 凭证读取（与 Kimi 桌面端共用本地配置）
 
 struct Credentials {
@@ -222,6 +252,8 @@ struct UsageData {
     var daily: [String: [Double]] = [:]
     var tools: [TokenAggregator.ToolStats] = []
     var staleTokensInWindow: Double = 0
+    /// 首轮本地扫描是否已完成：完成前缺失日一律视为覆盖未证实（数据不足），不得显示全零/持平
+    var scanCompleted: Bool = false
     var updatedAt: Date = Date()
 }
 
@@ -1001,7 +1033,8 @@ enum TokenAggregator {
     }
 
     static func comparisons(daily: [String: [Double]], staleTokensInWindow: Double,
-                            now: Date = Date(), calendar: Calendar = .current) -> Comparison {
+                            now: Date = Date(), calendar: Calendar = .current,
+                            coverageProven: Bool = true) -> Comparison {
         func key(_ offset: Int) -> String { dayKey(offset, from: now, calendar: calendar) }
         func mmdd(_ key: String) -> String {
             let parts = key.split(separator: "-")
@@ -1018,6 +1051,12 @@ enum TokenAggregator {
             return Comparison(day: .insufficient, week: .insufficient,
                               dayDetail: "部分来源读取失败，覆盖未证实",
                               weekDetail: "部分来源读取失败，覆盖未证实")
+        }
+        if !coverageProven {
+            // 首轮本地扫描完成前，任何缺失日都不可解释为真实 0，比较一律数据不足
+            return Comparison(day: .insufficient, week: .insufficient,
+                              dayDetail: "首次本地扫描未完成，覆盖未证实",
+                              weekDetail: "首次本地扫描未完成，覆盖未证实")
         }
         func value(_ current: Double, _ previous: Double) -> Comparison.Value {
             if current == previous { return .flat }
@@ -1060,6 +1099,18 @@ enum TokenAggregator {
             case .claude: return "Claude Code"
             case .hermes: return "Hermes"
             case .zcode: return "ZCode"
+            }
+        }
+
+        /// 工具占比条按来源固定分色，不随周期或用量排序改变；与 CodexUsage 的多色系方向一致。
+        var shareColor: NSColor {
+            switch self {
+            case .work: return PanelAccent.codex.color
+            case .cli: return PanelAccent.external.color
+            case .proma: return .systemTeal
+            case .claude: return .systemOrange
+            case .hermes: return .systemPurple
+            case .zcode: return .systemGreen
             }
         }
     }
@@ -1151,6 +1202,15 @@ enum ISO {
 // MARK: - 网络请求
 
 enum Fetcher {
+    /// 网络层可注入 transport（与 UpdateChecker 同款语义），默认 URLSession.shared。
+    /// 仅 --self-test 在 App 启动前的单线程测试阶段改写，并在退出前恢复；生产路径不得写入。
+    typealias Transport = (URLRequest, @escaping (Data?, URLResponse?, Error?) -> Void) -> Void
+    static var transport: Transport = { request, completion in
+        URLSession.shared.dataTask(with: request, completionHandler: completion).resume()
+    }
+    /// 仅 --self-test 在 App 启动前注入临时假凭据路径，并在退出前恢复 nil。
+    /// nil = 真实 CredStore.configPath；生产路径不得写入，测试绝不触碰真实配置文件。
+    static var configPathOverride: String?
 
     /// 用 refreshToken 自刷新 web token（GET /api/auth/token/refresh，Bearer 带 refreshToken）。
     /// 服务端每次会轮换 refresh_token，必须把新 token 对写回 config.json，否则刷新链会断。
@@ -1178,7 +1238,7 @@ enum Fetcher {
     }
 
     private static func performRefreshWebToken(completion: @escaping (String?) -> Void) {
-        let path = CredStore.configPath
+        let path = Fetcher.configPathOverride ?? CredStore.configPath
         // Re-read immediately before the request because the official desktop client may rotate tokens.
         guard let expected = CredStore.webTokens(at: path) else { completion(nil); return }
         guard let url = URL(string: "https://www.kimi.com/api/auth/token/refresh") else {
@@ -1190,7 +1250,7 @@ enum Fetcher {
         req.setValue("mac", forHTTPHeaderField: "x-msh-platform")
         req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        transport(req) { data, resp, err in
             guard err == nil, let data = data,
                   let http = resp as? HTTPURLResponse, http.statusCode == 200,
                   let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1207,7 +1267,7 @@ enum Fetcher {
                 NSLog("[KimiUsage] web token refresh write failed: %@", error.localizedDescription)
                 completion(nil)
             }
-        }.resume()
+        }
     }
 
     /// 5 小时 + 7 天窗口：kimi-code 用量接口
@@ -1266,7 +1326,7 @@ enum Fetcher {
         req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        transport(req) { data, resp, err in
             defer { completion(result) }
             // 先看 HTTP 状态码再解析：网关 5xx 返回 HTML 时也能报出真实状态码而非 "bad response"
             if let err = err {
@@ -1286,7 +1346,7 @@ enum Fetcher {
                 return
             }
             result = parseCodeUsagePayload(obj)
-        }.resume()
+        }
     }
 
     /// 本月总额度：Kimi 订阅接口（OMNI 余额）+ 套餐名（与 GLM/Codex 面板标题同款逻辑）
@@ -1320,7 +1380,7 @@ enum Fetcher {
         req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        transport(req) { data, resp, err in
             defer { completion(result) }
             // 先看 HTTP 状态码再解析（与 fetchKimiAccount 同序）：5xx HTML 报真实状态码
             if let err = err {
@@ -1337,7 +1397,7 @@ enum Fetcher {
                 return
             }
             result = parseMonthUsagePayload(obj)
-        }.resume()
+        }
     }
 
     // MARK: 登录账号信息（GET www.kimi.com/api/user，头部账号行）
@@ -1364,7 +1424,7 @@ enum Fetcher {
         req.setValue("3.1.2", forHTTPHeaderField: "x-msh-version")
         req.setValue("KimiUsage-Menubar/1.0", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: req) { data, resp, err in
+        transport(req) { data, resp, err in
             guard err == nil, let data = data,
                   let http = resp as? HTTPURLResponse, http.statusCode == 200,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -1374,7 +1434,38 @@ enum Fetcher {
             }
             let parsed = parseKimiAccountPayload(obj)
             completion(parsed.name, parsed.phone, nil)
-        }.resume()
+        }
+    }
+
+    // MARK: 401 续期 → 重试链（App 与 --once 共用同一套语义）
+
+    /// 月度额度 401 链：拉取失败一次 → 单飞续期 → 原样重试一次，绝不发第三次请求。
+    /// 续期成功后重试仍失败时，原样返回重试结果（含 401），由上层按失败保留旧值。
+    static func fetchMonthUsageWithRetry(webToken: String, completion: @escaping (UsageData) -> Void) {
+        fetchMonthUsage(webToken: webToken) { result in
+            guard let error = result.monthError, error.contains("401") else { completion(result); return }
+            refreshWebToken { newToken in
+                guard let newToken = newToken else {
+                    var failed = UsageData()
+                    failed.monthError = "HTTP 401（自刷新失败，请打开一次 Kimi 桌面端重新登录）"
+                    completion(failed)
+                    return
+                }
+                fetchMonthUsage(webToken: newToken, completion: completion)
+            }
+        }
+    }
+
+    /// 头部账号行 401 链：与月度完全同构——只续期一次、只重试一次。
+    static func fetchKimiAccountWithRetry(webToken: String,
+        completion: @escaping (_ name: String?, _ phone: String?, _ error: String?) -> Void) {
+        fetchKimiAccount(webToken: webToken) { name, phone, error in
+            guard let error = error, error.contains("401") else { completion(name, phone, error); return }
+            refreshWebToken { newToken in
+                guard let newToken = newToken else { completion(nil, nil, error); return }
+                fetchKimiAccount(webToken: newToken, completion: completion)
+            }
+        }
     }
 }
 
@@ -1387,10 +1478,18 @@ enum StackImage {
         let remaining: Int?
     }
 
-    private static func attributed(_ line: Line, font: NSFont) -> NSAttributedString {
+    private static func attributed(_ line: Line, font: NSFont, appearance: NSAppearance? = nil) -> NSAttributedString {
+        // 生产保留动态 labelColor，让每条菜单栏各自解析；显式外观仅用于离线像素测试。
+        // AppKit 对富文本动态墨色的离线解析不稳定，测试路径必须固定到该外观的实际墨色。
+        let labelColor: NSColor
+        if let appearance {
+            labelColor = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? .white : .black
+        } else {
+            labelColor = .labelColor
+        }
         let result = NSMutableAttributedString(string: line.label + " ", attributes: [
             .font: font,
-            .foregroundColor: NSColor.labelColor
+            .foregroundColor: labelColor
         ])
         result.append(NSAttributedString(string: line.value, attributes: [
             .font: font,
@@ -1400,13 +1499,18 @@ enum StackImage {
     }
 
     static func make(line1: Line, line2: Line, appearance: NSAppearance? = nil) -> NSImage {
-        let font = NSFont.monospacedDigitSystemFont(ofSize: 9.0, weight: .semibold)
-        let s1 = attributed(line1, font: font)
-        let s2 = attributed(line2, font: font)
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10.0, weight: .semibold)
+        let s1 = attributed(line1, font: font, appearance: appearance)
+        let s2 = attributed(line2, font: font, appearance: appearance)
         let w = max(ceil(s1.size().width), ceil(s2.size().width)) + 2
+        // 21pt 画布 / 22pt 菜单栏：两行基线按 capHeight + 1.5pt 行距落位。
+        // ⚠️ emoji 高于 capHeight（约 11pt），顶部与画布上缘齐平（与 9pt 时代一致）；
+        // 数字/字母/百分比都在 capHeight 内，无裁切。
+        let baseline2: CGFloat = 1.5
+        let baseline1 = baseline2 + font.capHeight + 1.5
         let draw = {
-            s1.draw(at: NSPoint(x: 1, y: 10.5))
-            s2.draw(at: NSPoint(x: 1, y: 0.5))
+            s1.draw(at: NSPoint(x: 1, y: baseline1))
+            s2.draw(at: NSPoint(x: 1, y: baseline2))
         }
         let img = NSImage(size: NSSize(width: w, height: 21), flipped: false) { _ in
             // 正常时不钉死绘制外观，由系统按每条菜单栏各自解析动态颜色，兼容双屏不同底色。
@@ -1919,6 +2023,7 @@ struct UsagePanelModel {
         var notices: [Notice]
     }
     struct ToolRow {
+        var id: TokenAggregator.ToolID
         var name: String
         var total: String
         var share: Double        // 0...1
@@ -2052,11 +2157,43 @@ private enum PanelUI {
             let color: NSColor
             switch notice.level {
             case .info: color = .secondaryLabelColor
-            case .warning: color = PanelAccent.codex.color
+            // 语义色：warning/数据过期统一橙色，与 RemainingColorTier.orange 同款动态色
+            case .warning: color = RemainingColorTier.orange.color()
             case .error: color = .systemRed
             }
             return label(notice.text, size: 11, color: color)
         }
+    }
+
+    /// 卡片统一头部：图标固定 14pt，标题统一 13pt semibold，尾部依次放入 accessory 视图。
+    /// 四张可见卡片（额度 / 用量情况 / 用量简析 / 工具明细）与重置卡、Tibo 共用，保证头部一致。
+    static func cardHeader(icon: String, iconColor: NSColor = PanelAccent.codex.color, title: String,
+                           trailing: [NSView] = []) -> NSStackView {
+        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        header.addArrangedSubview(PanelUI.symbol(icon, size: 14, color: iconColor))
+        header.addArrangedSubview(PanelUI.label(title, size: 13, weight: .semibold, wrapping: false))
+        header.addArrangedSubview(PanelUI.spacer())
+        for view in trailing { header.addArrangedSubview(view) }
+        return header
+    }
+
+    /// 共享折叠箭头：同一 SF Symbol（chevron.up/down）、同一配置与 secondary 色。
+    /// 曾出现的"浅色下用量情况箭头偏粗偏蓝"实际是首卡片箭头拿到初始第一响应者、
+    /// 被焦点强调染成品牌蓝（已在弹出时清初始焦点修复）；箭头本身仍统一走本工厂。
+    static func disclosureToggle(expanded: Bool, section: String,
+                                 target: AnyObject?, action: Selector?) -> NSButton {
+        let name = expanded ? "chevron.up" : "chevron.down"
+        let image = NSImage(systemSymbolName: name,
+                            accessibilityDescription: expanded ? "折叠\(section)" : "展开\(section)")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+        let toggle = NSButton(image: image ?? NSImage(), target: target, action: action)
+        toggle.isBordered = false
+        toggle.contentTintColor = .secondaryLabelColor
+        toggle.toolTip = expanded ? "折叠" : "展开"
+        toggle.setAccessibilityLabel(expanded ? "折叠\(section)" : "展开\(section)")
+        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
+        return toggle
     }
 }
 
@@ -2248,11 +2385,11 @@ final class QuotaProgressView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.cornerRadius = 3
+        layer?.cornerRadius = 4
         layer?.masksToBounds = true
-        fill.cornerRadius = 3
+        fill.cornerRadius = 4
         layer?.addSublayer(fill)
-        heightAnchor.constraint(equalToConstant: 6).isActive = true
+        heightAnchor.constraint(equalToConstant: 8).isActive = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
@@ -2324,14 +2461,10 @@ final class QuotaSectionView: PanelCardView {
     init(quotas: [UsagePanelModel.Quota], compact: Bool) {
         super.init()
         contentStack.spacing = 6
-        // 卡片头部沿用"重置卡"的图标+标题样式；"重置时间"继续右对齐充当列头。
-        let heading = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        heading.addArrangedSubview(PanelUI.symbol("stopwatch", size: 14, color: PanelAccent.codex.color))
-        heading.addArrangedSubview(PanelUI.label("用量进度", size: 13, weight: .semibold, wrapping: false))
-        heading.addArrangedSubview(PanelUI.spacer())
+        // 卡片头部沿用共享头部工厂（14pt 图标 + 13pt 标题）；"重置时间"继续右对齐充当列头。
         let resetLabel = PanelUI.label("重置时间", size: 10, color: .secondaryLabelColor, wrapping: false)
         resetLabel.alignment = .right
-        heading.addArrangedSubview(resetLabel)
+        let heading = PanelUI.cardHeader(icon: "stopwatch", title: "用量进度", trailing: [resetLabel])
         PanelUI.addFullWidth(heading, to: contentStack)
         for (index, quota) in quotas.enumerated() {
             let view = QuotaWindowView(model: quota, compact: compact)
@@ -2346,27 +2479,27 @@ final class QuotaSectionView: PanelCardView {
 final class ResetCardSectionView: PanelCardView {
     init(model: UsagePanelModel.ResetSection) {
         super.init(padding: 8)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        header.addArrangedSubview(PanelUI.symbol("calendar", size: 15, color: PanelAccent.codex.color))
-        header.addArrangedSubview(PanelUI.label("重置卡", size: 13, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
+        let headerTrailing: [NSView]
         if let count = model.count {
-            header.addArrangedSubview(PanelUI.label("×\(count)", size: 12, weight: .semibold,
-                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true))
+            headerTrailing = [PanelUI.label("×\(count)", size: 12, weight: .semibold,
+                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true)]
         } else if let empty = model.emptyText {
-            header.addArrangedSubview(PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false))
+            headerTrailing = [PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false)]
+        } else {
+            headerTrailing = []
         }
-        contentStack.addArrangedSubview(header)
+        contentStack.addArrangedSubview(PanelUI.cardHeader(icon: "calendar", title: "重置卡", trailing: headerTrailing))
         for (index, rowModel) in model.rows.enumerated() {
             _ = index
             let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-            let color: NSColor = rowModel.warning ? PanelAccent.codex.color : .labelColor
+            // 语义色：过期警告用橙色（与 RemainingColorTier.orange 同款动态色）
+            let color: NSColor = rowModel.warning ? RemainingColorTier.orange.color() : .labelColor
             let name = PanelUI.label((rowModel.warning ? "⚠ " : "") + rowModel.name,
                 size: 12, color: color)
             row.addArrangedSubview(name)
             row.addArrangedSubview(PanelUI.spacer())
             let expires = PanelUI.label(rowModel.expires, size: 11,
-                color: rowModel.warning ? PanelAccent.codex.color : .secondaryLabelColor,
+                color: rowModel.warning ? RemainingColorTier.orange.color() : .secondaryLabelColor,
                 wrapping: false, monospacedDigits: true)
             expires.setContentHuggingPriority(.required, for: .horizontal)
             expires.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -2631,11 +2764,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
         let card = PanelCardView(padding: 8)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        header.addArrangedSubview(PanelUI.symbol("checkmark.circle.fill", size: 16, color: .systemGreen))
-        header.addArrangedSubview(PanelUI.label("Tibo 重置动态", size: 13, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
-        PanelUI.addFullWidth(header, to: card.contentStack)
+        PanelUI.addFullWidth(PanelUI.cardHeader(icon: "checkmark.circle.fill", iconColor: .systemGreen,
+                                                title: "Tibo 重置动态"), to: card.contentStack)
         for row in model.rows {
             let view: NSView
             if let item = row.item {
@@ -2665,7 +2795,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.keyEquivalent = item.keyEquivalent
         button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
-        button.focusRingType = .none
+        // 可见键盘焦点圈：面板内 Tab / Full Keyboard Access 能定位到操作按钮
+        button.focusRingType = .default
         let title = overrideTitle ?? item.title
         let prominent = style == .prominent
         let textColor: NSColor = prominent
@@ -2876,6 +3007,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return abs(clip.bounds.origin.y - targetY) < 1
     }
 
+    /// 键盘预览直接使用 Popover 窗口，不依赖 accessory CLI 是否已产生全局 keyWindow。
+    func keyWindowForPreview() -> NSWindow? {
+        guard let window = contentController.view.window else { return nil }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        return window
+    }
+
     /// 捕捉完整系统窗口，包括原生箭头和阴影。
     func savePreviewImage(to path: String) -> Bool {
         guard let window = contentController.view.window,
@@ -2899,6 +3038,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         solid.opacity = reduceTransparency ? 1 : 0.9
         effect.isHidden = reduceTransparency
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // 弹出时不把初始第一响应者落在首个可聚焦控件上：焦点强调会让该控件染上品牌蓝。
+        // Tab / Full Keyboard Access 导航不依赖初始第一响应者，键盘可达性不受影响。
+        contentController.view.window?.makeFirstResponder(nil)
         if isOpen { installMonitors() }
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -3077,18 +3219,10 @@ private final class TokenSectionView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 3)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        header.addArrangedSubview(PanelUI.symbol(model.accent.symbol, size: 14, color: model.accent.color))
-        header.addArrangedSubview(PanelUI.label(model.title, size: 12, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
-        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down", accessibilityDescription: expanded ? "折叠用量" : "展开用量") ?? NSImage(), target: target, action: action)
-        toggle.isBordered = false
-        toggle.contentTintColor = .secondaryLabelColor
-        toggle.toolTip = expanded ? "折叠" : "展开"
-        toggle.setAccessibilityLabel(expanded ? "折叠\(model.title)" : "展开\(model.title)")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        header.addArrangedSubview(toggle)
+        let toggle = PanelUI.disclosureToggle(expanded: expanded, section: model.title,
+                                              target: target, action: action)
+        let header = PanelUI.cardHeader(icon: model.accent.symbol, iconColor: model.accent.color,
+                                        title: model.title, trailing: [toggle])
         PanelUI.addFullWidth(header, to: root)
         if expanded {
             let tableHeader = TokenDetailRow(values: ["周期", "总量", "输入", "输出"], header: true, accent: model.accent)
@@ -3257,20 +3391,9 @@ private final class DailyBriefSectionView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 6)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        header.addArrangedSubview(PanelUI.symbol("chart.bar.fill", size: 14, color: PanelAccent.codex.color))
-        header.addArrangedSubview(PanelUI.label("用量简析", size: 12, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
-        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
-            accessibilityDescription: expanded ? "折叠用量简析" : "展开用量简析") ?? NSImage(),
-            target: target, action: action)
-        toggle.isBordered = false
-        toggle.contentTintColor = .secondaryLabelColor
-        toggle.toolTip = expanded ? "折叠" : "展开"
-        toggle.setAccessibilityLabel(expanded ? "折叠用量简析" : "展开用量简析")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        header.addArrangedSubview(toggle)
+        let toggle = PanelUI.disclosureToggle(expanded: expanded, section: "用量简析",
+                                              target: target, action: action)
+        let header = PanelUI.cardHeader(icon: "chart.bar.fill", title: "用量简析", trailing: [toggle])
         PanelUI.addFullWidth(header, to: root)
 
         if expanded {
@@ -3425,10 +3548,6 @@ private final class ToolBreakdownView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 5)
-        let header = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        header.addArrangedSubview(PanelUI.symbol("list.bullet", size: 14, color: PanelAccent.codex.color))
-        header.addArrangedSubview(PanelUI.label("工具明细", size: 12, weight: .semibold, wrapping: false))
-        header.addArrangedSubview(PanelUI.spacer())
         let periodNames = ["今日", "7 天", "30 天"]
         let periods = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 2)
         for (index, name) in periodNames.enumerated() {
@@ -3440,17 +3559,10 @@ private final class ToolBreakdownView: NSView {
             button.setAccessibilityLabel("工具明细周期：\(name)")
             periods.addArrangedSubview(button)
         }
-        header.addArrangedSubview(periods)
-        let toggle = NSButton(image: NSImage(systemSymbolName: expanded ? "chevron.up" : "chevron.down",
-            accessibilityDescription: expanded ? "折叠工具明细" : "展开工具明细") ?? NSImage(),
-            target: target, action: toggleAction)
-        toggle.isBordered = false
-        toggle.contentTintColor = .secondaryLabelColor
-        toggle.toolTip = expanded ? "折叠" : "展开"
-        toggle.setAccessibilityLabel(expanded ? "折叠工具明细" : "展开工具明细")
-        toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        header.addArrangedSubview(toggle)
+        let toggle = PanelUI.disclosureToggle(expanded: expanded, section: "工具明细",
+                                              target: target, action: toggleAction)
+        let header = PanelUI.cardHeader(icon: "list.bullet", title: "工具明细",
+                                        trailing: [periods, toggle])
         PanelUI.addFullWidth(header, to: root)
         if expanded {
             let rows = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : []
@@ -3470,7 +3582,7 @@ private final class ToolBreakdownView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// 紧凑周期按钮：选中深蓝实底白字，未选中浅蓝底蓝字（Codex 同款语义、Kimi 深蓝）。
+/// 紧凑周期按钮：选中浅色系深蓝底白字、深色系浅蓝底深色字（Codex 同款语义、Kimi 深蓝）。
 private final class ToolPeriodButton: NSButton {
     var selected = false { didSet { refreshStyle() } }
 
@@ -3487,8 +3599,16 @@ private final class ToolPeriodButton: NSButton {
             .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: NSColor.labelColor])
         heightAnchor.constraint(equalToConstant: 18).isActive = true
         widthAnchor.constraint(greaterThanOrEqualToConstant: 34).isActive = true
+        // 初始化即刷新：未选中按钮原本没有背景色（didSet 在 false→false 时不触发），
+        // 这里统一补上 0.14 浅蓝底，与选中后取消的样式一致
+        refreshStyle()
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 选中状态同步暴露给辅助技术（VoiceOver 读出 已选中/未选中）
+    private func syncAccessibilitySelection() {
+        setAccessibilityValue(selected ? "已选中" : "未选中")
+    }
 
     private func refreshStyle() {
         let title = attributedTitle.string
@@ -3502,9 +3622,14 @@ private final class ToolPeriodButton: NSButton {
         }
         attributedTitle = NSAttributedString(string: title, attributes: [
             .font: NSFont.systemFont(ofSize: 10, weight: .medium), .foregroundColor: textColor])
-        layer?.backgroundColor = (isSelected
-            ? PanelAccent.codex.color
-            : PanelAccent.codex.color.withAlphaComponent(0.14)).cgColor
+        // 动态 NSColor 转 CGColor 必须在 effectiveAppearance 下解析，
+        // 否则外观切换时会拿到错误外观的底色
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = (isSelected
+                ? PanelAccent.codex.color
+                : PanelAccent.codex.color.withAlphaComponent(0.14)).cgColor
+        }
+        syncAccessibilitySelection()
         needsDisplay = true
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -3516,10 +3641,12 @@ private final class ToolPeriodButton: NSButton {
 /// 细占比条：分母为同周期同一快照的合并总量。
 private final class ShareBarView: NSView {
     private let fill = CALayer()
+    private let color: NSColor
     var ratio: CGFloat = 0 { didSet { needsLayout = true } }
 
-    init(ratio: CGFloat) {
+    init(ratio: CGFloat, color: NSColor) {
         self.ratio = ratio
+        self.color = color
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
@@ -3535,7 +3662,7 @@ private final class ShareBarView: NSView {
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             self.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.12).cgColor
-            self.fill.backgroundColor = PanelAccent.codex.color.withAlphaComponent(0.8).cgColor
+            self.fill.backgroundColor = self.color.withAlphaComponent(0.8).cgColor
         }
     }
     override func layout() {
@@ -3562,9 +3689,11 @@ private final class ToolRowView: NSView {
         let name = PanelUI.label(row.name, size: 11, weight: .medium, wrapping: false)
         name.lineBreakMode = .byTruncatingTail
         name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // 名称截断时悬停可读全称（行级详情 tooltip 保留在整行上）
+        name.toolTip = row.name
         main.addArrangedSubview(name)
         main.addArrangedSubview(PanelUI.spacer())
-        let bar = ShareBarView(ratio: CGFloat(row.share))
+        let bar = ShareBarView(ratio: CGFloat(row.share), color: row.id.shareColor)
         main.addArrangedSubview(bar)
         let shareLabel = PanelUI.label(row.shareText, size: 10, color: .secondaryLabelColor,
             wrapping: false, monospacedDigits: true)
@@ -3648,8 +3777,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var appearancePollTimer: Timer?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
-    // status.json 内容快照：内容未变时跳过磁盘写与日志（渲染每 10s 一次，多为重复内容）
-    private var lastStatusPayload: String?
+    // status.json 内容指纹（剔除心跳时间）与心跳写盘策略：内容未变时跳过磁盘写与日志，
+    // 仅按 60s 心跳降频写一次（渲染每 10s 一次，稳定状态多为重复内容）
+    private var lastStatusContentPayload: String?
+    private var statusWritePolicy = StatusWritePolicy(heartbeatInterval: 60)
     // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
     // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
     // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
@@ -3707,35 +3838,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         performRefresh(includeSlow: includeSlow)
     }
 
-    // 本轮所有来源都汇合到一份结果；锁保护并发网络回调，group.leave 前先解锁。
+    // 本轮所有来源都汇合到一份结果；merged 的每个字段（主线程直写与网络回调）
+    // 都在同一把 mergeLock 下写，group.leave 前先解锁。
     private func performRefresh(includeSlow: Bool) {
         lastAttemptAt = Date()
         if includeSlow { lastSlowAttemptAt = lastAttemptAt }
         updateUI()
-        let cred = CredStore.load()
+        let cred = CredStore.load()   // 每轮只读一次凭据快照；月度与账号共用
         var merged = UsageData()
         let group = DispatchGroup()
         let quotaGroup = DispatchGroup()
         let mergeLock = NSLock()
+        func mutateMerged(_ body: (inout UsageData) -> Void) {
+            mergeLock.lock(); body(&merged); mergeLock.unlock()
+        }
 
         if let key = cred.codeApiKey, !key.isEmpty {
             group.enter()
             quotaGroup.enter()
             Fetcher.fetchCodeUsage(apiKey: key) { r in
-                mergeLock.lock()
-                merged.fiveHourUsed = r.fiveHourUsed
-                merged.fiveHourReset = r.fiveHourReset
-                merged.sevenDayUsed = r.sevenDayUsed
-                merged.sevenDayReset = r.sevenDayReset
-                merged.fiveHourError = r.fiveHourError
-                merged.sevenDayError = r.sevenDayError
-                mergeLock.unlock()
+                mutateMerged {
+                    $0.fiveHourUsed = r.fiveHourUsed
+                    $0.fiveHourReset = r.fiveHourReset
+                    $0.sevenDayUsed = r.sevenDayUsed
+                    $0.sevenDayReset = r.sevenDayReset
+                    $0.fiveHourError = r.fiveHourError
+                    $0.sevenDayError = r.sevenDayError
+                }
                 quotaGroup.leave()
                 group.leave()
             }
         } else {
-            merged.fiveHourError = "no api key"
-            merged.sevenDayError = "no api key"
+            mutateMerged {
+                $0.fiveHourError = "未找到 Kimi Code API Key，请打开并登录 Kimi 桌面端"
+                $0.sevenDayError = $0.fiveHourError
+            }
         }
 
         // 额度先展示，不等待月度接口或本地扫描。
@@ -3751,70 +3888,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.updateUI()
         }
 
-        if includeSlow, let token = CredStore.load().webToken, !token.isEmpty {
+        // 月度与账号共用本轮凭据快照；401 续期在 refreshWebToken 内部重新读取最新配置，安全逻辑不变
+        let webToken = cred.webToken.flatMap { $0.isEmpty ? nil : $0 }
+        if includeSlow, let token = webToken {
             group.enter()
-            Fetcher.fetchMonthUsage(webToken: token) { r in
-                if let err = r.monthError, err.contains("401") {
-                    Fetcher.refreshWebToken { newToken in
-                        if let newToken = newToken {
-                            Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
-                                mergeLock.lock()
-                                merged.monthUsed = r2.monthUsed
-                                merged.monthReset = r2.monthReset
-                                merged.planName = r2.planName
-                                merged.monthError = r2.monthError
-                                mergeLock.unlock()
-                                group.leave()
-                            }
-                        } else {
-                            mergeLock.lock()
-                            merged.monthError = "HTTP 401（自刷新失败，请打开一次 Kimi 桌面端重新登录）"
-                            mergeLock.unlock()
-                            group.leave()
-                        }
-                    }
-                } else {
-                    mergeLock.lock()
-                    merged.monthUsed = r.monthUsed
-                    merged.monthReset = r.monthReset
-                    merged.planName = r.planName
-                    merged.monthError = r.monthError
-                    mergeLock.unlock()
-                    group.leave()
+            Fetcher.fetchMonthUsageWithRetry(webToken: token) { r in
+                mutateMerged {
+                    $0.monthUsed = r.monthUsed
+                    $0.monthReset = r.monthReset
+                    $0.planName = r.planName
+                    $0.monthError = r.monthError
                 }
+                group.leave()
             }
         } else if includeSlow {
-            merged.monthError = "no web token"
-            // 桌面端已登出：显式清空账号行，不再保留旧昵称/手机号
-            // （空串经头部 clean 后等价 nil，同时绕过"缺字段保留旧值"的合并）
-            merged.accountFetched = true
-            merged.accountName = ""
-            merged.accountPhone = ""
+            mutateMerged {
+                $0.monthError = "未检测到 Kimi 网页登录态，请打开并登录 Kimi 桌面端"
+                // 桌面端已登出：显式清空账号行，不再保留旧昵称/手机号
+                // （空串经头部 clean 后等价 nil，同时绕过"缺字段保留旧值"的合并）
+                $0.accountFetched = true
+                $0.accountName = ""
+                $0.accountPhone = ""
+            }
         }
 
         // 头部账号行（CodexUsage 头部同款）：昵称 + 服务端打码手机号；401 走与月度相同的 refresh→重试链
-        if includeSlow, let token = CredStore.load().webToken, !token.isEmpty {
-            merged.accountFetched = true
+        if includeSlow, let token = webToken {
+            mutateMerged { $0.accountFetched = true }
             group.enter()
-            func applyAccount(_ name: String?, _ phone: String?) {
-                mergeLock.lock()
-                merged.accountName = name
-                merged.accountPhone = phone
-                mergeLock.unlock()
-                group.leave()
-            }
-            Fetcher.fetchKimiAccount(webToken: token) { name, phone, err in
-                if let err = err, err.contains("401") {
-                    Fetcher.refreshWebToken { newToken in
-                        if let newToken = newToken {
-                            Fetcher.fetchKimiAccount(webToken: newToken) { n2, p2, _ in applyAccount(n2, p2) }
-                        } else {
-                            group.leave()   // 续期失败：本轮不改写，保留旧值
-                        }
-                    }
-                } else {
-                    applyAccount(name, phone)
+            Fetcher.fetchKimiAccountWithRetry(webToken: token) { name, phone, _ in
+                mutateMerged {
+                    $0.accountName = name
+                    $0.accountPhone = phone
                 }
+                group.leave()
             }
         }
 
@@ -3822,16 +3929,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.enter()
             DispatchQueue.global(qos: .utility).async {
                 let d = TokenAggregator.aggregateBothDetailed()
-                mergeLock.lock()
-                merged.tokensToday = d.work.0; merged.tokens7d = d.work.1; merged.tokens30d = d.work.2
-                merged.cliTokensToday = d.cli.0; merged.cliTokens7d = d.cli.1; merged.cliTokens30d = d.cli.2
-                merged.workTokensError = d.workError
-                merged.cliTokensError = d.cliError
-                merged.mergedTokens = d.merged
-                merged.daily = d.daily
-                merged.tools = d.tools
-                merged.staleTokensInWindow = TokenAggregator.staleTokensInWindow(tools: d.tools)
-                mergeLock.unlock()
+                mutateMerged {
+                    $0.tokensToday = d.work.0; $0.tokens7d = d.work.1; $0.tokens30d = d.work.2
+                    $0.cliTokensToday = d.cli.0; $0.cliTokens7d = d.cli.1; $0.cliTokens30d = d.cli.2
+                    $0.workTokensError = d.workError
+                    $0.cliTokensError = d.cliError
+                    $0.mergedTokens = d.merged
+                    $0.daily = d.daily
+                    $0.tools = d.tools
+                    $0.staleTokensInWindow = TokenAggregator.staleTokensInWindow(tools: d.tools)
+                    // 首轮扫描跑完即置真：此后缺键日按覆盖规则解释为真实零（数据不足态结束）
+                    $0.scanCompleted = true
+                }
                 group.leave()
             }
         }
@@ -3839,21 +3948,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         group.notify(queue: .main) { [weak self] in
             guard let self = self else { return }
             let completedAt = Date()
+            mergeLock.lock()
+            let mergedSnapshot = merged
+            mergeLock.unlock()
             self.lastFiveHourSuccessAt = DataFreshness.updated(self.lastFiveHourSuccessAt,
-                succeeded: merged.fiveHourUsed != nil, at: completedAt)
+                succeeded: mergedSnapshot.fiveHourUsed != nil, at: completedAt)
             self.lastSevenDaySuccessAt = DataFreshness.updated(self.lastSevenDaySuccessAt,
-                succeeded: merged.sevenDayUsed != nil, at: completedAt)
+                succeeded: mergedSnapshot.sevenDayUsed != nil, at: completedAt)
             if includeSlow {
                 self.lastMonthSuccessAt = DataFreshness.updated(self.lastMonthSuccessAt,
-                    succeeded: merged.monthError == nil && merged.monthUsed != nil, at: completedAt)
+                    succeeded: mergedSnapshot.monthError == nil && mergedSnapshot.monthUsed != nil, at: completedAt)
                 // 扫描失败面：已安装来源全部不可读时不推进成功时间，30 分钟后 ⚠️ 自动亮起
                 self.workTokensLastSuccessAt = DataFreshness.updated(self.workTokensLastSuccessAt,
-                    succeeded: merged.workTokensError == nil, at: completedAt)
+                    succeeded: mergedSnapshot.workTokensError == nil, at: completedAt)
                 self.cliTokensLastSuccessAt = DataFreshness.updated(self.cliTokensLastSuccessAt,
-                    succeeded: merged.cliTokensError == nil, at: completedAt)
+                    succeeded: mergedSnapshot.cliTokensError == nil, at: completedAt)
             }
 
+            var merged = mergedSnapshot
             let old = self.usage
+            mergeLock.lock()
             if merged.fiveHourUsed == nil { merged.fiveHourUsed = old.fiveHourUsed; merged.fiveHourReset = old.fiveHourReset }
             if merged.sevenDayUsed == nil { merged.sevenDayUsed = old.sevenDayUsed; merged.sevenDayReset = old.sevenDayReset }
             if !includeSlow {
@@ -3865,6 +3979,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
                 merged.mergedTokens = old.mergedTokens; merged.daily = old.daily
                 merged.tools = old.tools; merged.staleTokensInWindow = old.staleTokensInWindow
+                // 快轮不触发扫描：首轮完成状态沿旧值保留，扫描完成后不会退回未知态
+                merged.scanCompleted = old.scanCompleted
             } else {
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 套餐名随月度接口走：本轮拉取失败（含未订阅报错）保留旧值，避免标题闪空
@@ -3879,6 +3995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 即使部分来源失败，也显示健康来源的新贡献和失败来源的缓存。
 
             }
+            mergeLock.unlock()
             self.usage = merged
             self.updateUI()
             if self.refreshGate.finish() { self.performRefresh(includeSlow: true) }
@@ -3982,6 +4099,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.button?.toolTip = (statusItem.button?.toolTip ?? "")
                 + " · \(UpdateProgressController.shared.statusLine)"
         }
+        // VoiceOver 读出两组额度剩余与过期状态；toolTip 不是 accessibility label，必须显式设置
+        var spokenParts = ["Kimi 用量",
+                           "5 小时剩余 \(Fmt.pct(remaining(usage.fiveHourUsed)))",
+                           "7 天剩余 \(Fmt.pct(remaining(usage.sevenDayUsed)))"]
+        if fiveHourStale { spokenParts.append("5 小时额度数据已过期") }
+        if sevenDayStale { spokenParts.append("7 天额度数据已过期") }
+        if UpdateProgressController.shared.isActive { spokenParts.append(UpdateProgressController.shared.statusLine) }
+        statusItem.button?.setAccessibilityLabel(spokenParts.joined(separator: "，"))
         if !visualPreview { writeStatus(line1: "\(line1.label) \(line1.value)", line2: "\(line2.label) \(line2.value)") }
     }
 
@@ -4045,12 +4170,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             info["windowVisible"] = false
         }
         if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
-            let payload = String(data: data, encoding: .utf8) ?? ""
-            if payload != lastStatusPayload {
-                // 0600 原子写：status.json 含账号昵称/打码手机号等 PII，避免 0644 可被其他本地用户读取与半写状态
-                try? AtomicJSONFile.replace(data, at: dir + "/status.json", mode: 0o600)
-                NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
-                lastStatusPayload = payload
+            // 内容指纹剔除 lastAttemptAt（每轮都变的心跳时间），稳定状态才能真正命中去重；
+            // 内容不变时按 StatusWritePolicy 的心跳间隔降频写盘，保留诊断活性。
+            var contentInfo = info
+            contentInfo["lastAttemptAt"] = nil
+            let contentPayload = (try? JSONSerialization.data(withJSONObject: contentInfo, options: [.prettyPrinted, .sortedKeys]))
+                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let contentChanged = contentPayload != lastStatusContentPayload
+            let now = Date()
+            if statusWritePolicy.shouldWrite(contentChanged: contentChanged, now: now) {
+                do {
+                    // 0600 原子写：status.json 含账号昵称/打码手机号等 PII，避免 0644 可被其他本地用户读取与半写状态
+                    try AtomicJSONFile.replace(data, at: dir + "/status.json", mode: 0o600)
+                    // 只有写盘成功才推进心跳与内容指纹；失败时下轮仍会补写。
+                    statusWritePolicy.didWrite(at: now)
+                    if contentChanged {
+                        NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
+                        lastStatusContentPayload = contentPayload
+                    } else {
+                        NSLog("[KimiUsage] status heartbeat written")
+                    }
+                } catch {
+                    NSLog("[KimiUsage] status write failed: %@", error.localizedDescription)
+                }
             }
         }
     }
@@ -4089,8 +4231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
         // v1.5 用量洞察：用量情况（合并 Work + API 客户端）+ 用量简析 + 工具明细，同一扫描快照
-        let coverageOK = usage.workTokensError == nil && usage.cliTokensError == nil
-        let comparison = TokenAggregator.comparisons(daily: usage.daily, staleTokensInWindow: usage.staleTokensInWindow)
+        // 覆盖口径：首轮扫描未完成时一切缺失日都不可证实，日图显示缺口、比较显示数据不足
+        let coverageOK = DailyCoverage.missingDayCovered(scanCompleted: usage.scanCompleted,
+                                                         workError: usage.workTokensError,
+                                                         cliError: usage.cliTokensError)
+        let comparison = TokenAggregator.comparisons(daily: usage.daily,
+                                                     staleTokensInWindow: usage.staleTokensInWindow,
+                                                     coverageProven: coverageOK)
         func briefDay(_ offset: Int) -> UsagePanelModel.BriefDay {
             let key = TokenAggregator.dayKey(offset, from: Date())
             let parts = key.split(separator: "-")
@@ -4161,7 +4308,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 let sharePct = Int((share * 100).rounded())
                 let detail = "\(status) · 输入 \(Fmt.tokens(stat.input)) · 输出 \(Fmt.tokens(stat.output)) · 占比 \(sharePct)%"
-                return UsagePanelModel.ToolRow(name: tool.id.displayName, total: Fmt.tokens(stat.total),
+                return UsagePanelModel.ToolRow(id: tool.id, name: tool.id.displayName, total: Fmt.tokens(stat.total),
                     share: share, shareText: "\(sharePct)%", status: status, detail: detail)
             }
         }
@@ -4230,8 +4377,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         usage.cliTokens7d = previewStat(61000000, 890000, [45000000, 700000], [16000000, 190000])
         usage.cliTokens30d = previewStat(440000000, 2100000, [320000000, 1500000], [120000000, 600000])
         if args.contains("--visual-preview-empty") {
-            usage = UsageData()
+            usage = UsageData()   // scanCompleted 保持 false：首轮扫描未知态（缺口 + 数据不足）
         } else {
+            // 健康预览的合成扫描快照视为首轮已完成：缺键日按真实零显示，比较条出百分比
+            usage.scanCompleted = true
             // v1.5 用量洞察预览：合并窗口 + 近 30 天日序列 + 逐工具贡献（与评审原型演示数据同款）
             let workPattern: [Double] = [0.9, 1.1, 1.2, 1.0, 1.4, 1.3, 1.1, 1.5, 1.2, 1.4, 1.0, 1.6, 1.2,
                                          1.3, 1.5, 1.1, 1.2, 1.4, 1.3, 1.6, 1.1, 1.2, 1.4, 1.1, 1.6, 1.0,
@@ -4378,14 +4527,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func runPreviewKeyTest(button: NSStatusBarButton) {
         func fail(_ message: String) { fputs("KimiUsage key event test: FAIL: \(message)\n", stderr); exit(1) }
         func send(_ character: String, _ keyCode: UInt16) {
-            guard let window = NSApp.keyWindow,
+            guard let window = panelController.keyWindowForPreview(),
                   let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .command,
                       timestamp: 0, windowNumber: window.windowNumber, context: nil,
                       characters: character, charactersIgnoringModifiers: character,
                       isARepeat: false, keyCode: keyCode) else { fail("cannot create event"); return }
             NSApp.sendEvent(event)
         }
-        guard let keyWindow = NSApp.keyWindow,
+        guard let keyWindow = panelController.keyWindowForPreview(),
               let escape = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
                   windowNumber: keyWindow.windowNumber, context: nil, characters: "\u{1b}",
                   charactersIgnoringModifiers: "\u{1b}", isARepeat: false, keyCode: 53) else { return fail("escape event") }
@@ -4562,6 +4711,58 @@ enum KimiOfflineRegression {
             try expect(neutralInkCount(darkImage, white: true) > 0,
                        "dark appearance override did not draw light menu bar text")
 
+            // 10pt semibold 两行渲染：⚠️ 5H + 100% 等宽内容在浅色/深色都能渲染、宽度合理、无裁切
+            func inkProfile(_ image: NSImage) -> (count: Int, top: Int, bottom: Int,
+                                                   dark: Int, light: Int, labelDark: Int, labelLight: Int)? {
+                guard let data = image.tiffRepresentation,
+                      let bitmap = NSBitmapImageRep(data: data) else { return nil }
+                var count = 0, top = 0, bottom = 0, dark = 0, light = 0, labelDark = 0, labelLight = 0
+                for y in 0..<bitmap.pixelsHigh {
+                    for x in 0..<bitmap.pixelsWide {
+                        guard let c = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB),
+                              c.alphaComponent > 0.8 else { continue }
+                        count += 1
+                        if y <= 2 { top += 1 }                        // 上行（含 ⚠️）渲染到画布顶部
+                        if y >= bitmap.pixelsHigh - 6 { bottom += 1 } // 下行落在画布下三分之一，未缺失
+                        let brightness = (c.redComponent + c.greenComponent + c.blueComponent) / 3
+                        if brightness < 0.25 { dark += 1 }
+                        if brightness > 0.85 { light += 1 }
+                        // 左下区域的 7D 标签独立于右侧绿色数字，避免彩色数值掩盖标签墨色回归。
+                        if x < 15 && y >= bitmap.pixelsHigh / 2 {
+                            if brightness < 0.25 { labelDark += 1 }
+                            if brightness > 0.85 { labelLight += 1 }
+                        }
+                    }
+                }
+                return (count, top, bottom, dark, light, labelDark, labelLight)
+            }
+            let warnLine = StackImage.Line(label: "⚠️ 5H", value: "100%", remaining: 100)
+            let plainLine = StackImage.Line(label: "7D", value: "100%", remaining: 100)
+            for name in [NSAppearance.Name.aqua, .darkAqua] {
+                let appearance = NSAppearance(named: name)!
+                let warnImage = StackImage.make(line1: warnLine, line2: plainLine, appearance: appearance)
+                let narrowImage = StackImage.make(line1: plainLine, line2: plainLine, appearance: appearance)
+                try expect(abs(warnImage.size.height - 21) < 0.01,
+                           "menu bar canvas height changed from 21pt for \(name.rawValue)")
+                try expect(warnImage.size.width >= 60 && warnImage.size.width <= 120,
+                           "⚠️ 5H + 100% menu bar width unreasonable: \(warnImage.size.width)")
+                try expect(narrowImage.size.width < warnImage.size.width,
+                           "⚠️ prefix did not widen the menu bar image for \(name.rawValue)")
+                guard let profile = inkProfile(warnImage) else {
+                    try expect(false, "menu bar render produced no bitmap for \(name.rawValue)"); continue
+                }
+                try expect(profile.count > 100, "menu bar text did not render ink for \(name.rawValue)")
+                try expect(profile.top > 0, "top line (⚠️) was clipped away for \(name.rawValue)")
+                try expect(profile.bottom > 0, "bottom line was bottom-clipped for \(name.rawValue)")
+                if name == .aqua {
+                    try expect(profile.dark > 20 && profile.labelDark > 0,
+                               "light appearance did not draw dark menu bar labels")
+                } else {
+                    try expect(profile.light > 20 && profile.labelLight > 0,
+                               "dark appearance did not draw light menu bar labels")
+                }
+            }
+
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")
             try expect(absent.sevenDayUsed == nil && absent.sevenDayError != nil, "missing 7D was not rejected")
@@ -4612,6 +4813,117 @@ enum KimiOfflineRegression {
             try expect(Fetcher.parseKimiAccountPayload([:]).name == nil
                        && Fetcher.parseKimiAccountPayload([:]).phone == nil,
                        "missing kimi account fields were fabricated")
+
+            // Fetcher 网络层 transport 注入 + refresh 单飞 + 401 只续期重试一次（全部假 token + 临时目录）
+            let fetchAuthPath = root.appendingPathComponent("fetch-config.json").path
+            func fetchDocument(_ access: String, _ refresh: String) throws {
+                let doc: [String: Any] = [
+                    "credentials": ["kimiWeb": ["accessToken": access, "refreshToken": refresh],
+                                    "kimiCode": ["apiKey": "fake-api-key"]]]
+                try JSONSerialization.data(withJSONObject: doc)
+                    .write(to: URL(fileURLWithPath: fetchAuthPath))
+            }
+            try fetchDocument("fake-access", "fake-refresh")
+            let originalTransport = Fetcher.transport
+            let originalConfigPath = Fetcher.configPathOverride
+            defer {
+                Fetcher.transport = originalTransport
+                Fetcher.configPathOverride = originalConfigPath
+            }
+            Fetcher.configPathOverride = fetchAuthPath
+            let refreshURL = URL(string: "https://www.kimi.com/api/auth/token/refresh")!
+            func httpResponse(_ url: URL, _ status: Int) -> HTTPURLResponse {
+                HTTPURLResponse(url: url, statusCode: status, httpVersion: nil, headerFields: nil)!
+            }
+            let rotatedBody = Data("{\"access_token\":\"rotated-access\",\"refresh_token\":\"rotated-refresh\"}".utf8)
+
+            // A) 并发 refreshWebToken 单飞：只发一次真实（模拟）请求，所有 waiter 拿到同一 token
+            var refreshRequests = 0
+            var refreshReplies: [(Data?, URLResponse?, Error?) -> Void] = []
+            Fetcher.transport = { request, completion in
+                if request.url == refreshURL {
+                    refreshRequests += 1
+                    refreshReplies.append(completion)
+                } else {
+                    completion(nil, nil, NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet))
+                }
+            }
+            let refreshGroup = DispatchGroup()
+            var waiterTokens: [String?] = []
+            for _ in 0..<3 {
+                refreshGroup.enter()
+                Fetcher.refreshWebToken { token in
+                    waiterTokens.append(token)
+                    refreshGroup.leave()
+                }
+            }
+            try expect(refreshRequests == 1 && refreshReplies.count == 1,
+                       "concurrent refreshWebToken started extra requests")
+            refreshReplies.removeFirst()(rotatedBody, httpResponse(refreshURL, 200), nil)
+            try expect(refreshGroup.wait(timeout: .now() + 5) == .success, "refresh waiters were not all fulfilled")
+            try expect(waiterTokens.count == 3 && waiterTokens.allSatisfy { $0 == "rotated-access" },
+                       "refresh waiters did not all receive the same token")
+            try expect(refreshRequests == 1, "refresh single-flight issued a follow-up request")
+            let rotatedDoc = try JSONSerialization.jsonObject(
+                with: Data(contentsOf: URL(fileURLWithPath: fetchAuthPath))) as! [String: Any]
+            let rotatedWeb = (rotatedDoc["credentials"] as! [String: Any])["kimiWeb"] as! [String: Any]
+            try expect(rotatedWeb["accessToken"] as? String == "rotated-access"
+                       && rotatedWeb["refreshToken"] as? String == "rotated-refresh",
+                       "refresh did not persist the rotated token pair")
+            let rotatedFile = try Data(contentsOf: URL(fileURLWithPath: fetchAuthPath))
+
+            // B) refresh 返回 200 但缺 access_token：回调 nil 且配置文件不被改写
+            Fetcher.transport = { request, completion in
+                completion(Data("{}".utf8), httpResponse(request.url!, 200), nil)
+            }
+            var missingCalled = false
+            var missingToken: String? = "sentinel"
+            Fetcher.refreshWebToken { token in
+                missingCalled = true
+                missingToken = token
+            }
+            try expect(missingCalled && missingToken == nil,
+                       "200 without access_token produced a token or never completed")
+            let afterMissing = try Data(contentsOf: URL(fileURLWithPath: fetchAuthPath))
+            try expect(afterMissing == rotatedFile, "refresh without access_token modified the config")
+
+            // C) 月度/账号 401：只续期一次、只重试一次，绝不第三次请求（不会无限循环）
+            var monthRequests = 0
+            Fetcher.transport = { request, completion in
+                let url = request.url!
+                if url.absoluteString.contains("GetSubscription") {
+                    monthRequests += 1
+                    completion(Data("{}".utf8), httpResponse(url, 401), nil)
+                } else if url == refreshURL {
+                    completion(rotatedBody, httpResponse(url, 200), nil)
+                } else {
+                    completion(nil, nil, NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet))
+                }
+            }
+            var monthCompleted: UsageData?
+            Fetcher.fetchMonthUsageWithRetry(webToken: "fake-web-token") { monthCompleted = $0 }
+            try expect(monthCompleted != nil, "month 401 retry chain did not complete")
+            try expect(monthRequests == 2, "month 401 did not retry exactly once (possible infinite loop)")
+            try expect(monthCompleted?.monthError?.contains("401") == true,
+                       "month retry 401 outcome was lost")
+            var accountRequests = 0
+            Fetcher.transport = { request, completion in
+                let url = request.url!
+                if url.absoluteString.hasPrefix("https://www.kimi.com/api/user") {
+                    accountRequests += 1
+                    completion(nil, httpResponse(url, 401), nil)
+                } else if url == refreshURL {
+                    completion(rotatedBody, httpResponse(url, 200), nil)
+                } else {
+                    completion(nil, nil, NSError(domain: NSURLErrorDomain, code: NSURLErrorNotConnectedToInternet))
+                }
+            }
+            var accountCompleted = false
+            Fetcher.fetchKimiAccountWithRetry(webToken: "fake-web-token") { _, _, _ in accountCompleted = true }
+            try expect(accountCompleted && accountRequests == 2,
+                       "account 401 did not renew-and-retry exactly once")
+            Fetcher.transport = originalTransport
+            Fetcher.configPathOverride = originalConfigPath
 
             // 扫描失败面：已安装来源全部不可读才置错；未安装/部分可读/仅 hermes 成功均不置错
             try expect(TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: nil) != nil,
@@ -4705,6 +5017,18 @@ enum KimiOfflineRegression {
             if case .insufficient = staleComp.day {} else { try expect(false, "stale day must be insufficient") }
             if case .insufficient = staleComp.week {} else { try expect(false, "stale week must be insufficient") }
 
+            // 首轮扫描完成前：缺键日覆盖未证实、比较一律数据不足；扫描完成后空结果才是真实零
+            try expect(!DailyCoverage.missingDayCovered(scanCompleted: false, workError: nil, cliError: nil),
+                       "pre-scan missing day treated as covered")
+            try expect(DailyCoverage.missingDayCovered(scanCompleted: true, workError: nil, cliError: nil),
+                       "post-scan missing day not treated as real zero")
+            try expect(!DailyCoverage.missingDayCovered(scanCompleted: true, workError: "部分来源读取失败", cliError: nil),
+                       "failed-source missing day treated as covered")
+            let preScanComp = TokenAggregator.comparisons(daily: daily, staleTokensInWindow: 0, now: cutNow,
+                                                          coverageProven: false)
+            if case .insufficient = preScanComp.day {} else { try expect(false, "pre-scan day comparison must be insufficient") }
+            if case .insufficient = preScanComp.week {} else { try expect(false, "pre-scan week comparison must be insufficient") }
+
             // 陈旧贡献只在失败来源上统计，且只看 [D-13, D]
             let staleTool = TokenAggregator.ToolStats(id: .proma, modelDays: windowDays, installed: true, ok: false)
             try expect(TokenAggregator.staleTokensInWindow(tools: [staleTool], now: cutNow) == 24,
@@ -4758,6 +5082,27 @@ enum KimiOfflineRegression {
                        "successful window did not advance independently")
             try expect(DataFreshness.isStale(lastSuccess: successTime, hasData: true,
                                              now: now, after: 50), "old retained value was not marked stale")
+
+            // status.json 写盘去重策略：内容不变不重复写；心跳到期（60s）可写一次，内容变化立即写。
+            // didWrite 模拟原子写成功；未确认成功的到期心跳不得吞掉下一轮补写。
+            var statusPolicy = StatusWritePolicy(heartbeatInterval: 60)
+            let policyT0 = Date(timeIntervalSince1970: 1_000)
+            try expect(statusPolicy.shouldWrite(contentChanged: true, now: policyT0), "initial status write skipped")
+            statusPolicy.didWrite(at: policyT0)
+            try expect(!statusPolicy.shouldWrite(contentChanged: false, now: policyT0.addingTimeInterval(10)),
+                       "unchanged content rewrote within heartbeat interval")
+            try expect(!statusPolicy.shouldWrite(contentChanged: false, now: policyT0.addingTimeInterval(59)),
+                       "heartbeat wrote before its interval")
+            try expect(statusPolicy.shouldWrite(contentChanged: false, now: policyT0.addingTimeInterval(61)),
+                       "due heartbeat write was skipped")
+            try expect(statusPolicy.shouldWrite(contentChanged: false, now: policyT0.addingTimeInterval(61.5)),
+                       "failed heartbeat write advanced the dedup clock")
+            statusPolicy.didWrite(at: policyT0.addingTimeInterval(61.5))
+            try expect(statusPolicy.shouldWrite(contentChanged: true, now: policyT0.addingTimeInterval(62)),
+                       "content change write was skipped")
+            statusPolicy.didWrite(at: policyT0.addingTimeInterval(62))
+            try expect(!statusPolicy.shouldWrite(contentChanged: false, now: policyT0.addingTimeInterval(90)),
+                       "content change did not reset the heartbeat timer")
 
             let authPath = root.appendingPathComponent("config.json").path
             func document(_ access: String, _ refresh: String, _ extra: String, _ updatedAt: String) -> [String: Any] {
@@ -5197,7 +5542,7 @@ enum KimiOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.4.0",
                        "prerelease not skipped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
@@ -5277,29 +5622,12 @@ if CommandLine.arguments.contains("--once") {
     } else { print("no kimiCode apiKey found") }
     if let token = cred.webToken {
         group.enter()
-        Fetcher.fetchMonthUsage(webToken: token) { r in
-            if let err = r.monthError, err.contains("401") {
-                Fetcher.refreshWebToken { newToken in
-                    if let newToken = newToken {
-                        Fetcher.fetchMonthUsage(webToken: newToken) { r2 in
-                            applyResult { current in
-                                current.monthUsed = r2.monthUsed
-                                current.monthReset = r2.monthReset
-                                current.planName = r2.planName
-                                current.monthError = r2.monthError
-                            }
-                        }
-                    } else {
-                        applyResult { $0.monthError = "HTTP 401（自刷新失败）" }
-                    }
-                }
-            } else {
-                applyResult { current in
-                    current.monthUsed = r.monthUsed
-                    current.monthReset = r.monthReset
-                    current.planName = r.planName
-                    current.monthError = r.monthError
-                }
+        Fetcher.fetchMonthUsageWithRetry(webToken: token) { r in
+            applyResult { current in
+                current.monthUsed = r.monthUsed
+                current.monthReset = r.monthReset
+                current.planName = r.planName
+                current.monthError = r.monthError
             }
         }
     } else { print("no kimiWeb token found") }

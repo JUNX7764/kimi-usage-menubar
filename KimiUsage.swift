@@ -424,28 +424,28 @@ enum TokenAggregator {
         var tools: [ToolStats]
     }
 
-    /// Kimi Work 本地会话统计
-    static func aggregateBoth() -> (work: (TokenStat, TokenStat, TokenStat), cli: (TokenStat, TokenStat, TokenStat)) {
-        let d = aggregateBothDetailed()
-        return (d.work, d.cli)
-    }
-
     static func aggregateBothDetailed(persist: Bool = true) -> BothStats {
         lock.lock(); defer { lock.unlock() }
         var st = loadState()
         let workScan = scan(roots: [sessionsRoot], kimiOnly: false, into: &st.work)
         let cliScan = scan(roots: apiSessionsRoots, kimiOnly: true, into: &st.cli)
         var hermesOK: Bool?   // nil = 未安装（state.db 不存在），不算失败
-        if FileManager.default.fileExists(atPath: hermesDBPath) {
+        let hermesInstalled = FileManager.default.fileExists(atPath: hermesDBPath)
+        if hermesInstalled {
             hermesOK = scanHermes(into: &st)
         }
         var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
-        if FileManager.default.fileExists(atPath: zcodeDBPath) || st.zcodeDays != nil || st.zcodeModelDays != nil {
+        if FileManager.default.fileExists(atPath: zcodeDBPath) {
             zcodeOK = updateZCode(into: &st, at: zcodeDBPath)
         }
         let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
         st.zcodeDays = st.zcodeDays?.filter { $0.key >= cutoffKey }
         st.zcodeModelDays = st.zcodeModelDays?.filter { $0.key >= cutoffKey }
+        if !hermesInstalled, var hermesSnapshot = st.hermes {
+            // 卸载后不再扫描：行累计快照保留（重装可续差分），过期日贡献随窗口裁剪
+            hermesSnapshot.rowDays = hermesSnapshot.rowDays.mapValues { $0.filter { $0.key >= cutoffKey } }
+            st.hermes = hermesSnapshot
+        }
         state = st
         if persist { saveState(st) }
         // 旧缓存没有模型维度时保留总量并归入未知模型；数据库恢复后会自动替换为真实模型。
@@ -461,9 +461,13 @@ enum TokenAggregator {
         if hermesOK != nil {
             tools.append(ToolStats(id: .hermes, modelDays: st.hermes?.modelDays ?? [:],
                                    installed: true, ok: hermesOK == true))
+        } else if let cached = uninstalledCacheTool(id: .hermes, modelDays: st.hermes?.modelDays ?? [:]) {
+            tools.append(cached)
         }
         if zcodeOK != nil {
             tools.append(ToolStats(id: .zcode, modelDays: zcodeModels, installed: true, ok: zcodeOK == true))
+        } else if let cached = uninstalledCacheTool(id: .zcode, modelDays: zcodeModels) {
+            tools.append(cached)
         }
         var mergedDays: ModelDays = [:]
         for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
@@ -476,16 +480,6 @@ enum TokenAggregator {
             merged: statWindows(mergedDays),
             daily: dailyTotals(mergedDays),
             tools: tools)
-    }
-
-    static func mergeSourceDays(_ first: [String: [Double]], _ second: [String: [Double]]) -> [String: [Double]] {
-        var result = first
-        for (day, value) in second {
-            var total = result[day] ?? [0, 0]
-            total[0] += value[0]; total[1] += value[1]
-            result[day] = total
-        }
-        return result
     }
 
     static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
@@ -530,14 +524,6 @@ enum TokenAggregator {
     /// 此前为固定 86400 秒回退，跨夏令时日界会漂移一天）
     static func windowCutoffs(now: Date, calendar: Calendar = .current) -> (d7: String, d30: String) {
         (dayKey(-6, from: now, calendar: calendar), dayKey(-29, from: now, calendar: calendar))
-    }
-
-    /// 兼容既有调用；主刷新使用 aggregateBoth 合并扫描和缓存写入。
-    static func aggregate() -> (TokenStat, TokenStat, TokenStat) { aggregateBoth().work }
-
-    /// API 客户端（ZCode / Kimi Code CLI / Proma / Claude Code / hermes）中的 Kimi 用量统计
-    static func aggregateCLI() -> (TokenStat, TokenStat, TokenStat) {
-        aggregateBoth().cli
     }
 
     /// 全解析符号链接的绝对路径（realpath(3)）；路径不存在时原样返回。
@@ -712,11 +698,6 @@ enum TokenAggregator {
         modelDays.mapValues { models in
             models.values.reduce([0, 0]) { [$0[0] + $1[0], $0[1] + $1[1]] }
         }
-    }
-
-    /// 兼容既有对账调用；窗口展示使用同一快照的模型维度。
-    static func scanZCode(at path: String = zcodeDBPath, now: Date = Date()) -> [String: [Double]]? {
-        scanZCodeModelDays(at: path, now: now).map { days(from: $0) }
     }
 
     /// 直接按 started_at 索引读取近 31 天明细，天然支持历史回填，无需持久化扫描状态。
@@ -916,46 +897,46 @@ enum TokenAggregator {
         // Proma result 行的 modelUsage / 顶层 usage 都是全会话累计汇总，逐条 assistant 行已含每次调用。
         // 有些 result 没有 modelUsage，必须按 type 一并跳过，不能只判断 modelUsage 字段。
         if obj["modelUsage"] != nil { return }
-            let rowType = obj["type"] as? String
-            if kimiOnly && rowType == "result" { return }
-            // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写。
-            // API 只取前者；Kimi Work 旧文件只有 loop 时保留 loop，新文件出现 record 后只取 record。
-            if rowType == "context.append_loop_event" && (kimiOnly || preferUsageRecord) { return }
-            // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
-            let t: Date
-            if let ms = obj["time"] as? Double {
-                t = Date(timeIntervalSince1970: ms / 1000)
-            } else if let ts = ISO.parse(obj["timestamp"] as? String) {
-                t = ts
-            } else if let ms = obj["_createdAt"] as? Double {
-                t = Date(timeIntervalSince1970: ms / 1000)
-            } else { return }
-            // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
-            let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
-                ?? obj["usage"] as? [String: Any]
-                ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
-            guard let usage = usage else { return }
-            let event = obj["event"] as? [String: Any] ?? [:]
-            let rawModel = (obj["message"] as? [String: Any])?["model"] as? String
-                ?? obj["model"] as? String ?? event["model"] as? String
-            // 混接客户端只统计 Kimi 模型的行；可信旧格式与 Work 旧镜像归入未知模型。
-            if kimiOnly {
-                guard isKimiModel(rawModel) || (allowMissingModel && (rawModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { return }
-            }
-            let model = normalizedModel(rawModel)
-            // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
-            var input: Double = 0
-            for k in ["inputOther", "inputCacheRead", "inputCacheCreation",
-                      "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
-                      "input", "cacheRead", "cacheWrite"] {
-                if let v = usage[k] as? Double { input += v }
-                else if let v = usage[k] as? Int { input += Double(v) }
-            }
-            var output: Double = 0
-            for k in ["output", "output_tokens"] {
-                if let v = usage[k] as? Double { output += v }
-                else if let v = usage[k] as? Int { output += Double(v) }
-            }
+        let rowType = obj["type"] as? String
+        if kimiOnly && rowType == "result" { return }
+        // Kimi Code 的 usage.record 与 context.append_loop_event 是同一次调用的双写。
+        // API 只取前者；Kimi Work 旧文件只有 loop 时保留 loop，新文件出现 record 后只取 record。
+        if rowType == "context.append_loop_event" && (kimiOnly || preferUsageRecord) { return }
+        // 时间：kimi 系为 time(ms epoch)；Claude SDK 为 timestamp(ISO8601)；Proma 会话为 _createdAt(ms)
+        let t: Date
+        if let ms = obj["time"] as? Double {
+            t = Date(timeIntervalSince1970: ms / 1000)
+        } else if let ts = ISO.parse(obj["timestamp"] as? String) {
+            t = ts
+        } else if let ms = obj["_createdAt"] as? Double {
+            t = Date(timeIntervalSince1970: ms / 1000)
+        } else { return }
+        // usage 位置：event.usage（Kimi Work）/ 顶层（kimi-code CLI）/ message.usage（Claude SDK）
+        let usage = (obj["event"] as? [String: Any])?["usage"] as? [String: Any]
+            ?? obj["usage"] as? [String: Any]
+            ?? (obj["message"] as? [String: Any])?["usage"] as? [String: Any]
+        guard let usage = usage else { return }
+        let event = obj["event"] as? [String: Any] ?? [:]
+        let rawModel = (obj["message"] as? [String: Any])?["model"] as? String
+            ?? obj["model"] as? String ?? event["model"] as? String
+        // 混接客户端只统计 Kimi 模型的行；可信旧格式与 Work 旧镜像归入未知模型。
+        if kimiOnly {
+            guard isKimiModel(rawModel) || (allowMissingModel && (rawModel?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)) else { return }
+        }
+        let model = normalizedModel(rawModel)
+        // 字段：kimi 系 inputOther/inputCache*/output；Claude 系 *_tokens；Proma SDK 系 input/output/cacheRead/cacheWrite
+        var input: Double = 0
+        for k in ["inputOther", "inputCacheRead", "inputCacheCreation",
+                  "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                  "input", "cacheRead", "cacheWrite"] {
+            if let v = usage[k] as? Double { input += v }
+            else if let v = usage[k] as? Int { input += Double(v) }
+        }
+        var output: Double = 0
+        for k in ["output", "output_tokens"] {
+            if let v = usage[k] as? Double { output += v }
+            else if let v = usage[k] as? Int { output += Double(v) }
+        }
 
         let dayKey = dayFmt.string(from: t)
         if dayKey >= cutoffKey {
@@ -1085,6 +1066,12 @@ enum TokenAggregator {
         return total
     }
 
+    /// sqlite 来源卸载后的缓存行：库文件已消失但窗口内仍有真实历史贡献——保留计入合并视图，
+    /// 不算读取失败（区别于「暂时不可读」），行内状态由 UI 标「标准路径未发现」。
+    static func uninstalledCacheTool(id: ToolID, modelDays: ModelDays) -> ToolStats? {
+        modelDays.isEmpty ? nil : ToolStats(id: id, modelDays: modelDays, installed: false, ok: true)
+    }
+
     // MARK: 逐工具维度（v1.5 用量洞察）
 
     /// 面板「工具明细」的来源维度：Work 与 5 类 API 客户端各自独立聚合。
@@ -1125,24 +1112,9 @@ enum TokenAggregator {
         }
     }
 
-    /// CLI 会话文件路径 → 工具归属（两侧都过 realpath，与扫描同口径）。
-    static func toolID(forSessionPath rawPath: String, roots: [String] = apiSessionsRoots) -> ToolID {
-        let path = realPath(rawPath)
-        func under(_ root: String) -> Bool {
-            let base = realPath(root)
-            return path == base || path.hasPrefix(base + "/")
-        }
-        if roots.count > 3 {
-            if under(roots[3]) { return .claude }
-            if under(roots[2]) || under(roots[1]) { return .proma }
-            if under(roots[0]) { return .cli }
-        }
-        return .cli
-    }
-
     /// 从文件状态字典聚合单个工具的按日 × 模型贡献。
-    private static func toolModelDays(_ files: [String: FileScanState],
-                                      under roots: [String] = []) -> ModelDays {
+    static func toolModelDays(_ files: [String: FileScanState],
+                              under roots: [String] = []) -> ModelDays {
         var days: ModelDays = [:]
         for (path, st) in files {
             if !roots.isEmpty && !roots.contains(where: { root in
@@ -1166,18 +1138,6 @@ enum TokenAggregator {
             if !okRoots.contains(realPath(root)) { ok = false }
         }
         return ToolStats(id: id, modelDays: toolModelDays(files, under: roots), installed: installed, ok: ok)
-    }
-}
-
-/// Token 窗口明细的树形行：今日/近 7 天/近 30 天各一行，├ 分支 └ 收尾、两空格缩进
-/// （与 GlmUsage 的模型明细、CodexUsage 的窗口明细同款呈现）；无数据显示「暂无记录」
-enum TokenWindowLines {
-    static func render(_ rows: [(label: String, stat: TokenStat?)]) -> [String] {
-        rows.enumerated().map { index, row in
-            let branch = index < rows.count - 1 ? "├" : "└"
-            guard let s = row.stat, !s.isEmpty else { return "  \(branch) \(row.label)：暂无记录" }
-            return "  \(branch) \(row.label)：入 \(Fmt.tokens(s.input)) · 出 \(Fmt.tokens(s.output)) · 计 \(Fmt.tokens(s.total))"
-        }
     }
 }
 
@@ -1962,25 +1922,6 @@ struct UsagePanelModel {
         var remaining: Int?
         var notices: [Notice]
     }
-    struct ResetRow {
-        var name: String
-        var expires: String
-        var warning: Bool
-    }
-    struct ResetSection {
-        var count: Int?
-        var emptyText: String?
-        var rows: [ResetRow]
-        var notices: [Notice]
-    }
-    struct TiboRow {
-        var text: String
-        var item: NSMenuItem?
-    }
-    struct TiboSection {
-        var rows: [TiboRow]
-        var notices: [Notice]
-    }
     struct TokenModel {
         var name: String
         var total: String
@@ -2041,8 +1982,6 @@ struct UsagePanelModel {
     var planName: String?        // 套餐名标签（缺失隐藏）
     var accountLine: String?     // 头部账号行（CodexUsage 同款布局：标题行下一行账号信息）
     var quotas: [Quota]
-    var resetCards: ResetSection?
-    var tibo: TiboSection?
     var usage: TokenSection      // 用量情况：合并本机全部来源，口径见 docs/DEVELOPMENT.md
     var brief: BriefSection      // 用量简析：近 30 天日图 + 较昨日/较前 7 天
     var tools: ToolsSection      // 工具明细：逐来源占比
@@ -2438,7 +2377,7 @@ final class QuotaProgressView: NSView {
 }
 
 final class QuotaWindowView: NSView {
-    init(model: UsagePanelModel.Quota, compact: Bool = false) {
+    init(model: UsagePanelModel.Quota) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 4)
@@ -2481,7 +2420,7 @@ final class QuotaWindowView: NSView {
 
 /// 三个额度窗口与各自异常状态组成一张完整卡片；单行布局、文案和语义色保持原样。
 final class QuotaSectionView: PanelCardView {
-    init(quotas: [UsagePanelModel.Quota], compact: Bool) {
+    init(quotas: [UsagePanelModel.Quota]) {
         super.init()
         contentStack.spacing = 6
         // 卡片头部沿用共享头部工厂（14pt 图标 + 13pt 标题）；"重置时间"继续右对齐充当列头。
@@ -2490,49 +2429,12 @@ final class QuotaSectionView: PanelCardView {
         let heading = PanelUI.cardHeader(icon: "stopwatch", title: "用量进度", trailing: [resetLabel])
         PanelUI.addFullWidth(heading, to: contentStack)
         for (index, quota) in quotas.enumerated() {
-            let view = QuotaWindowView(model: quota, compact: compact)
+            let view = QuotaWindowView(model: quota)
             PanelUI.addFullWidth(view, to: contentStack)
             if index < quotas.count - 1 { contentStack.setCustomSpacing(8, after: view) }
         }
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-}
-
-final class ResetCardSectionView: PanelCardView {
-    init(model: UsagePanelModel.ResetSection) {
-        super.init(padding: 8)
-        let headerTrailing: [NSView]
-        if let count = model.count {
-            headerTrailing = [PanelUI.label("×\(count)", size: 12, weight: .semibold,
-                color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true)]
-        } else if let empty = model.emptyText {
-            headerTrailing = [PanelUI.label(empty, size: 11, color: .secondaryLabelColor, wrapping: false)]
-        } else {
-            headerTrailing = []
-        }
-        contentStack.addArrangedSubview(PanelUI.cardHeader(icon: "calendar", title: "重置卡", trailing: headerTrailing))
-        for (index, rowModel) in model.rows.enumerated() {
-            _ = index
-            let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-            // 语义色：过期警告用橙色（与 RemainingColorTier.orange 同款动态色）
-            let color: NSColor = rowModel.warning ? RemainingColorTier.orange.color() : .labelColor
-            let name = PanelUI.label((rowModel.warning ? "⚠ " : "") + rowModel.name,
-                size: 12, color: color)
-            row.addArrangedSubview(name)
-            row.addArrangedSubview(PanelUI.spacer())
-            let expires = PanelUI.label(rowModel.expires, size: 11,
-                color: rowModel.warning ? RemainingColorTier.orange.color() : .secondaryLabelColor,
-                wrapping: false, monospacedDigits: true)
-            expires.setContentHuggingPriority(.required, for: .horizontal)
-            expires.setContentCompressionResistancePriority(.required, for: .horizontal)
-            row.addArrangedSubview(expires)
-            contentStack.addArrangedSubview(row)
-        }
-        for notice in PanelUI.notices(model.notices) {
-            PanelUI.addFullWidth(notice, to: contentStack)
-        }
-    }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
@@ -2720,13 +2622,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
             addContentRow(button)
         }
-        addContentRow(QuotaSectionView(quotas: model.quotas, compact: panelWidth < 400))
-        if let reset = model.resetCards {
-            addContentRow(ResetCardSectionView(model: reset))
-        }
-        if let tibo = model.tibo {
-            addContentRow(makeTiboSection(tibo))
-        }
+        addContentRow(QuotaSectionView(quotas: model.quotas))
         let usageView = TokenSectionView(model: model.usage, expanded: usageExpanded,
             expandedBuckets: expandedUsageBuckets, target: self, action: #selector(toggleUsage),
             bucketAction: #selector(toggleUsageBucket(_:)))
@@ -2785,25 +2681,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
     }
 
-    private func makeTiboSection(_ model: UsagePanelModel.TiboSection) -> NSView {
-        let card = PanelCardView(padding: 8)
-        PanelUI.addFullWidth(PanelUI.cardHeader(icon: "checkmark.circle.fill", iconColor: .systemGreen,
-                                                title: "Tibo 重置动态"), to: card.contentStack)
-        for row in model.rows {
-            let view: NSView
-            if let item = row.item {
-                view = makeActionButton(item, .plain, title: row.text)
-            } else {
-                view = PanelUI.label(row.text, size: 12)
-            }
-            PanelUI.addFullWidth(view, to: card.contentStack)
-        }
-        for notice in PanelUI.notices(model.notices) {
-            PanelUI.addFullWidth(notice, to: card.contentStack)
-        }
-        return card
-    }
-
     private func makeActionButton(_ item: NSMenuItem, _ style: PanelActionButton.Style,
                                   title overrideTitle: String? = nil) -> PanelActionButton {
         let button = PanelActionButton()
@@ -2822,11 +2699,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.focusRingType = .default
         let title = overrideTitle ?? item.title
         let prominent = style == .prominent
-        let textColor: NSColor = prominent
-            ? NSColor(name: nil) { appearance in
-                .white
-            }
-            : .labelColor
+        let textColor: NSColor = prominent ? .white : .labelColor
         button.attributedTitle = NSAttributedString(string: title, attributes: [
             .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
             .foregroundColor: textColor
@@ -4300,30 +4173,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let mergedTotals = [usage.mergedTokens?.today.total ?? 0,
                             usage.mergedTokens?.week.total ?? 0,
                             usage.mergedTokens?.month.total ?? 0]
+        // 预计算各工具三窗口一次：toolRows 三个周期共用，排序比较器内不再反复重建 statWindows
+        let toolWindows = usage.tools.map { (tool: $0, windows: $0.windows()) }
         func toolRows(_ index: Int) -> [UsagePanelModel.ToolRow] {
             // 该周期使用量为 0 的来源直接隐藏（用户 2026-11-07 要求）；
             // 失败来源若有历史贡献（>0）仍保留行并标缓存，全部为零时显示「本周期暂无用量」空态
-            let active = usage.tools.filter { tool in
-                let window = tool.windows()
-                return [window.today, window.week, window.month][index].total > 0
+            let active = toolWindows.filter { entry in
+                [entry.windows.today, entry.windows.week, entry.windows.month][index].total > 0
             }
             let sorted = active.sorted { lhs, rhs in
-                let lhsWindow = lhs.windows()
-                let rhsWindow = rhs.windows()
-                let lhsTotal = [lhsWindow.today.total, lhsWindow.week.total, lhsWindow.month.total][index]
-                let rhsTotal = [rhsWindow.today.total, rhsWindow.week.total, rhsWindow.month.total][index]
+                let lhsTotal = [lhs.windows.today.total, lhs.windows.week.total, lhs.windows.month.total][index]
+                let rhsTotal = [rhs.windows.today.total, rhs.windows.week.total, rhs.windows.month.total][index]
                 if lhsTotal != rhsTotal { return lhsTotal > rhsTotal }
-                return fixedOrder(lhs.id) < fixedOrder(rhs.id)
+                return fixedOrder(lhs.tool.id) < fixedOrder(rhs.tool.id)
             }
-            return sorted.compactMap { tool in
-                let window = tool.windows()
-                let stat = [window.today, window.week, window.month][index]
+            return sorted.compactMap { entry in
+                let tool = entry.tool
+                let stat = [entry.windows.today, entry.windows.week, entry.windows.month][index]
                 let denominator = mergedTotals[index]
                 let share = denominator > 0 ? stat.total / denominator : 0
                 let status: String
                 switch tool.id {
                 case .hermes:
-                    status = !tool.ok ? "部分记录 · 缓存" : (tool.modelDays.isEmpty ? "可读取 · 无记录" : "可读取 · 近似归日")
+                    if !tool.installed { status = "标准路径未发现" }
+                    else if !tool.ok { status = "部分记录 · 缓存" }
+                    else { status = tool.modelDays.isEmpty ? "可读取 · 无记录" : "可读取 · 近似归日" }
                 case .work, .cli, .proma, .claude, .zcode:
                     if !tool.installed { status = "标准路径未发现" }
                     else if !tool.ok { status = "部分记录 · 缓存" }
@@ -4361,7 +4235,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             quotas: [quota("5 小时", usage.fiveHourUsed, usage.fiveHourReset, usage.fiveHourError, lastFiveHourSuccessAt, fiveHourStale),
                      quota("7 天", usage.sevenDayUsed, usage.sevenDayReset, usage.sevenDayError, lastSevenDaySuccessAt, sevenDayStale),
                      quota("月度", usage.monthUsed, usage.monthReset, usage.monthError, lastMonthSuccessAt, monthStale)],
-            resetCards: nil, tibo: nil,
             usage: usageSection,
             brief: brief,
             tools: toolsSection,
@@ -5079,8 +4952,20 @@ enum KimiOfflineRegression {
             let okTool = TokenAggregator.ToolStats(id: .proma, modelDays: windowDays, installed: true, ok: true)
             try expect(TokenAggregator.staleTokensInWindow(tools: [okTool], now: cutNow) == 0,
                        "ok tool counted as stale contribution")
+            // 卸载的 sqlite 来源：库消失但历史快照仍在 → 保留缓存行（不算失败、不阻断比较），空快照无行
+            if let uninstalled = TokenAggregator.uninstalledCacheTool(id: .zcode, modelDays: windowDays) {
+                try expect(!uninstalled.installed && uninstalled.ok
+                           && uninstalled.windows(now: cutNow).month.total == 32,
+                           "uninstalled sqlite source lost its cached history")
+                try expect(TokenAggregator.staleTokensInWindow(tools: [uninstalled], now: cutNow) == 0,
+                           "uninstalled cached history was counted as stale coverage")
+            } else {
+                try expect(false, "uninstalled sqlite source dropped its cached history")
+            }
+            try expect(TokenAggregator.uninstalledCacheTool(id: .hermes, modelDays: [:]) == nil,
+                       "empty snapshot still produced an uninstalled tool row")
 
-            // 逐工具归属：realpath 前缀匹配（临时目录模拟 CLI 根）
+            // 逐工具归属：realpath 前缀匹配（临时目录模拟 CLI 根；toolModelDays 是工具明细的真实归属路径）
             let cliRoot = root.appendingPathComponent("cli-roots/cli")
             let promaRoot = root.appendingPathComponent("cli-roots/proma")
             let claudeRoot = root.appendingPathComponent("cli-roots/claude")
@@ -5088,19 +4973,24 @@ enum KimiOfflineRegression {
             for dir in [cliRoot, promaRoot, claudeRoot, otherRoot] {
                 try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             }
+            var attributionFiles: [String: TokenAggregator.FileScanState] = [:]
             for (dir, name) in [(cliRoot, "a.jsonl"), (promaRoot, "b.jsonl"),
                                 (claudeRoot, "c.jsonl"), (otherRoot, "d.jsonl")] {
                 try Data().write(to: dir.appendingPathComponent(name))
+                var state = TokenAggregator.FileScanState()
+                state.modelDays = ["2026-01-01": ["k3.1-pro": [10, 1]]]
+                // 键与扫描同口径：枚举器产出的路径是 realpath 形式（/var → /private/var）
+                attributionFiles[TokenAggregator.realPath(dir.appendingPathComponent(name).path)] = state
             }
             let attributionRoots = [cliRoot.path, promaRoot.path, promaRoot.path, claudeRoot.path]
-            try expect(TokenAggregator.toolID(forSessionPath: cliRoot.appendingPathComponent("a.jsonl").path,
-                                              roots: attributionRoots) == .cli, "cli attribution drifted")
-            try expect(TokenAggregator.toolID(forSessionPath: promaRoot.appendingPathComponent("b.jsonl").path,
-                                              roots: attributionRoots) == .proma, "proma attribution drifted")
-            try expect(TokenAggregator.toolID(forSessionPath: claudeRoot.appendingPathComponent("c.jsonl").path,
-                                              roots: attributionRoots) == .claude, "claude attribution drifted")
-            try expect(TokenAggregator.toolID(forSessionPath: otherRoot.appendingPathComponent("d.jsonl").path,
-                                              roots: attributionRoots) == .cli, "unknown path fell back unexpectedly")
+            func attributionTotal(_ roots: [String]) -> [Double] {
+                TokenAggregator.toolModelDays(attributionFiles, under: roots)
+                    .values.flatMap { $0.values }.reduce([0, 0]) { [$0[0] + $1[0], $0[1] + $1[1]] }
+            }
+            try expect(attributionTotal([attributionRoots[0]]) == [10, 1], "cli attribution drifted")
+            try expect(attributionTotal(Array(attributionRoots[1...2])) == [10, 1], "proma attribution drifted")
+            try expect(attributionTotal([attributionRoots[3]]) == [10, 1], "claude attribution drifted")
+            // otherRoot 下的文件不属于任何已知根：泄漏进任一分组都会把 [10,1] 翻成 [20,2]
 
             let gate = RefreshGate()
             try expect(gate.begin(manual: false), "initial refresh gate did not open")
@@ -5473,7 +5363,8 @@ enum KimiOfflineRegression {
             let nowMS = Int64(nowSeconds * 1000)
             let oldMS = nowMS - Int64(40 * 86400 * 1000)
             try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 100, 5, \(nowMS)), ('glm-5.3', 1000, 50, \(nowMS)), (NULL, 500, 50, \(nowMS)), ('k3-256k', 7, 1, \(oldMS))")
-            let zcodeDays = TokenAggregator.scanZCode(at: sqlitePath, now: usageNow)
+            let zcodeDays = TokenAggregator.scanZCodeModelDays(at: sqlitePath, now: usageNow)
+                .map { TokenAggregator.days(from: $0) }
             let todayKey = TokenAggregator.dayFmt.string(from: usageNow)
             try expect(zcodeDays != nil && zcodeDays?[todayKey] == [100, 5],
                        "ZCode model filtering, cache accounting, or retention is wrong")
@@ -5481,10 +5372,10 @@ enum KimiOfflineRegression {
             try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "initial ZCode read failed")
             try expect(!TokenAggregator.updateZCode(into: &zState, at: sqlitePath + ".missing", now: usageNow), "missing ZCode read succeeded")
             try expect(zState.zcodeDays?[todayKey] == [100, 5], "failed ZCode read lost snapshot")
-            let beforeOther = [todayKey: [20.0, 0.0]]
-            let afterOther = [todayKey: [30.0, 0.0]]
-            try expect(TokenAggregator.mergeSourceDays(beforeOther, zState.zcodeDays ?? [:])[todayKey] == [120, 5] &&
-                       TokenAggregator.mergeSourceDays(afterOther, zState.zcodeDays ?? [:])[todayKey] == [130, 5], "healthy source increment lost during ZCode failure")
+            let beforeOther: TokenAggregator.ModelDays = [todayKey: ["k3.1-pro": [20, 0]]]
+            let afterOther: TokenAggregator.ModelDays = [todayKey: ["k3.1-pro": [30, 0]]]
+            try expect(TokenAggregator.mergeSourceModelDays(beforeOther, zState.zcodeModelDays ?? [:])[todayKey]?["k3.1-pro"] == [120, 5] &&
+                       TokenAggregator.mergeSourceModelDays(afterOther, zState.zcodeModelDays ?? [:])[todayKey]?["k3.1-pro"] == [130, 5], "healthy source increment lost during ZCode failure")
             try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 8, 2, \(nowMS))")
             try expect(TokenAggregator.updateZCode(into: &zState, at: sqlitePath, now: usageNow), "ZCode recovery failed")
             try expect(zState.zcodeDays?[todayKey] == [108, 7], "ZCode recovery double counted")
@@ -5534,20 +5425,6 @@ enum KimiOfflineRegression {
                        && hermesModels.hermes?.modelDays[todayKey]?["k3-256k"] == nil,
                        "Hermes model switch double-counted or retained stale model usage")
 
-            // Token 窗口树形行：├/└ 分支、两空格缩进，空数据显示「暂无记录」
-            let windowTree = TokenWindowLines.render([
-                ("今日", TokenStat(input: 1234, output: 56)),
-                ("近 7 天", nil),
-                ("近 30 天", TokenStat(input: 0, output: 0))
-            ])
-            try expect(windowTree == [
-                "  ├ 今日：入 1.23K · 出 56 · 计 1.29K",
-                "  ├ 近 7 天：暂无记录",
-                "  └ 近 30 天：暂无记录"
-            ], "token window tree lines did not render with branch symbols")
-            try expect(TokenWindowLines.render([]).isEmpty,
-                       "empty token window rows still rendered lines")
-
             // 更新检查：Release 版本号比较（v 前缀与 describe/dirty 尾巴剥离、逐段数值、短侧补 0、无法解析不提示）
             try expect(!UpdateCheck.isOutdated(local: "v1.0.1", remote: "v1.0.1"), "same release flagged outdated")
             try expect(UpdateCheck.isOutdated(local: "v1.0.0-1-g95952a1", remote: "v1.0.1"), "newer release not detected")
@@ -5585,7 +5462,7 @@ enum KimiOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.4.0",
                        "prerelease not skipped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting, token window tree lines, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
@@ -5698,6 +5575,7 @@ if CommandLine.arguments.contains("--once") {
     print("api tokens 7d:    in=\(Fmt.tokens(cw.input)) out=\(Fmt.tokens(cw.output)) total=\(Fmt.tokens(cw.total))")
     print("api tokens 30d:   in=\(Fmt.tokens(cm.input)) out=\(Fmt.tokens(cm.output)) total=\(Fmt.tokens(cm.total))")
     if let e = snapshot.fiveHourError { print("5h error: \(e)") }
+    if let e = snapshot.sevenDayError { print("7d error: \(e)") }
     if let e = snapshot.monthError { print("month error: \(e)") }
     if timedOut { fputs("KimiUsage --once: 等待网络结果超时（45s），以上为部分数据\n", stderr) }
     exit(timedOut ? 1 : 0)

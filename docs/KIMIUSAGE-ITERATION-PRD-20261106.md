@@ -1,7 +1,7 @@
 # KimiUsage 用量洞察迭代 PRD
 
 - 文档版本：v0.6 · 2026-11-07
-- 状态：**已按本稿实施于分支 `kimi/v1.5-usage-insights`（P0+P1，2026-11-07）；未合并 main、未发布、未做真实环境验收**。
+- 状态：**历史文档（已实施）。P0+P1 于 2026-11-07 在分支 `kimi/v1.5-usage-insights` 实施，随后合并 main 并自 v1.5.0 起发布（后续迭代至 v1.7.x）；当前工程事实以 `docs/DEVELOPMENT.md` 与 `docs/project/` 为准**。
 - 当前基线：`ade57f9` / KimiUsage v1.4.10；建议目标版本 v1.5.0，尚未创建标签。
 - 本轮交付：需求、信息架构、交互原型、实施顺序与验收标准；不修改 Swift、安装包、登录配置、LaunchAgent 或发布链路。
 

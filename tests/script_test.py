@@ -106,7 +106,7 @@ case "$out" in
         ;;
     *.sha256)
         if [ "${MOCK_SHA256_BAD:-0}" = 1 ]; then
-            printf '%064d  %s\n' 0 "GlmUsage.zip" > "$out"
+            printf '%064d  %s\n' 0 "${MOCK_EXECUTABLE}.zip" > "$out"
         else
             (cd "$(dirname "$out")" && /usr/bin/shasum -a 256 "$(basename "${out%.sha256}")" > "$out")
         fi

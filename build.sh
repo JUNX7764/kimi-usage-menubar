@@ -18,6 +18,16 @@ if [ ! -f "$DIR/AppIcon.icns" ]; then
     (cd "$DIR" && swift scripts/icon_gen.swift)
 fi
 
+echo "== 校验 macOS 26+ SDK =="
+# 液态玻璃背景（macOS 26+ 原生 NSPopover chrome）与可用性判定依赖新 SDK；旧 SDK 无法保证该路径的编译语义。
+SDK_VERSION="$(xcrun --show-sdk-version 2>/dev/null || true)"
+SDK_MAJOR="${SDK_VERSION%%.*}"
+if ! [[ "$SDK_MAJOR" =~ ^[0-9]+$ ]] || [ "$SDK_MAJOR" -lt 26 ]; then
+    echo "错误: 需要 macOS 26+ SDK 编译（xcrun --show-sdk-version 返回「${SDK_VERSION:-空}」）" >&2
+    exit 1
+fi
+echo "== SDK ${SDK_VERSION} =="
+
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。

@@ -1,6 +1,6 @@
 # KimiUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-10。
+> 状态：当前架构摘要。最后核对：2026-11-11。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -22,7 +22,7 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当�
 | `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
-| `UsagePanelController` | 原生 Popover、额度与模型明细交互 |
+| `UsagePanelController` | 原生 Popover、额度与模型明细交互、面板背景样式（纯色/液态玻璃/经典毛玻璃） |
 | `AppDelegate` | 生命周期、刷新调度、自启和状态聚合 |
 | `KimiOfflineRegression` | 使用临时目录与假数据的离线自检 |
 
@@ -47,6 +47,16 @@ Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度�
 GitHub Release → 可安装版本选择 → ZIP / SHA256 下载 → 身份、版本、签名与离线自检 → 暂存 → 停止目标进程 → 换包 → 健康检查 → 成功清理或失败回滚。
 
 更新器只处理当前应用路径和 `com.local.kimi-usage`，不得按名称模糊终止其他进程。
+
+### 面板背景样式
+
+头部最右缘按钮 → 原生 NSMenu（纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
+
+- 缺省与非法值回退 solid；打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册）共用同一应用入口，切换不重建面板内容。
+- solid：`PanelSolidBackgroundView` opacity=1（无历史 0.9 混合）；classicMaterial：仅 `NSVisualEffectView(.popover)`；liquidGlass：两层自绘背景全部隐藏，露出 macOS 26+ 新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView / NSPanel。卡片深浅外观共用半透明表面色 `controlBackgroundColor@0.82`。
+- 旧系统禁用液态菜单项并渲染降级 classicMaterial；「降低透明度」临时强制 solid 且不改写持久化偏好。
+- NSMenu 弹出期间挂起面板 local/global 事件 monitor（避免面板被自己的 monitor 关闭），结束后恢复；主 Popover 保持 transient。
+- 预览回归经 `--visual-preview-background=` / `--visual-preview-backdrop` / `--visual-preview-background-test=` / `--visual-preview-background-menu-test` 走覆盖模式，所有预览路径不写真实 UserDefaults；矩阵/单拍不弹真实 NSMenu，背板只存在于预览进程，合成截图带面板墨水有效性守门。
 
 ## 4. 信任边界
 

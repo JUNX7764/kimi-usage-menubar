@@ -2291,11 +2291,6 @@ class PanelCardView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 14
         layer?.borderWidth = 0.5
-        // 阴影绘制在卡片自身 layer 上，不能随圆角背景一起裁掉。
-        layer?.masksToBounds = false
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowRadius = 11
-        layer?.shadowOffset = CGSize(width: 0, height: -2)
         let horizontalPadding = padding ?? Self.contentInset
         let verticalPadding = padding ?? Self.verticalInset
         addSubview(contentStack)
@@ -2317,13 +2312,8 @@ class PanelCardView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
-            let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            // 深浅外观共用同一半透明卡片表面色（历史深色 labelColor@0.055 会被液态玻璃的
-            // 彩色底吞没，白字不可读）；半透明度让卡片在 liquid/classic 档透出材质而非被材质盖住，
-            // solid 档上表现一致，不按背景样式分叉。
-            layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.82).cgColor
-            layer?.borderColor = NSColor.labelColor.withAlphaComponent(dark ? 0.14 : 0.09).cgColor
-            layer?.shadowOpacity = dark ? 0.03 : 0.06
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.09).cgColor
         }
     }
     override func viewDidChangeEffectiveAppearance() {
@@ -2370,7 +2360,7 @@ final class PanelHeaderView: NSView {
         row.addArrangedSubview(titles)
         row.addArrangedSubview(PanelUI.spacer())
         if let backgroundTarget, let backgroundAction {
-            let styleImage = NSImage(systemSymbolName: "square.on.square",
+            let styleImage = NSImage(systemSymbolName: "paintpalette",
                                      accessibilityDescription: "背景样式")?
                 .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
             let styleButton = NSButton(image: styleImage ?? NSImage(), target: backgroundTarget, action: backgroundAction)
@@ -2417,7 +2407,8 @@ final class PlanTagView: NSView {
         tierColor = presentation.color
         label = PanelUI.label(presentation.name, size: 11, color: tierColor, wrapping: false)
         label.lineBreakMode = .byTruncatingTail
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // 优先保留套餐全名；空间不足时让账号行和弹性间隔先收缩。
+        label.setContentCompressionResistancePriority(.required, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -5361,9 +5352,9 @@ enum KimiOfflineRegression {
             // 24×24 尺寸固定，位置不随套餐标签宽度漂移。
             let geometryTarget = ProcessInfo.processInfo   // 仅充当 target，测试内不点击
             let geometryAction = Selector(("backgroundStyleMenuDummy:"))
-            func makeHeader(plan: String?) -> PanelHeaderView {
+            func makeHeader(plan: String?, account: String? = nil) -> PanelHeaderView {
                 PanelHeaderView(model: UsagePanelModel(
-                    updateItem: nil, title: "Kimi 用量", planName: plan, accountLine: nil, quotas: [],
+                    updateItem: nil, title: "Kimi 用量", planName: plan, accountLine: account, quotas: [],
                     usage: UsagePanelModel.TokenSection(title: "用量情况", accent: .codex, buckets: [], notices: []),
                     brief: UsagePanelModel.BriefSection(days: [],
                         day: UsagePanelModel.BriefComparison(label: "较昨日", text: "数据不足",
@@ -5397,6 +5388,20 @@ enum KimiOfflineRegression {
                        "background button is far from nominal 24×24: \(shortPlanFrame)")
             try expect(abs(NSMaxX(longPlanFrame) - NSMaxX(shortPlanFrame)) < 0.5,
                        "background button drifts with plan tag width: \(shortPlanFrame) vs \(longPlanFrame)")
+            func descendants(_ view: NSView) -> [NSView] {
+                [view] + view.subviews.flatMap { descendants($0) }
+            }
+            for width: CGFloat in [300, 330] {
+                let header = makeHeader(plan: "Allegretto", account: "Test User (138****0000)")
+                header.frame = NSRect(x: 0, y: 0, width: width, height: 60)
+                header.layoutSubtreeIfNeeded()
+                guard let planLabel = descendants(header).compactMap({ $0 as? NSTextField })
+                    .first(where: { $0.stringValue == "Allegretto" }) else {
+                    throw Failure(description: "plan label missing")
+                }
+                try expect(planLabel.frame.width + 0.5 >= planLabel.intrinsicContentSize.width,
+                           "plan label truncated at header width \(width): \(planLabel.frame.width) < \(planLabel.intrinsicContentSize.width)")
+            }
             let legacyMenu = styleController.makeBackgroundStyleMenu()
             try menuProfile(legacyMenu, stored: .solid, liquidTitle: "液态玻璃（需 macOS 26+）")
             try expect(legacyMenu.items[0].isEnabled && legacyMenu.items[2].isEnabled,

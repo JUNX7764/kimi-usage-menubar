@@ -36,6 +36,20 @@ if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 cd "$DIR"
+NOTES="$DIR/release-notes/$TAG.md"
+if [ ! -f "$NOTES" ] || ! LC_ALL=C grep -q '[^[:space:]]' "$NOTES"; then
+    echo "!! 缺少或为空的版本说明：${NOTES}"
+    exit 1
+fi
+# Compare before creating or pushing a tag; existing releases are never silently edited.
+if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+    REMOTE_NOTES="$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)" || { echo "!! 无法读取已有 Release 说明"; exit 1; }
+    LOCAL_NOTES="$(cat "$NOTES")"
+    if [ "$REMOTE_NOTES" != "$LOCAL_NOTES" ]; then
+        echo "!! 已有 Release 说明与本地文件不一致，请先核对"
+        exit 1
+    fi
+fi
 git diff --quiet && git diff --cached --quiet || { echo "!! 工作区有未提交改动，先提交"; exit 1; }
 git fetch origin main --quiet
 if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
@@ -103,10 +117,16 @@ git push origin "$TAG"
 TAG_PUSHED=1
 ASSETS=("$TMP/$EXECUTABLE.dmg" "$TMP/$EXECUTABLE.zip" "$TMP/$EXECUTABLE.zip.sha256")
 if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-    # Release 可能已由人工创建，或上次上传中断；补齐附件而不是留下会导致更新 404 的空 Release。
+    # Recheck at upload time in case a Release was created or edited during the build.
+    REMOTE_NOTES="$(gh release view "$TAG" --repo "$REPO" --json body --jq .body)" || { echo "!! 无法读取已有 Release 说明"; exit 1; }
+    if [ "$REMOTE_NOTES" != "$(cat "$NOTES")" ]; then
+        echo "!! 已有 Release 说明与本地文件不一致，请先核对"
+        exit 1
+    fi
+    # Release 可能已由人工创建，或上次上传中断；补齐附件。
     gh release upload "$TAG" --repo "$REPO" --clobber "${ASSETS[@]}"
 else
-    gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes "${ASSETS[@]}"
+    gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes-file "$NOTES" "${ASSETS[@]}"
 fi
 
 echo "✅ 已发布 ${TAG}；已装旧版本将在下轮检查（≤30 分钟，打开菜单也会触发）提示更新"

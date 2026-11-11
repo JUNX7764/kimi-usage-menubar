@@ -23,6 +23,8 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
+发布前由 Agent 对比上一正式版与目标版本，核实实际改动并编写、提交 `release-notes/vX.Y.Z.md`。脚本拒绝缺失或空白说明；已有 Release 正文与文件不一致时停止，不自动覆盖。
+
 确认工作区干净、HEAD 已推送且版本号符合变更类型后，执行 `scripts/release.sh vX.Y.Z`。
 
 脚本自动完成远端与身份检查、标签创建、构建、二进制自检、ad-hoc 签名验证、DMG / ZIP 打包与校验、SHA256 生成以及 Release 创建或补全。

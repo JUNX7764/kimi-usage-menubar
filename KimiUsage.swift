@@ -2136,8 +2136,78 @@ private enum PanelUI {
     }
 }
 
+/// 面板背景样式（头部「背景样式」菜单的三选一）：
+/// - solid：自绘纯色层（PanelSolidBackgroundView，opacity=1）
+/// - liquidGlass：macOS 26+ 隐藏全部自绘背景层，露出新 SDK 原生 NSPopover chrome（液态玻璃）；
+///   不引入 NSGlassEffectView / NSPanel。旧系统菜单项禁用，存储值渲染降级为 classicMaterial。
+/// - classicMaterial：仅显示现有 NSVisualEffectView(.popover)（经典毛玻璃）
+/// 持久化使用单个 UserDefaults key；缺省与非法值一律回退 solid。
+enum PanelBackgroundStyle: String, CaseIterable {
+    case solid
+    case liquidGlass
+    case classicMaterial
+
+    static let defaultsKey = "panelBackgroundStyle"
+
+    var menuTitle: String {
+        switch self {
+        case .solid: return "纯色"
+        case .liquidGlass: return "液态玻璃"
+        case .classicMaterial: return "经典毛玻璃"
+        }
+    }
+
+    /// 缺省（nil/空）与非法值都回退 solid，不让坏数据挡住面板。
+    static func parse(_ raw: String?) -> PanelBackgroundStyle {
+        return PanelBackgroundStyle(rawValue: raw ?? "") ?? .solid
+    }
+}
+
+/// 样式存取隔离：生产读写 standard UserDefaults 的单 key；--self-test 经 beginMemoryOverride
+/// 换成进程内存字典——绝不在用户 Preferences 创建 suite plist，也不读写真实偏好。
+/// 仅主线程访问（生产：样式选择在主线程菜单动作；测试：单线程启动前阶段）。
+enum PanelBackgroundStyleStore {
+    private static var memoryBackend: [String: String]?
+
+    /// --self-test 启用内存 backend；返回值用于恢复生产存取（配合 defer）。
+    @discardableResult
+    static func beginMemoryOverride() -> () -> Void {
+        memoryBackend = [:]
+        return { memoryBackend = nil }
+    }
+
+    /// --self-test 注入原始存储值（含非法值）验证回退；仅内存 backend 下生效。
+    static func setRawForTest(_ raw: String) {
+        memoryBackend?[PanelBackgroundStyle.defaultsKey] = raw
+    }
+
+    /// --self-test 检查底层是否仍为空（缺省/未持久化断言）。
+    static var hasValueForTest: Bool {
+        return memoryBackend?[PanelBackgroundStyle.defaultsKey] != nil
+    }
+
+    static func load() -> PanelBackgroundStyle {
+        let raw: String?
+        if let memoryBackend {
+            raw = memoryBackend[PanelBackgroundStyle.defaultsKey]
+        } else {
+            raw = UserDefaults.standard.string(forKey: PanelBackgroundStyle.defaultsKey)
+        }
+        return PanelBackgroundStyle.parse(raw)
+    }
+
+    static func save(_ style: PanelBackgroundStyle) {
+        if memoryBackend != nil {
+            memoryBackend?[PanelBackgroundStyle.defaultsKey] = style.rawValue
+        } else {
+            UserDefaults.standard.set(style.rawValue, forKey: PanelBackgroundStyle.defaultsKey)
+        }
+    }
+}
+
 final class PanelSolidBackgroundView: NSView {
-    var opacity: CGFloat = 0.9 { didSet { needsDisplay = true } }
+    // 取消历史 0.9 混合：solid 档就是全不透明纯色；毛玻璃需求走 classicMaterial 档。
+    var opacity: CGFloat = 1 { didSet { needsDisplay = true } }
     override var wantsUpdateLayer: Bool { true }
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -2229,9 +2299,10 @@ class PanelCardView: NSView {
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            layer?.backgroundColor = (dark
-                ? NSColor.labelColor.withAlphaComponent(0.055)
-                : NSColor.controlBackgroundColor.withAlphaComponent(0.82)).cgColor
+            // 深浅外观共用同一半透明卡片表面色（历史深色 labelColor@0.055 会被液态玻璃的
+            // 彩色底吞没，白字不可读）；半透明度让卡片在 liquid/classic 档透出材质而非被材质盖住，
+            // solid 档上表现一致，不按背景样式分叉。
+            layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.82).cgColor
             layer?.borderColor = NSColor.labelColor.withAlphaComponent(dark ? 0.14 : 0.09).cgColor
             layer?.shadowOpacity = dark ? 0.03 : 0.06
         }
@@ -2243,9 +2314,14 @@ class PanelCardView: NSView {
 }
 
 final class PanelHeaderView: NSView {
-    init(model: UsagePanelModel) {
+    /// 标题行右侧「背景样式」按钮（无 target/action 时为 nil）。
+    private(set) var backgroundStyleButton: NSButton?
+    /// backgroundTarget/backgroundAction：标题行右侧「背景样式」按钮（生产由 UsagePanelController 注入）。
+    init(model: UsagePanelModel, backgroundTarget: AnyObject? = nil, backgroundAction: Selector? = nil) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        // 最外层一行：icon + 标题区 + 弹性间隔 + 背景样式按钮（24×24）。
+        // 按钮固定在 header trailing，套餐文字长短只影响中间标题区。
         let row = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 12)
         let icon = NSImageView(image: NSApp.applicationIconImage)
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -2265,7 +2341,6 @@ final class PanelHeaderView: NSView {
             tag.setAccessibilityLabel("套餐 \(plan)")
             titleRow.addArrangedSubview(tag)
         }
-        titleRow.addArrangedSubview(PanelUI.spacer())
         PanelUI.addFullWidth(titleRow, to: titles)
         if let accountLine = model.accountLine, !accountLine.isEmpty {
             // 单行截断（同 PlanTag 惯例）：超长昵称不得换行撑高固定头部；全名进 toolTip
@@ -2274,6 +2349,21 @@ final class PanelHeaderView: NSView {
             PanelUI.addFullWidth(accountLabel, to: titles)
         }
         row.addArrangedSubview(titles)
+        row.addArrangedSubview(PanelUI.spacer())
+        if let backgroundTarget, let backgroundAction {
+            let styleImage = NSImage(systemSymbolName: "square.on.square",
+                                     accessibilityDescription: "背景样式")?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
+            let styleButton = NSButton(image: styleImage ?? NSImage(), target: backgroundTarget, action: backgroundAction)
+            styleButton.isBordered = false
+            styleButton.contentTintColor = .secondaryLabelColor
+            styleButton.toolTip = "背景样式"
+            styleButton.setAccessibilityLabel("背景样式")
+            styleButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
+            styleButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+            row.addArrangedSubview(styleButton)
+            backgroundStyleButton = styleButton
+        }
         addSubview(row)
         PanelUI.pin(row, to: self)
     }
@@ -2450,13 +2540,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
-    var previewAppearance: NSAppearance? { didSet { contentController.view.appearance = previewAppearance } }
+    /// 预览专用外观：show 之后再赋给 popover.appearance（show 前设置会得到空内容窗口）；
+    /// 生产路径恒为 nil，popover 沿用系统继承外观。
+    var previewAppearance: NSAppearance?
     var isOpen: Bool { popover.isShown }
 
     private let popover = NSPopover()
     private let contentController = NSViewController()
-    private let effect = NSVisualEffectView()
-    private let solid = PanelSolidBackgroundView()
+    // effect/solid 暴露为 internal：--self-test 断言背景层 hidden/opacity 用，生产路径仍只经 applyBackgroundStyle() 驱动。
+    let effect = NSVisualEffectView()
+    let solid = PanelSolidBackgroundView()
     private let headerContainer = NSView()
     private let footerContainer = NSView()
     private let scrollView = NSScrollView()
@@ -2472,6 +2565,42 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private static let maximumWidth: CGFloat = 330
     private var panelWidth = UsagePanelController.maximumWidth
 
+    // MARK: 背景样式（PanelBackgroundStyle）
+    // 用户已保存偏好；预览覆盖（--visual-preview-background=）优先于它渲染，且两者都不经 reduce 透明度改写。
+    private(set) var storedBackgroundStyle = PanelBackgroundStyleStore.load()
+    /// 预览专用：强制按指定样式渲染（不读 UserDefaults、不落盘），供背景矩阵截图回归。
+    var previewBackgroundOverride: PanelBackgroundStyle?
+    /// 预览专用：强制按「降低透明度」渲染（不读真实无障碍状态），供 reduce 回归截图。
+    var previewReduceTransparencyOverride: Bool?
+    /// 预览模式下禁用持久化：--visual-preview* 运行的是真实二进制，不能改写用户真实偏好。
+    var previewSuppressesPersistence = false
+    /// --self-test 注入：模拟旧系统液态玻璃不可用；生产按系统版本判定，运行期不再改动。
+    static var liquidGlassSupportOverride: Bool?
+    static var isLiquidGlassSupported: Bool {
+        if let overridden = liquidGlassSupportOverride { return overridden }
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+    private var workspaceObserver: NSObjectProtocol?
+    private var persistenceEnabled: Bool { previewBackgroundOverride == nil && !previewSuppressesPersistence }
+    /// 预览专用：popover 窗口屏幕坐标与层级（背板定位与屏幕合成截图用）。
+    var previewWindowInfoForTest: (frame: NSRect, level: NSWindow.Level)? {
+        guard let window = contentController.view.window else { return nil }
+        return (window.frame, window.level)
+    }
+    /// --self-test 用：内容视图身份（切换背景样式不得重建内容）；未建内容时先补一次重建。
+    var arrangedContentViewsForTest: [NSView] {
+        if stack.arrangedSubviews.isEmpty && model != nil { rebuildContent() }
+        return stack.arrangedSubviews
+    }
+    /// 预览菜单烟测用：头部真实的「背景样式」按钮（经 PanelHeaderView 记录）。
+    private weak var headerViewForTest: PanelHeaderView?
+    var headerBackgroundButtonForTest: NSButton? { headerViewForTest?.backgroundStyleButton }
+    /// 预览菜单烟测用：当前弹出中的背景样式菜单（popUp 结束后为 nil）。
+    private(set) var activeBackgroundMenu: NSMenu?
+    /// 预览菜单烟测用：面板 local/global monitor 是否处于安装状态。
+    var backgroundMonitorsActiveForTest: Bool { localMonitor != nil || globalMonitor != nil }
+
     override init() {
         super.init()
         contentController.view = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
@@ -2480,11 +2609,19 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         popover.behavior = .transient
         popover.animates = false
         popover.delegate = self
+        applyBackgroundStyle()
+        // 系统无障碍设置变化（含降低透明度）实时套用；不重建内容、不改写已保存偏好。
+        // 该通知必须注册在 NSWorkspace 的专属 notificationCenter 上，default center 收不到。
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+            object: NSWorkspace.shared, queue: .main
+        ) { [weak self] _ in self?.applyBackgroundStyle() }
     }
 
     deinit {
         if let localMonitor = localMonitor { NSEvent.removeMonitor(localMonitor) }
         if let globalMonitor = globalMonitor { NSEvent.removeMonitor(globalMonitor) }
+        if let workspaceObserver { NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver) }
     }
 
     private func configureContent() {
@@ -2573,7 +2710,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         clear(container: headerContainer)
         clear(container: footerContainer)
 
-        let header = PanelHeaderView(model: model)
+        let header = PanelHeaderView(model: model, backgroundTarget: self,
+                                     backgroundAction: #selector(showBackgroundStyleMenu(_:)))
+        headerViewForTest = header
         let headerLine = PanelUI.separator()
         headerContainer.addSubview(header)
         headerContainer.addSubview(headerLine)
@@ -2921,6 +3060,56 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
     }
 
+    /// 预览专用：popover 窗口自身位图的不透明采样占比（0...1）。
+    /// 偶发“窗口在屏但像素未合成”的时序 flake 下该值≈0，用作合成截图有效性守门。生产路径不调用。
+    func windowInkCoverageForPreview() -> Double {
+        guard let window = contentController.view.window,
+              let image = CGWindowListCreateImage(.null, .optionIncludingWindow,
+                  CGWindowID(window.windowNumber), [.boundsIgnoreFraming, .bestResolution]) else { return 0 }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard rep.pixelsWide > 0, rep.pixelsHigh > 0 else { return 0 }
+        let total = rep.pixelsWide * rep.pixelsHigh
+        let step = max(1, total / 20_000)
+        var opaque = 0, samples = 0
+        for index in stride(from: 0, to: total, by: step) {
+            let x = index % rep.pixelsWide
+            let y = index / rep.pixelsWide
+            samples += 1
+            if let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.5 { opaque += 1 }
+        }
+        guard samples > 0 else { return 0 }
+        return Double(opaque) / Double(samples)
+    }
+
+    /// 预览专用：屏幕合成截图——popover 区域内全部在屏窗口（含测试背板）按真实合成结果拍下；
+    /// 用于毛玻璃/液态玻璃的透底验证。背板层级紧贴 popover 之下、高于全部普通窗口，
+    /// 且完全覆盖截图区域，因此截图内容只含面板与背板，不会采到用户真实窗口。
+    /// requireWindowInk：仅当 popover 窗口自身位图确有内容（墨水占比达阈）才认成功，
+    /// 防止把“只有背板没有面板”的空帧当 PASS。生产路径不调用。
+    func savePreviewCompositeImage(to path: String, requireWindowInk: Bool = true) -> Bool {
+        guard let window = contentController.view.window else { return false }
+        if requireWindowInk {
+            let coverage = windowInkCoverageForPreview()
+            guard coverage >= 0.2 else { return false }
+        }
+        // Cocoa 全局屏幕坐标（主屏左下原点）→ CG 全局坐标（主屏左上原点）：必须用主屏高度换算，
+        // 用窗口所在屏高度在多屏（尤其副屏在上/竖屏）场景会算错区域。
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        var frame = window.frame
+        frame.origin.y = primaryHeight - frame.maxY
+        let cgFrame = NSRectToCGRect(frame)
+        guard let image = CGWindowListCreateImage(cgFrame,
+                [.optionOnScreenOnly], kCGNullWindowID, [.boundsIgnoreFraming, .bestResolution]) else { return false }
+        let rep = NSBitmapImageRep(cgImage: image)
+        // 尺寸守门：宽高比必须与 popover 窗口一致，防止坐标换算错误时静默截到别的屏幕内容。
+        guard frame.width > 0, frame.height > 0, rep.pixelsWide > 0, rep.pixelsHigh > 0 else { return false }
+        let expectedRatio = frame.width / frame.height
+        let actualRatio = CGFloat(rep.pixelsWide) / CGFloat(rep.pixelsHigh)
+        guard abs(expectedRatio - actualRatio) / expectedRatio < 0.05 else { return false }
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: URL(fileURLWithPath: path), options: .atomic)) != nil
+    }
+
     func toggle(anchoredTo button: NSStatusBarButton) {
         if isOpen { close() } else { show(anchoredTo: button) }
     }
@@ -2930,10 +3119,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         anchorButton = button
         if needsRebuild { rebuildContent(); needsRebuild = false }
         layoutPanel(buttonWindow: buttonWindow)
-        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-        solid.opacity = reduceTransparency ? 1 : 0.9
-        effect.isHidden = reduceTransparency
+        applyBackgroundStyle()
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // 深色 chrome 需在 show 之后显式赋外观；生产路径 previewAppearance 为 nil，行为不变。
+        popover.appearance = previewAppearance
         // 弹出时不把初始第一响应者落在首个可聚焦控件上：焦点强调会让该控件染上品牌蓝。
         // Tab / Full Keyboard Access 导航不依赖初始第一响应者，键盘可达性不受影响。
         contentController.view.window?.makeFirstResponder(nil)
@@ -2984,6 +3173,75 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             self.close()
             return event
         }
+    }
+
+    // MARK: 背景样式菜单与应用
+
+    /// 统一背景应用入口：面板打开、样式切换、系统「降低透明度」通知都走这里；
+    /// 只切换背景层 hidden/opacity，不 rebuild 内容，不改写已保存偏好。
+    func applyBackgroundStyle() {
+        var style = previewBackgroundOverride ?? storedBackgroundStyle
+        // 旧系统没有原生液态玻璃 chrome：存储值不变，渲染降级为经典毛玻璃。
+        if style == .liquidGlass && !Self.isLiquidGlassSupported { style = .classicMaterial }
+        let reduceTransparency = previewReduceTransparencyOverride
+            ?? NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
+        // 降低透明度临时强制 solid，退出无障碍设置后自动回到用户偏好。
+        if reduceTransparency { style = .solid }
+        switch style {
+        case .solid:
+            solid.isHidden = false
+            solid.opacity = 1
+            effect.isHidden = true
+        case .classicMaterial:
+            solid.isHidden = true
+            effect.isHidden = false
+        case .liquidGlass:
+            // macOS 26+：自绘背景层全部隐藏，露出新 SDK 原生 NSPopover chrome（液态玻璃）。
+            solid.isHidden = true
+            effect.isHidden = true
+        }
+    }
+
+    /// 构建背景样式菜单（顺序固定：纯色/液态玻璃/经典毛玻璃，当前项打勾）。
+    /// 离线测试直接断言本返回值，不弹出真实 NSMenu。
+    func makeBackgroundStyleMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let active = previewBackgroundOverride ?? storedBackgroundStyle
+        for style in PanelBackgroundStyle.allCases {
+            let legacy = style == .liquidGlass && !Self.isLiquidGlassSupported
+            let item = NSMenuItem(title: legacy ? "液态玻璃（需 macOS 26+）" : style.menuTitle,
+                                  action: #selector(selectBackgroundStyle(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = style.rawValue
+            item.state = style == active ? .on : .off
+            if legacy {
+                item.isEnabled = false
+                item.toolTip = "需 macOS 26+"
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func showBackgroundStyleMenu(_ sender: NSButton) {
+        let menu = makeBackgroundStyleMenu()
+        // NSMenu 自带事件循环：期间挂起 local/global monitor，避免面板被自己的 monitor 关闭；结束后恢复。
+        let hadMonitors = localMonitor != nil || globalMonitor != nil
+        if hadMonitors { removeMonitors() }
+        activeBackgroundMenu = menu
+        menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.maxX, y: -6), in: sender)
+        activeBackgroundMenu = nil
+        if hadMonitors && isOpen { installMonitors() }
+    }
+
+    /// internal：--self-test 直构 NSMenuItem 驱动同一条选择路径（与菜单点击一致）。
+    @objc func selectBackgroundStyle(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let style = PanelBackgroundStyle(rawValue: raw) else { return }
+        storedBackgroundStyle = style
+        if persistenceEnabled { PanelBackgroundStyleStore.save(style) }
+        applyBackgroundStyle()
     }
 
     private func removeMonitors() {
@@ -3653,11 +3911,42 @@ private final class PanelFooterView: NSView {
 
 // MARK: - App
 
+/// 统一测试背板（仅 --visual-preview-backdrop / --visual-preview-background-test 创建）：
+/// 固定 sRGB 高饱和斜条纹，不随系统强调色/外观变化，保证截图跨机器可比较；
+/// solid 档完全不透，毛玻璃/液态玻璃会透出可辨底色。
+final class PreviewBackdropView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        NSColor(srgbRed: 0.96, green: 0.95, blue: 0.93, alpha: 1).setFill()
+        context.fill(bounds)
+        let stripes: [NSColor] = [
+            NSColor(srgbRed: 0.13, green: 0.62, blue: 0.59, alpha: 1),
+            NSColor(srgbRed: 0.55, green: 0.36, blue: 0.90, alpha: 1),
+            NSColor(srgbRed: 0.98, green: 0.62, blue: 0.18, alpha: 1),
+            NSColor(srgbRed: 0.94, green: 0.35, blue: 0.55, alpha: 1),
+            NSColor(srgbRed: 0.20, green: 0.47, blue: 0.95, alpha: 1),
+            NSColor(srgbRed: 0.25, green: 0.72, blue: 0.40, alpha: 1)
+        ]
+        context.saveGState()
+        context.translateBy(x: bounds.midX, y: bounds.midY)
+        context.rotate(by: .pi / 6)
+        let band: CGFloat = 34
+        let diagonal = hypot(bounds.width, bounds.height)
+        for (index, x) in stride(from: -diagonal, to: diagonal, by: band * 2).enumerated() {
+            stripes[index % stripes.count].setFill()
+            context.fill(NSRect(x: x, y: -diagonal, width: band, height: diagonal * 2))
+        }
+        context.restoreGState()
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelController = UsagePanelController()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
     private var previewRefreshCount = 0
     private var previewQuitCount = 0
+    // 预览专用测试背板：--visual-preview-backdrop 时垫在面板后面，让透明/混合材质在截图中可辨；生产路径不创建。
+    private var previewBackdropWindow: NSWindow?
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -4244,11 +4533,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func configureVisualPreview() {
         let args = CommandLine.arguments
+        // 所有 --visual-preview* 路径统一禁止持久化：预览运行真实二进制，样式选择只影响本次渲染。
+        panelController.previewSuppressesPersistence = true
         if args.contains("--visual-preview-dark") {
             NSApp.appearance = NSAppearance(named: .darkAqua)
             panelController.previewAppearance = NSAppearance(named: .darkAqua)
         }
         if args.contains("--visual-preview-narrow") { panelController.previewWidth = 300 }
+        // 背景样式预览覆盖：只影响本次渲染，不读也不写真实 UserDefaults；非法值直接拒绝启动。
+        let backgroundPrefix = "--visual-preview-background="
+        if let arg = args.first(where: { $0.hasPrefix(backgroundPrefix) }) {
+            let raw = String(arg.dropFirst(backgroundPrefix.count))
+            guard let style = PanelBackgroundStyle(rawValue: raw) else {
+                fputs("KimiUsage: 未知背景样式 \(raw)（支持 solid/liquidGlass/classicMaterial）\n", stderr)
+                exit(2)
+            }
+            panelController.previewBackgroundOverride = style
+        }
+        // 预览始终显式给定 reduce 语义（未传旗标即 false），绝不读取真实无障碍状态——
+        // 否则开启「降低透明度」的机器会让矩阵 classic/liquid 静默变 solid。
+        panelController.previewReduceTransparencyOverride = args.contains("--visual-preview-reduce-transparency")
         // 健康预览使用当前时间，避免固定历史时间被现有过期规则标成 stale；异常分支仍由 states 显式注入。
         let now = Date()
         lastAttemptAt = now
@@ -4343,7 +4647,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu(); renderBar()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
+            // 背景矩阵回归以子进程单拍方式运行（每个组合独立进程，避免中途改外观后
+            // 系统胶囊窗口内容失效），父进程不需要弹出自己的面板。
+            if let arg = args.first(where: { $0.hasPrefix("--visual-preview-background-test=") }) {
+                self.runBackgroundStyleMatrixTest(outputDirectory: String(arg.dropFirst("--visual-preview-background-test=".count)))
+                return
+            }
             self.panelController.toggle(anchoredTo: button)
+            if args.contains("--visual-preview-background-menu-test") {
+                self.runPreviewBackgroundMenuTest()
+                return
+            }
+            if args.contains("--visual-preview-backdrop"), let info = self.panelController.previewWindowInfoForTest {
+                self.placePreviewBackdrop(around: info.frame, popoverLevel: info.level)
+            }
             if args.contains("--visual-preview-models") { self.panelController.expandAllTokenBucketsForPreview() }
             if args.contains("--visual-preview-tools") { self.panelController.expandToolsForPreview() }
             if args.contains("--visual-preview-test") {
@@ -4374,10 +4691,176 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let path = String(arg.dropFirst(prefix.count))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     if args.contains("--visual-preview-scroll-end") { _ = self.panelController.scrollToEndForPreview() }
-                    exit(self.panelController.savePreviewImage(to: path) ? 0 : 1)
+                    if self.previewBackdropWindow == nil {
+                        exit(self.panelController.savePreviewImage(to: path) ? 0 : 1)
+                    }
+                    // 背板合成截图带有效性守门（面板窗口位图必须有墨水）；
+                    // 偶发“窗口在屏但像素未合成”时强制激活/显示后重试，重试耗尽以非零退出，不静默假 PASS。
+                    var attempt = 0
+                    func capture() {
+                        attempt += 1
+                        if self.panelController.savePreviewCompositeImage(to: path) { exit(0) }
+                        guard attempt < 3, self.panelController.isOpen else { exit(1) }
+                        _ = self.panelController.keyWindowForPreview()
+                        self.panelController.applyBackgroundStyle()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { capture() }
+                    }
+                    capture()
                 }
             }
         }
+    }
+
+    // MARK: 背景样式预览回归（--visual-preview-background-test=<目录>）
+
+    /// 统一测试背板：高饱和固定色斜条纹，垫在面板下方；毛玻璃/液态玻璃会透出可辨底色，solid 则完全遮住。
+    /// 层级取 popover-1（高于所有普通窗口）：截图区域被背板完全覆盖，不会采到用户真实窗口内容。
+    /// 生产路径（常驻应用、--once、--tokens-once、--self-test）永远不会创建该窗口。
+    private func placePreviewBackdrop(around popoverFrame: NSRect, popoverLevel: NSWindow.Level) {
+        let pad: CGFloat = 48
+        let frame = popoverFrame.insetBy(dx: -pad, dy: -pad)
+        if let window = previewBackdropWindow {
+            window.setFrame(frame, display: true)
+            return
+        }
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.level = NSWindow.Level(rawValue: popoverLevel.rawValue - 1)
+        window.isOpaque = false
+        window.ignoresMouseEvents = true   // 预览自动化不拦截任何输入
+        window.contentView = PreviewBackdropView(frame: NSRect(origin: .zero, size: frame.size))
+        window.orderFrontRegardless()
+        previewBackdropWindow = window
+    }
+
+    /// 背景样式矩阵回归：每档样式 × 明暗外观各出一张屏幕合成截图，另加「降低透明度强制 solid」三张。
+    /// 每个组合以独立子进程单拍（--visual-preview-background/--visual-preview-dark/
+    /// --visual-preview-reduce-transparency/--visual-preview-backdrop/--visual-preview-output），
+    /// 中途不改运行中进程的外观——改动已显示的系统胶囊窗口内容会得到空帧；
+    /// 也不弹真实 NSMenu、不写真实 UserDefaults（子进程均为覆盖模式）。任一截图失败即非零退出。
+    /// 解析当前可执行文件绝对路径：Bundle.main 优先；退化用 argv[0]（文档的
+    /// `./KimiUsage.app/Contents/MacOS/KimiUsage ...` 相对写法按 cwd 补全）。
+    private func resolvedExecutablePathForPreview() -> String? {
+        if let url = Bundle.main.executableURL,
+           FileManager.default.fileExists(atPath: url.path) { return url.path }
+        let argv0 = CommandLine.arguments.first ?? ""
+        guard !argv0.isEmpty, argv0.hasPrefix("-") == false else { return nil }
+        if argv0.hasPrefix("/") { return FileManager.default.fileExists(atPath: argv0) ? argv0 : nil }
+        let candidate = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(argv0).standardizedFileURL.path
+        return FileManager.default.fileExists(atPath: candidate) ? candidate : nil
+    }
+
+    private func runBackgroundStyleMatrixTest(outputDirectory: String) {
+        func fail(_ message: String) -> Never {
+            fputs("KimiUsage background style test: FAIL: \(message)\n", stderr)
+            exit(1)
+        }
+        guard let executable = resolvedExecutablePathForPreview() else {
+            fail("cannot resolve executable path (argv0=\(CommandLine.arguments.first ?? "-"))")
+        }
+        let styles: [PanelBackgroundStyle] = [.solid, .liquidGlass, .classicMaterial]
+        var combos: [(file: String, args: [String])] = []
+        for style in styles {
+            combos.append(("background-\(style.rawValue)-light", ["--visual-preview-background=\(style.rawValue)"]))
+            combos.append(("background-\(style.rawValue)-dark", ["--visual-preview-background=\(style.rawValue)", "--visual-preview-dark"]))
+            combos.append(("background-\(style.rawValue)-reduce", ["--visual-preview-background=\(style.rawValue)", "--visual-preview-reduce-transparency"]))
+        }
+        try? FileManager.default.createDirectory(atPath: outputDirectory, withIntermediateDirectories: true)
+        var failures: [String] = []
+        for combo in combos {
+            let path = outputDirectory + "/" + combo.file + ".png"
+            try? FileManager.default.removeItem(atPath: path)
+            let arguments = ["--visual-preview"] + combo.args
+                + ["--visual-preview-backdrop", "--visual-preview-output=\(path)"]
+            let child = Process()
+            child.executableURL = URL(fileURLWithPath: executable)
+            child.arguments = arguments
+            child.standardOutput = FileHandle.nullDevice
+            child.standardError = FileHandle.nullDevice
+            do { try child.run() } catch { fail("spawn \(combo.file): \(error)") }
+            // 子进程超时保护：单拍正常 ~3s，90s 未退出即 terminate 并判失败，避免回归造成无限等待。
+            let exited = DispatchSemaphore(value: 0)
+            DispatchQueue.global().async { child.waitUntilExit(); exited.signal() }
+            guard exited.wait(timeout: .now() + 90) == .success else {
+                child.terminate()
+                fail("\(combo.file) timed out after 90s")
+            }
+            if child.terminationStatus != 0 {
+                failures.append("\(combo.file) exit \(child.terminationStatus)")
+                continue
+            }
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+                  (attributes[.size] as? NSNumber)?.intValue ?? 0 > 1024 else {
+                failures.append("\(combo.file) missing/empty screenshot")
+                continue
+            }
+        }
+        guard failures.isEmpty else { fail(failures.joined(separator: "; ")) }
+        print("KimiUsage background style test: PASS \(combos.count) shots -> \(outputDirectory)")
+        exit(0)
+    }
+
+    /// 真实 NSMenu 事件烟测（--visual-preview-background-menu-test，preview-only）：
+    /// 经头部真实按钮路径弹出菜单（popUp 同步 tracking），用 .common 模式 Timer（含菜单跟踪
+    /// runloop 模式）延时 `performActionForItem(at:)` 选择并 `cancelTracking` 结束；
+    /// 断言选择已应用、主 transient popover 全程 isOpen、菜单返回后 local/global monitor 已恢复、
+    /// 真实 UserDefaults 未被写入。不用只构造 NSMenuItem 直调 action 的假路径。
+    private func runPreviewBackgroundMenuTest() {
+        func fail(_ message: String) -> Never {
+            fputs("KimiUsage background menu test: FAIL: \(message)\n", stderr)
+            exit(1)
+        }
+        guard let headerButton = panelController.headerBackgroundButtonForTest else {
+            fail("header background style button not found")
+        }
+        let defaultsKey = PanelBackgroundStyle.defaultsKey
+        let storedBefore = UserDefaults.standard.string(forKey: defaultsKey)
+        // 菜单顺序固定：0=纯色 1=液态玻璃 2=经典毛玻璃（当前系统液态可用）
+        let plan: [(index: Int, style: PanelBackgroundStyle)] = [(1, .liquidGlass), (2, .classicMaterial)]
+        var step = 0
+        func scheduleSelection() {
+            // .common 模式（含菜单跟踪 runloop 模式）在 tracking 期间触发：选择并结束 tracking
+            let timer = Timer(timeInterval: 0.8, repeats: false) { [weak self] _ in
+                guard let self, let menu = self.panelController.activeBackgroundMenu else {
+                    fputs("KimiUsage background menu test: FAIL: background menu was not tracking\n", stderr)
+                    exit(1)
+                }
+                menu.performActionForItem(at: plan[step].index)
+                menu.cancelTracking()
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            // 看门狗：10s 仍在跟踪说明选择 Timer 未生效，强制结束 tracking 让断言给出明确 FAIL。
+            let watchdog = Timer(timeInterval: 10, repeats: false) { [weak self] _ in
+                guard let self, self.panelController.activeBackgroundMenu != nil else { return }
+                self.panelController.activeBackgroundMenu?.cancelTracking()
+            }
+            RunLoop.main.add(watchdog, forMode: .common)
+        }
+        func verify(_ style: PanelBackgroundStyle) {
+            guard panelController.storedBackgroundStyle == style else {
+                fail("menu selection was not applied (\(style.rawValue))")
+            }
+            guard panelController.isOpen else {
+                fail("transient popover closed during menu tracking (\(style.rawValue))")
+            }
+            guard panelController.backgroundMonitorsActiveForTest else {
+                fail("local/global monitors not restored after menu (\(style.rawValue))")
+            }
+        }
+        func next() {
+            guard step < plan.count else {
+                let storedAfter = UserDefaults.standard.string(forKey: defaultsKey)
+                guard storedAfter == storedBefore else { fail("preview wrote real UserDefaults") }
+                print("KimiUsage background menu test: PASS liquidGlass+classicMaterial selected, popover kept open, monitors restored, real defaults untouched")
+                exit(0)
+            }
+            scheduleSelection()
+            headerButton.performClick(nil)   // 真实按钮动作：popUp 阻塞至 cancelTracking
+            verify(plan[step].style)
+            step += 1
+            next()
+        }
+        next()
     }
 
     // The fake transport lets overlapping checks complete through the normal main-queue path.
@@ -4679,6 +5162,184 @@ enum KimiOfflineRegression {
                            abs(color.blueComponent - CGFloat(hex & 0xff) / 255) < 0.001,
                            "incorrect plan color for \(name)")
             }
+            // MARK: 面板背景样式（解析/持久化/菜单结构/旧系统降级/reduce 强制/切换不重建）
+            // 内存 backend：绝不读写真实用户偏好；结束恢复生产存取与系统判定。
+            let endMemoryBackend = PanelBackgroundStyleStore.beginMemoryOverride()
+            UsagePanelController.liquidGlassSupportOverride = false
+            let styleController = UsagePanelController()
+            // 注入最小模型并补一次内容重建：让「切换不重建」断言有真实内容可对照（面板保持关闭）。
+            styleController.update(model: UsagePanelModel(
+                updateItem: nil, title: "Kimi 用量", planName: nil, accountLine: nil, quotas: [],
+                usage: UsagePanelModel.TokenSection(title: "用量情况", accent: .codex, buckets: [], notices: []),
+                brief: UsagePanelModel.BriefSection(days: [],
+                    day: UsagePanelModel.BriefComparison(label: "较昨日", text: "数据不足",
+                        direction: .flat, detail: ""),
+                    week: UsagePanelModel.BriefComparison(label: "较前 7 天", text: "数据不足",
+                        direction: .flat, detail: ""),
+                    notices: []),
+                tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
+                refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
+                loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
+                quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")))
+            // 隔离真实无障碍状态：显式给定 reduce=false，机器开启「降低透明度」也不影响判定。
+            styleController.previewReduceTransparencyOverride = false
+            defer {
+                endMemoryBackend()
+                UsagePanelController.liquidGlassSupportOverride = nil
+            }
+            try expect(PanelBackgroundStyle.defaultsKey == "panelBackgroundStyle", "background style defaults key changed")
+            try expect(PanelBackgroundStyle.parse(nil) == .solid, "missing background style did not fall back to solid")
+            try expect(PanelBackgroundStyle.parse("") == .solid, "empty background style did not fall back to solid")
+            try expect(PanelBackgroundStyle.parse("bogus") == .solid, "invalid background style did not fall back to solid")
+            try expect(PanelBackgroundStyle.parse("solid") == .solid
+                       && PanelBackgroundStyle.parse("liquidGlass") == .liquidGlass
+                       && PanelBackgroundStyle.parse("classicMaterial") == .classicMaterial,
+                       "background style raw values changed")
+            try expect(PanelBackgroundStyleStore.load() == .solid, "fresh defaults did not fall back to solid")
+            PanelBackgroundStyleStore.save(.classicMaterial)
+            try expect(PanelBackgroundStyleStore.load() == .classicMaterial, "background style did not persist")
+            PanelBackgroundStyleStore.setRawForTest("glassy")
+            try expect(PanelBackgroundStyleStore.load() == .solid, "invalid stored style did not fall back to solid")
+
+            // 菜单结构离线断言（不弹真实 NSMenu）：顺序固定，当前项打勾，目标/动作齐全
+            func menuProfile(_ menu: NSMenu, stored: PanelBackgroundStyle, liquidTitle: String) throws {
+                let titles = menu.items.map(\.title)
+                try expect(titles == ["纯色", liquidTitle, "经典毛玻璃"], "background menu order changed: \(titles)")
+                for (item, style) in zip(menu.items, PanelBackgroundStyle.allCases) {
+                    try expect(item.representedObject as? String == style.rawValue, "background menu payload changed")
+                    try expect((item.state == .on) == (style == stored), "background menu checkmark wrong for \(style.rawValue)")
+                    try expect(item.action != nil && item.target != nil, "background menu item missing target/action")
+                }
+            }
+            // solid 档（缺省）：纯色层可见且全不透明（取消 0.9 混合），effect 隐藏
+            try expect(!styleController.solid.isHidden && styleController.solid.opacity == 1 && styleController.effect.isHidden,
+                       "solid style did not show opaque solid layer and hide effect")
+
+            // 头部几何：背景样式按钮贴 header trailing（外层 row 弹性间隔撑开），
+            // 24×24 尺寸固定，位置不随套餐标签宽度漂移。
+            let geometryTarget = ProcessInfo.processInfo   // 仅充当 target，测试内不点击
+            let geometryAction = Selector(("backgroundStyleMenuDummy:"))
+            func makeHeader(plan: String?) -> PanelHeaderView {
+                PanelHeaderView(model: UsagePanelModel(
+                    updateItem: nil, title: "Kimi 用量", planName: plan, accountLine: nil, quotas: [],
+                    usage: UsagePanelModel.TokenSection(title: "用量情况", accent: .codex, buckets: [], notices: []),
+                    brief: UsagePanelModel.BriefSection(days: [],
+                        day: UsagePanelModel.BriefComparison(label: "较昨日", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        week: UsagePanelModel.BriefComparison(label: "较前 7 天", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        notices: []),
+                    tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
+                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
+                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")),
+                    backgroundTarget: geometryTarget, backgroundAction: geometryAction)
+            }
+            func headerButtonFrame(plan: String) -> NSRect {
+                let header = makeHeader(plan: plan)
+                header.frame = NSRect(x: 0, y: 0, width: 330, height: 60)
+                header.layoutSubtreeIfNeeded()
+                guard let button = header.backgroundStyleButton else { return .zero }
+                return button.convert(button.bounds, to: header)
+            }
+            let shortPlanFrame = headerButtonFrame(plan: "GO")
+            let longPlanFrame = headerButtonFrame(plan: "ALLEGRETTO")
+            try expect(!shortPlanFrame.isEmpty, "header background style button missing")
+            // 名义 24×24；NSButton 内部内容约束会把实际 frame 拉到 ~24.5×30.5（点击热区略大，视觉等价），
+            // 断言用容差守住下限，避免对引擎消解细节过拟合。
+            try expect(abs(NSMaxX(shortPlanFrame) - 330) < 1,
+                       "background button not pinned to header trailing: \(shortPlanFrame)")
+            try expect(shortPlanFrame.width >= 22 && shortPlanFrame.width <= 25.5
+                       && shortPlanFrame.height >= 22 && shortPlanFrame.height <= 32,
+                       "background button is far from nominal 24×24: \(shortPlanFrame)")
+            try expect(abs(NSMaxX(longPlanFrame) - NSMaxX(shortPlanFrame)) < 0.5,
+                       "background button drifts with plan tag width: \(shortPlanFrame) vs \(longPlanFrame)")
+            let legacyMenu = styleController.makeBackgroundStyleMenu()
+            try menuProfile(legacyMenu, stored: .solid, liquidTitle: "液态玻璃（需 macOS 26+）")
+            try expect(legacyMenu.items[0].isEnabled && legacyMenu.items[2].isEnabled,
+                       "legacy system wrongly disabled non-liquid background items")
+            try expect(!legacyMenu.items[1].isEnabled && legacyMenu.items[1].toolTip == "需 macOS 26+",
+                       "legacy system did not disable liquid glass item with macOS 26 note")
+
+            // 旧系统 + 存储 liquidGlass：渲染降级 classicMaterial，存储值不改写，菜单仍打勾但禁用
+            PanelBackgroundStyleStore.setRawForTest(PanelBackgroundStyle.liquidGlass.rawValue)
+            let legacyLiquidController = UsagePanelController()
+            legacyLiquidController.previewReduceTransparencyOverride = false
+            try expect(legacyLiquidController.storedBackgroundStyle == .liquidGlass, "stored liquid style lost on reload")
+            legacyLiquidController.applyBackgroundStyle()
+            try expect(legacyLiquidController.solid.isHidden && !legacyLiquidController.effect.isHidden,
+                       "legacy system did not degrade stored liquid style to classic material")
+            try expect(PanelBackgroundStyleStore.load() == .liquidGlass, "legacy degradation rewrote stored preference")
+            let legacyLiquidMenu = legacyLiquidController.makeBackgroundStyleMenu()
+            try expect(legacyLiquidMenu.items[1].state == .on && !legacyLiquidMenu.items[1].isEnabled,
+                       "legacy menu did not reflect stored liquid style as checked but disabled")
+
+            // 新系统：经菜单动作真实选中 liquidGlass → 双自绘层隐藏 + 持久化；切换不重建内容
+            UsagePanelController.liquidGlassSupportOverride = true
+            func select(_ controller: UsagePanelController, _ style: PanelBackgroundStyle) {
+                let item = NSMenuItem(title: style.menuTitle, action: nil, keyEquivalent: "")
+                item.representedObject = style.rawValue
+                controller.selectBackgroundStyle(item)
+            }
+            select(styleController, .liquidGlass)
+            try expect(styleController.storedBackgroundStyle == .liquidGlass, "menu selection did not update stored style")
+            try expect(PanelBackgroundStyleStore.load() == .liquidGlass, "menu selection did not persist style")
+            try expect(styleController.solid.isHidden && styleController.effect.isHidden,
+                       "liquid glass on modern system did not hide both painted layers")
+            try expect(!styleController.arrangedContentViewsForTest.isEmpty, "no content rows available for identity check")
+            let contentBefore = styleController.arrangedContentViewsForTest.map(ObjectIdentifier.init)
+            select(styleController, .classicMaterial)
+            select(styleController, .solid)
+            let contentAfter = styleController.arrangedContentViewsForTest.map(ObjectIdentifier.init)
+            try expect(contentBefore == contentAfter, "background style switch rebuilt panel content")
+            try expect(!styleController.solid.isHidden && styleController.solid.opacity == 1 && styleController.effect.isHidden,
+                       "solid style re-apply did not restore opaque layer")
+            let modernMenu = styleController.makeBackgroundStyleMenu()
+            try menuProfile(modernMenu, stored: .solid, liquidTitle: "液态玻璃")
+            try expect(modernMenu.items[1].isEnabled, "modern system disabled liquid glass menu item")
+            let modernLiquidTip = modernMenu.items[1].toolTip
+            try expect(modernLiquidTip == nil || modernLiquidTip!.isEmpty, "modern liquid item carried legacy macOS 26 note")
+
+            // 降低透明度：临时强制 solid（opacity=1、effect 隐藏），偏好不被改写；解除后恢复
+            // （解除即回到显式 false，与预览一致：非 nil 就绝不读真实无障碍状态）
+            select(styleController, .classicMaterial)
+            try expect(!styleController.effect.isHidden, "classic style did not show effect layer")
+            styleController.previewReduceTransparencyOverride = true
+            styleController.applyBackgroundStyle()
+            try expect(!styleController.solid.isHidden && styleController.solid.opacity == 1 && styleController.effect.isHidden,
+                       "reduce transparency did not force solid rendering")
+            try expect(styleController.storedBackgroundStyle == .classicMaterial
+                       && PanelBackgroundStyleStore.load() == .classicMaterial,
+                       "reduce transparency rewrote stored preference")
+            styleController.previewReduceTransparencyOverride = false
+            styleController.applyBackgroundStyle()
+            try expect(!styleController.effect.isHidden,
+                       "explicit reduce=false must ignore real accessibility state")
+
+            // 预览覆盖：渲染跟随覆盖值且绝不落盘（模拟 --visual-preview-background=）
+            _ = PanelBackgroundStyleStore.beginMemoryOverride()   // 存储重置回缺省 solid
+            try expect(PanelBackgroundStyleStore.load() == .solid, "storage reset did not fall back to solid")
+            try expect(styleController.storedBackgroundStyle == .classicMaterial,
+                       "in-memory style should not follow defaults removal")
+            styleController.previewBackgroundOverride = .liquidGlass
+            styleController.previewSuppressesPersistence = true
+            styleController.applyBackgroundStyle()
+            try expect(styleController.solid.isHidden && styleController.effect.isHidden,
+                       "preview background override did not render liquid glass")
+            select(styleController, .classicMaterial)
+            try expect(!PanelBackgroundStyleStore.hasValueForTest,
+                       "preview mode wrote real stored preference")
+            try expect(styleController.storedBackgroundStyle == .classicMaterial,
+                       "preview suppression cleared in-memory style")
+            let overrideMenu = styleController.makeBackgroundStyleMenu()
+            try menuProfile(overrideMenu, stored: .liquidGlass, liquidTitle: "液态玻璃")
+            styleController.previewBackgroundOverride = nil
+            styleController.previewSuppressesPersistence = false
+            styleController.applyBackgroundStyle()
+            try expect(!styleController.effect.isHidden, "classic rendering lost after preview override release")
+
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")
             try expect(absent.sevenDayUsed == nil && absent.sevenDayError != nil, "missing 7D was not rejected")
@@ -5462,7 +6123,7 @@ enum KimiOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.4.0",
                        "prerelease not skipped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

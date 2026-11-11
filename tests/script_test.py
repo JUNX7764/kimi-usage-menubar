@@ -217,6 +217,14 @@ done
 printf '#!/bin/bash\nexit 0\n' > "$out"
 chmod +x "$out"
 ''')
+        # build.sh 的 macOS 26+ SDK 校验入口：默认模拟新 SDK，可用 MOCK_SDK_VERSION 覆盖（空串模拟无版本输出）
+        self._mock("xcrun", r'''
+if [ "$1" = "--show-sdk-version" ]; then
+    echo "${MOCK_SDK_VERSION-27.2}"
+    exit 0
+fi
+exec /usr/bin/xcrun "$@"
+''')
 
     def make_app(self, parent, version, marker):
         app = parent / APP_NAME
@@ -695,6 +703,48 @@ echo "build" >> "$MOCK_LOG"
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertNotIn("== 完成:", result.stdout)
         self.assertTrue(any("--sign" in line for line in self.log_lines()))
+
+    def _prepare_build_project(self):
+        project = self.base / "build-project"
+        (project / "scripts").mkdir(parents=True)
+        shutil.copy2(BUILD, project / "build.sh")
+        shutil.copy2(ROOT / "Info.plist", project / "Info.plist")
+        shutil.copy2(ROOT / "AppIcon.icns", project / "AppIcon.icns")
+        shutil.copy2(UPDATE, project / "scripts" / "update.sh")
+        (project / f"{EXECUTABLE}.swift").write_text("// swiftc is mocked\n")
+        return project
+
+    def test_build_rejects_sdk_older_than_macos26(self):
+        project = self._prepare_build_project()
+        for sdk in ("15.4", "abc", ""):
+            self.log.write_text("")
+            result = subprocess.run(
+                ["bash", str(project / "build.sh")], cwd=project,
+                env={**self.env, "MOCK_SDK_VERSION": sdk}, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertNotEqual(result.returncode, 0, f"sdk={sdk!r}: {result.stdout}")
+            self.assertNotIn("== 编译", result.stdout)
+            self.assertNotIn("== 完成:", result.stdout)
+            self.assertIn("macOS 26+ SDK", result.stdout)
+            self.assertFalse([line for line in self.log_lines() if line.startswith("swiftc ")],
+                             f"swiftc ran despite sdk={sdk!r}")
+
+    def test_build_keeps_macos13_target_and_passes_sdk_check(self):
+        project = self._prepare_build_project()
+        for sdk in ("26.0", "27.2"):
+            self.log.write_text("")
+            result = subprocess.run(
+                ["bash", str(project / "build.sh")], cwd=project,
+                env={**self.env, "MOCK_SDK_VERSION": sdk}, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+            )
+            self.assertEqual(result.returncode, 0, f"sdk={sdk}: {result.stdout}")
+            self.assertIn("== 完成:", result.stdout)
+        swift_calls = [line for line in self.log_lines() if line.startswith("swiftc ")]
+        self.assertTrue(swift_calls, "swiftc was never invoked")
+        for line in swift_calls:
+            self.assertIn("-target arm64-apple-macos13.0", line)
 
 
 if __name__ == "__main__":

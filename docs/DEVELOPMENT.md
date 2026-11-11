@@ -1,7 +1,7 @@
 # KimiUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-10。
+> 最后核对：2026-11-11。
 
 ## 文档入口与效力
 
@@ -17,7 +17,7 @@
 
 ## 构建
 
-需要 macOS 13 或更新版本、Apple Silicon 和 Xcode Command Line Tools；未安装 CLT 时先执行 `xcode-select --install`。
+需要 macOS 13 或更新版本、Apple Silicon 和 Xcode Command Line Tools；未安装 CLT 时先执行 `xcode-select --install`。编译部署目标保持 macOS 13，但构建要求 **macOS 26+ SDK**（液态玻璃背景依赖新 SDK 的原生 NSPopover chrome 语义）；`build.sh` 在编译前校验 `xcrun --show-sdk-version`，旧 SDK 以明确报错退出。
 
 ```bash
 ./build.sh
@@ -32,6 +32,7 @@
 - **配额**：通过 Kimi 远程接口查询 5 小时、7 天和月度额度
 - **头部账号行**：`GET https://www.kimi.com/api/user`（Kimi Web 认证）取昵称与手机号；手机号由服务端打码返回，客户端原样展示。Kimi 账号可能为手机号/微信注册，无 email 字段，账号行显示「昵称（打码手机号）」，两者皆缺时隐藏。随月度接口同在慢轮刷新，401 走相同的 refresh→重试链，失败保留旧值
 - **面板卡片布局**：固定头部与底部操作区，中间滚动区按额度、用量情况、用量简析、工具明细分为四张卡片；卡片只重组现有视图，不改变数据快照、默认展开状态或更新链路。面板宽 330pt（窄预览 300pt），卡片圆角 14pt、内容边距 10pt，浅色以中性表面和轻阴影分层，深色以表面色差和描边为主。工具占比条固定 72pt，为完整工具名称保留空间，并按 `ToolID` 固定分色，不随周期或用量排序变化；展开、收起和异步刷新仍实时调整 Popover 高度，超过屏幕可用高度 85% 后内部滚动。
+- **面板背景样式**：头部最右缘 24×24 `square.on.square` 按钮（icon + 标题区 + 弹性间隔 + 按钮）弹出原生 `NSMenu`（顺序固定 纯色 / 液态玻璃 / 经典毛玻璃，当前项打勾）。`PanelBackgroundStyle`（solid/liquidGlass/classicMaterial）以单个 UserDefaults key `panelBackgroundStyle` 持久化，缺省与非法值回退 solid。打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册，default center 收不到）统一走 `applyBackgroundStyle()`，只切背景层 hidden/opacity、不重建内容：solid 档 `PanelSolidBackgroundView` 全不透明（历史 0.9 混合已取消）、隐藏 effect；classicMaterial 档仅显示 `NSVisualEffectView(.popover)`；liquidGlass 档（macOS 26+）两层自绘背景全部隐藏，露出新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView 或 NSPanel。卡片深浅外观共用同一半透明表面色（`controlBackgroundColor@0.82`，历史深色 `labelColor@0.055` 会被液态玻璃彩底吞没），不按背景样式分叉。旧系统该菜单项禁用，标题直接标注「液态玻璃（需 macOS 26+）」，存储的 liquidGlass 渲染降级 classicMaterial。「降低透明度」临时强制 solid，不改写偏好；NSMenu 弹出期间挂起面板 local/global monitor，结束后恢复，主 Popover 保持 transient。
 - **Token**：扫描本地会话 wire.jsonl / 客户端 JSONL 日志，并只读查询 ZCode、Hermes 的 sqlite 用量表聚合。ZCode 以 `model_usage` 逐请求表为唯一来源；输入包含缓存读取/创建，不重复加 cache 字段。近 7 天和近 30 天均包含今天。混接客户端缺失模型名时不归属 Kimi；可信 Kimi Code 旧格式可兼容并归入「未知模型」。ZCode 暂时不可读时保留最近成功快照并提示，其他来源继续更新。Work 优先按请求 ID，或同一 agent 的 `llm.request` 与 `turnStep` 关联模型和双写用量；同一请求内用量一致且两侧各一条的 `usage.record` / `step.end` 只计一次，不受工具执行耗时限制。没有请求上下文的旧日志仍只匹配时间和位置邻近的事件。保留独有历史调用和压缩用量，跳过子任务完成汇总；只有缺少可靠模型依据的用量才进入「未知模型」。
 - **模型明细**：`scan-state-v6.json` 按「日 × 模型」保存文件贡献，ZCode 与 Hermes 同步保留模型维度；周期汇总和展开行从同一数据源计算，模型输入、输出之和等于汇总。Work 扫描修订 v4 会重建旧文件贡献，保留 sqlite 增量快照；文件追加后重扫 Work 请求上下文，未变化文件直接复用缓存。用量情况板块的周期整行控制展开与收起，模型明细行与表头四列对齐，数字列与汇总行共用等宽布局。
 - **用量情况（v1.5 合并板块）**：「用量情况」合并展示本机全部已适配来源（Kimi Work 与 API 客户端）的今日/近 7 天/近 30 天用量。合并口径：本机 Kimi 模型统计，可能包含 API、不同账号或订阅归属未确认的记录，不代表订阅账单；面板不设统计范围入口，口径以本文为准。既有去重（Work 镜像、Proma 并行日志、ZCode 唯一 model_usage 来源）在聚合前生效。
@@ -65,7 +66,22 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 视觉预览可附加 `--visual-preview-models`（展开模型明细）、`--visual-preview-tools`（展开工具明细）、`--visual-preview-dark`、`--visual-preview-narrow`、`--visual-preview-empty`、`--visual-preview-states` 或 `--visual-preview-long`。`--once` 会读取真实登录态并联网，不属于离线测试；等待超时（45s）以非零退出码报告。
 
-另有内部测试旗标（发布与用户路径不依赖）：`--visual-preview-full`、`--visual-preview-popover-test=<目录>`、`--visual-preview-update-test`、`--visual-preview-key-test`、`--visual-preview-updating`、`--visual-preview-updating-install`、`--visual-preview-output=<路径>`、`--visual-preview-scroll-end`。入口支持 `--help`；未识别的 `--` 旗标会打印错误并以退出码 2 拒绝启动，不会静默拉起常驻应用。
+背景样式预览与回归（所有 `--visual-preview*` 路径统一禁止写真实 UserDefaults；未传 `--visual-preview-reduce-transparency` 时显式按未开启渲染，绝不读真实无障碍状态；矩阵/单拍不弹真实 NSMenu）：
+
+```bash
+# 指定背景样式与明暗外观单拍（--visual-preview-output 有背板时输出屏幕合成截图）
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview --visual-preview-background=classicMaterial --visual-preview-dark --visual-preview-backdrop --visual-preview-output=/tmp/bg.png
+
+# 矩阵回归：3 样式 × 明暗 + 降低透明度强制 solid 共 9 张子进程截图（需 GUI 会话，单张 90s 超时）
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview --visual-preview-background-test=/tmp/bg-shots
+
+# 真实 NSMenu 事件烟测：经头部按钮真实弹出菜单并程序化选择（需 GUI 会话）
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview --visual-preview-background-menu-test
+```
+
+`--visual-preview-background=solid|liquidGlass|classicMaterial` 强制渲染样式；`--visual-preview-backdrop` 在面板后垫高饱和斜条纹测试背板（生产路径不创建），配合 `--visual-preview-output=` 输出背板+面板的屏幕合成截图——截图带有效性守门（面板窗口位图墨水占比达标才算成功，偶发“窗口在屏但像素未合成”会强制激活并重试，重试耗尽即非零退出，不产出空背板假 PASS）；`--visual-preview-reduce-transparency` 强制按「降低透明度」渲染。
+
+另有内部测试旗标（发布与用户路径不依赖）：`--visual-preview-full`、`--visual-preview-popover-test=<目录>`、`--visual-preview-update-test`、`--visual-preview-key-test`、`--visual-preview-updating`、`--visual-preview-updating-install`、`--visual-preview-output=<路径>`、`--visual-preview-scroll-end`、`--visual-preview-background-menu-test`（真实弹出背景样式菜单并在跟踪中程序化选择液态/经典，断言选择生效、主 Popover 保持打开、monitor 恢复、真实 UserDefaults 未写）。所有 `--visual-preview*` 路径统一禁止写真实 UserDefaults；深色预览外观在 `popover.show` 之后赋给 `popover.appearance`（show 前设置会得到空内容窗口）。入口支持 `--help`；未识别的 `--` 旗标会打印错误并以退出码 2 拒绝启动，不会静默拉起常驻应用。
 
 ## 文件说明
 
@@ -78,7 +94,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 | `scripts/icon_gen.swift` | 图标生成脚本 |
 | `scripts/update.sh` | Release 下载、校验、暂存、换包和失败回滚（含中断自愈） |
 | `scripts/release.sh` | 标签、构建、自检、资产校验和 GitHub Release 发布 |
-| `tests/script_test.py` | 更新、发布和签名故障的离线回归测试 |
+| `tests/script_test.py` | 更新、发布、签名与构建 SDK 门禁的离线回归测试 |
 
 ## 发布前必须执行
 

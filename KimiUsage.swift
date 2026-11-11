@@ -1789,7 +1789,7 @@ enum UpdateCheck {
 
     /// GitHub 按创建时间倒序返回 Release；空 Release 或附件上传不完整时跳过，
     /// 与 update.sh 选择同一个「最近可安装版本」，避免提示后下载 404。
-    static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
+    static func latestDownloadableRelease(in releases: [[String: Any]]) -> (tag: String, notes: String)? {
         for release in releases {
             guard let tag = release["tag_name"] as? String, normalized(tag) != nil,
                   release["draft"] as? Bool != true, release["prerelease"] as? Bool != true
@@ -1797,10 +1797,25 @@ enum UpdateCheck {
             let assets = release["assets"] as? [[String: Any]] ?? []
             let names = Set(assets.compactMap { $0["name"] as? String })
             if names.contains("KimiUsage.zip") && names.contains("KimiUsage.zip.sha256") {
-                return tag
+                return (tag, release["body"] as? String ?? "")
             }
         }
         return nil
+    }
+
+    static func displayNotes(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "本版本暂未提供详细更新说明" }
+        return trimmed.components(separatedBy: .newlines).map { line in
+            var value = line
+            if let range = value.range(of: #"^#{1,6}\s+"#, options: .regularExpression) { value.removeSubrange(range) }
+            if let range = value.range(of: #"^\s*[-*]\s+"#, options: .regularExpression) { value.replaceSubrange(range, with: "• ") }
+            return value.replacingOccurrences(of: "**", with: "")
+        }.joined(separator: "\n")
+    }
+
+    static func latestDownloadableTag(in releases: [[String: Any]]) -> String? {
+        latestDownloadableRelease(in: releases)?.tag
     }
 }
 
@@ -1810,6 +1825,7 @@ final class UpdateChecker {
     static let shared = UpdateChecker()
     private(set) var available = false
     private(set) var targetTag: String?
+    private(set) var releaseNotes = ""
     private var etag: String?
     private var hasValidRelease = false
     private var lastCheck: Date?
@@ -1850,12 +1866,15 @@ final class UpdateChecker {
                 } else if err == nil, let data = data, http?.statusCode == 200,
                           let releases = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
                     self.hasValidRelease = true
-                    if let tag = UpdateCheck.latestDownloadableTag(in: releases) {
+                    if let release = UpdateCheck.latestDownloadableRelease(in: releases) {
+                        let tag = release.tag
+                        self.releaseNotes = release.notes
                         self.available = UpdateCheck.isOutdated(local: BuildInfo.version, remote: tag)
                         self.targetTag = self.available ? tag : nil
                     } else {
                         self.available = false
                         self.targetTag = nil
+                        self.releaseNotes = ""
                     }
                     if let e = http?.value(forHTTPHeaderField: "ETag"), !e.isEmpty { self.etag = e }
                 }
@@ -2531,6 +2550,8 @@ final class QuotaSectionView: PanelCardView {
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onClose: (() -> Void)?
     var onCheckUpdate: (() -> Void)?
+    private var updateConfirmation: (tag: String, notes: String)?
+    var onConfirmUpdate: ((String, String) -> Void)?
     private var usageExpanded = true
     private var briefExpanded = true
     private var toolsExpanded = false
@@ -2756,6 +2777,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         // 更新进行中：原按钮位置换成进度行（重开面板也在此恢复）；空闲时才显示更新按钮
         if UpdateProgressController.shared.isActive {
             addContentRow(UpdateProgressRowView())
+        } else if let confirmation = updateConfirmation {
+            addContentRow(makeUpdateConfirmation(tag: confirmation.tag, notes: confirmation.notes))
         } else if let update = model.updateItem {
             let button = makeActionButton(update, .prominent)
             button.heightAnchor.constraint(equalToConstant: 30).isActive = true
@@ -2777,6 +2800,102 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         addContentRow(PanelCardView(containing: toolsView))
         for notice in PanelUI.notices(model.notices) { addContentRow(notice) }
         stack.needsLayout = true
+    }
+
+    func showUpdateConfirmation(tag: String, notes: String) {
+        updateConfirmation = (tag, notes)
+        refreshPanelLayout()
+    }
+
+    func verifyUpdateConfirmationForPreview() -> Bool {
+        var confirmed: [String] = []
+        onConfirmUpdate = { tag, _ in confirmed.append(tag) }
+        showUpdateConfirmation(tag: "v999.0.0", notes: "版本说明")
+        guard updateConfirmation?.tag == "v999.0.0", confirmed.isEmpty else { return false }
+        cancelUpdateConfirmation()
+        guard updateConfirmation == nil, confirmed.isEmpty else { return false }
+        showUpdateConfirmation(tag: "v999.0.0", notes: "版本说明")
+        confirmUpdate()
+        guard updateConfirmation == nil, confirmed == ["v999.0.0"] else { return false }
+        showUpdateConfirmation(tag: "v999.0.0", notes: Array(repeating: "更新说明内容", count: 40).joined(separator: "\n"))
+        contentController.view.layoutSubtreeIfNeeded()
+        func textScroll(in view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView, scroll.documentView is NSTextView { return scroll }
+            for child in view.subviews { if let found = textScroll(in: child) { return found } }
+            return nil
+        }
+        guard let scroll = textScroll(in: stack), let document = scroll.documentView else { return false }
+        document.layoutSubtreeIfNeeded()
+        let bottom = max(0, document.frame.height - scroll.contentView.bounds.height)
+        guard bottom > 0 else { return false }
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: bottom))
+        guard scroll.contentView.bounds.origin.y > 0 else { return false }
+        popoverDidClose(Notification(name: NSPopover.didCloseNotification))
+        return updateConfirmation == nil && confirmed.count == 1
+    }
+
+    private func makeUpdateConfirmation(tag: String, notes: String) -> NSView {
+        let content = PanelUI.stack(spacing: 7)
+        PanelUI.addFullWidth(PanelUI.label("发现新版本 \(tag)", size: 13, weight: .semibold), to: content)
+        PanelUI.addFullWidth(PanelUI.label("当前版本 \(BuildInfo.version)", size: 11, color: .secondaryLabelColor), to: content)
+        PanelUI.addFullWidth(PanelUI.label("本次更新", size: 12, weight: .semibold), to: content)
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: panelWidth - 32, height: 100))
+        text.isEditable = false; text.isSelectable = true; text.drawsBackground = false
+        text.font = NSFont.systemFont(ofSize: 12); text.textColor = .labelColor
+        text.textContainerInset = NSSize(width: 0, height: 2)
+        text.textContainer?.widthTracksTextView = true
+        text.isVerticallyResizable = true; text.isHorizontallyResizable = false
+        let displayedNotes = UpdateCheck.displayNotes(notes)
+        let styledNotes = NSMutableAttributedString(string: displayedNotes, attributes: [
+            .font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor
+        ])
+        let noteText = displayedNotes as NSString
+        for line in displayedNotes.components(separatedBy: "\n") where ["新增", "优化", "修复"].contains(line.trimmingCharacters(in: .whitespaces)) {
+            let range = noteText.range(of: line)
+            if range.location != NSNotFound { styledNotes.addAttribute(.font, value: NSFont.systemFont(ofSize: 12, weight: .semibold), range: range) }
+        }
+        text.textStorage?.setAttributedString(styledNotes)
+        let notesScroll = NSScrollView()
+        notesScroll.translatesAutoresizingMaskIntoConstraints = false
+        notesScroll.drawsBackground = false; notesScroll.hasVerticalScroller = true
+        notesScroll.autohidesScrollers = true; notesScroll.documentView = text
+        let notesBox = NSBox()
+        notesBox.translatesAutoresizingMaskIntoConstraints = false
+        notesBox.boxType = .custom
+        notesBox.borderWidth = 1
+        notesBox.borderColor = .separatorColor
+        notesBox.fillColor = NSColor.controlBackgroundColor.withAlphaComponent(0.35)
+        notesBox.cornerRadius = 7
+        notesBox.contentViewMargins = .zero
+        notesBox.addSubview(notesScroll)
+        NSLayoutConstraint.activate([
+            notesScroll.topAnchor.constraint(equalTo: notesBox.topAnchor, constant: 7),
+            notesScroll.bottomAnchor.constraint(equalTo: notesBox.bottomAnchor, constant: -7),
+            notesScroll.leadingAnchor.constraint(equalTo: notesBox.leadingAnchor, constant: 9),
+            notesScroll.trailingAnchor.constraint(equalTo: notesBox.trailingAnchor, constant: -9)
+        ])
+        let measured = (text.string as NSString).boundingRect(
+            with: NSSize(width: panelWidth - 62, height: 10000),
+            options: [.usesLineFragmentOrigin, .usesFontLeading],
+            attributes: [.font: NSFont.systemFont(ofSize: 12)]).height
+        notesBox.heightAnchor.constraint(equalToConstant: min(134, max(48, ceil(measured) + 22))).isActive = true
+        PanelUI.addFullWidth(notesBox, to: content)
+        PanelUI.addFullWidth(PanelUI.label("安装完成后，应用将自动重启。", size: 11, color: .secondaryLabelColor), to: content)
+        let buttons = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
+        buttons.addArrangedSubview(PanelUI.spacer())
+        let cancel = NSButton(title: "取消", target: self, action: #selector(cancelUpdateConfirmation))
+        let install = NSButton(title: "下载并安装", target: self, action: #selector(confirmUpdate))
+        for button in [cancel, install] { button.bezelStyle = .rounded; buttons.addArrangedSubview(button) }
+        PanelUI.addFullWidth(buttons, to: content)
+        return content
+    }
+
+    @objc private func cancelUpdateConfirmation() { updateConfirmation = nil; refreshPanelLayout() }
+    @objc private func confirmUpdate() {
+        guard let confirmation = updateConfirmation else { return }
+        updateConfirmation = nil
+        onConfirmUpdate?(confirmation.tag, confirmation.notes)
+        refreshPanelLayout()
     }
 
     private func refreshPanelLayout() {
@@ -3253,6 +3372,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         removeMonitors()
+        updateConfirmation = nil
+        needsRebuild = true
         anchorButton = nil
         onClose?()
     }
@@ -3987,6 +4108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
+        panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         if visualPreview { configureVisualPreview(); return }
         rebuildMenu()
         renderBar()
@@ -4645,6 +4767,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.workTokensError = message; usage.cliTokensError = "会话目录不可读"
         }
         rebuildMenu(); renderBar()
+        if args.contains("--visual-preview-update-notes") || args.contains("--visual-preview-update-notes-long") {
+            let sample = "新增\n• 支持切换面板背景样式\n\n优化\n• 改善深色模式下的文字显示\n\n修复\n• 修复部分情况下的面板闪烁"
+            panelController.showUpdateConfirmation(tag: "v1.7.8", notes: args.contains("--visual-preview-update-notes-long") ? Array(repeating: sample, count: 8).joined(separator: "\n") : sample)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
             // 背景矩阵回归以子进程单拍方式运行（每个组合独立进程，避免中途改外观后
@@ -4677,6 +4803,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let arg = args.first(where: { $0.hasPrefix("--visual-preview-popover-test=") }) {
                 self.panelController.runPopoverResizeTest(outputDirectory: String(arg.dropFirst("--visual-preview-popover-test=".count)))
                 return
+            }
+            if args.contains("--visual-preview-confirm-test") {
+                guard self.panelController.verifyUpdateConfirmationForPreview() else {
+                    fputs("KimiUsage update confirmation test: FAIL\n", stderr); exit(1)
+                }
+                print("KimiUsage update confirmation test: PASS"); exit(0)
             }
             if args.contains("--visual-preview-update-test") {
                 self.runPreviewUpdateTest()
@@ -4887,15 +5019,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 checker.check(force: true) { completions += 1 }
                 let release = """
                     [{"tag_name":"v999.0.0","draft":false,"prerelease":false,
-                      "assets":[{"name":"KimiUsage.zip"},{"name":"KimiUsage.zip.sha256"}]}]
+                      "body":"版本说明","assets":[{"name":"KimiUsage.zip"},{"name":"KimiUsage.zip.sha256"}]}]
                     """
                 replies.removeFirst()(Data(release.utf8), response(200), nil)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    guard completions == 4, !checker.lastError, checker.available, checker.targetTag == "v999.0.0" else { return fail("successful release check") }
+                    guard completions == 4, !checker.lastError, checker.available, checker.targetTag == "v999.0.0", checker.releaseNotes == "版本说明" else { return fail("successful release check") }
                     checker.check(force: true) { completions += 1 }
                     replies.removeFirst()(nil, response(304), nil)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        guard completions == 5, !checker.lastError, checker.available, checker.targetTag == "v999.0.0" else { return fail("cached 304") }
+                        guard completions == 5, !checker.lastError, checker.available, checker.targetTag == "v999.0.0", checker.releaseNotes == "版本说明" else { return fail("cached 304") }
                         print("KimiUsage update check test: PASS")
                         exit(0)
                     }
@@ -4994,7 +5126,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onUpdateApp() {
-        guard !visualPreview else { return }
+        guard !visualPreview, !UpdateProgressController.shared.isActive,
+              let tag = UpdateChecker.shared.targetTag else { return }
+        panelController.showUpdateConfirmation(tag: tag, notes: UpdateChecker.shared.releaseNotes)
+    }
+
+    private func startConfirmedUpdate(tag: String, notes: String) {
+        guard !visualPreview, !UpdateProgressController.shared.isActive,
+              UpdateChecker.shared.targetTag == tag, UpdateChecker.shared.releaseNotes == notes else {
+            panelController.setUpdateMessage("版本信息已变更，请重新查看更新", dismissAfter: 5)
+            return
+        }
         // App Translocation：从下载目录直接运行的应用被挂载到只读位置，原地更新必然失败，
         // 在发起更新前拦截并给出安装指引，而不是让脚本在暂存阶段报错。
         if Bundle.main.bundleURL.path.contains("/AppTranslocation/") {
@@ -5008,7 +5150,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let script = Bundle.main.path(forResource: "update", ofType: "sh") else {
             NSWorkspace.shared.open(UpdateCheck.releasesPage); return
         }
-        guard let tag = UpdateChecker.shared.targetTag else { return }
         UpdateProgressController.shared.start(script: script, targetTag: tag, appPath: Bundle.main.bundleURL.path)
     }
 
@@ -6123,6 +6264,8 @@ enum KimiOfflineRegression {
             try expect(UpdateCheck.latestDownloadableTag(in: [prerelease, completeRelease]) == "v1.4.0",
                        "prerelease not skipped")
 
+            try expect(UpdateCheck.displayNotes("   ") == "本版本暂未提供详细更新说明", "empty update notes")
+            try expect(UpdateCheck.displayNotes("## 新增\n- **新功能**") == "新增\n• 新功能", "update notes formatting")
             print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild)")
             return 0
         } catch {

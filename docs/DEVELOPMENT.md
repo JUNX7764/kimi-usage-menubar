@@ -81,7 +81,7 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 `--visual-preview-background=solid|liquidGlass|classicMaterial` 强制渲染样式；`--visual-preview-backdrop` 在面板后垫高饱和斜条纹测试背板（生产路径不创建），配合 `--visual-preview-output=` 输出背板+面板的屏幕合成截图——截图带有效性守门（面板窗口位图墨水占比达标才算成功，偶发“窗口在屏但像素未合成”会强制激活并重试，重试耗尽即非零退出，不产出空背板假 PASS）；`--visual-preview-reduce-transparency` 强制按「降低透明度」渲染。
 
-另有内部测试旗标（发布与用户路径不依赖）：`--visual-preview-full`、`--visual-preview-popover-test=<目录>`、`--visual-preview-update-test`、`--visual-preview-key-test`、`--visual-preview-updating`、`--visual-preview-updating-install`、`--visual-preview-output=<路径>`、`--visual-preview-scroll-end`、`--visual-preview-background-menu-test`（真实弹出背景样式菜单并在跟踪中程序化选择液态/经典，断言选择生效、主 Popover 保持打开、monitor 恢复、真实 UserDefaults 未写）。所有 `--visual-preview*` 路径统一禁止写真实 UserDefaults；深色预览外观在 `popover.show` 之后赋给 `popover.appearance`（show 前设置会得到空内容窗口）。入口支持 `--help`；未识别的 `--` 旗标会打印错误并以退出码 2 拒绝启动，不会静默拉起常驻应用。
+另有内部测试旗标（发布与用户路径不依赖）：`--visual-preview-full`、`--visual-preview-popover-test=<目录>`、`--visual-preview-update-test`、`--visual-preview-update-notes`、`--visual-preview-confirm-test`、`--visual-preview-key-test`、`--visual-preview-updating`、`--visual-preview-updating-install`、`--visual-preview-output=<路径>`、`--visual-preview-scroll-end`、`--visual-preview-background-menu-test`（真实弹出背景样式菜单并在跟踪中程序化选择液态/经典，断言选择生效、主 Popover 保持打开、monitor 恢复、真实 UserDefaults 未写）。所有 `--visual-preview*` 路径统一禁止写真实 UserDefaults；深色预览外观在 `popover.show` 之后赋给 `popover.appearance`（show 前设置会得到空内容窗口）。入口支持 `--help`；未识别的 `--` 旗标会打印错误并以退出码 2 拒绝启动，不会静默拉起常驻应用。
 
 ## 文件说明
 
@@ -106,7 +106,7 @@ python3 -m unittest discover -s tests -p '*_test.py'
 bash -n build.sh scripts/update.sh scripts/release.sh
 ```
 
-确认工作区干净且 HEAD 已推送后，再运行 `scripts/release.sh v1.2.3`。
+发布前由 Agent 对比上一个正式版与目标版本，核对实际改动并整理面向用户的 `release-notes/vX.Y.Z.md`，随代码提交。确认工作区干净且 HEAD 已推送后，再运行 `scripts/release.sh v1.2.3`。脚本拒绝缺失或空白说明，已有 Release 的正文不一致时停止；一致时可补传附件。
 
 `release.sh` 会执行构建、二进制自检、签名和资产校验，但**不会自动运行 Python 脚本回归，也不代表真实面板更新、回滚或最低系统版本验收已完成**。完整要求见 `docs/project/10-release.md`。
 
@@ -119,3 +119,5 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 ## License
 
 MIT，详见 [LICENSE](../LICENSE)。
+
+更新检查从同一可安装 Release 读取 tag 与说明，304 和网络失败保留上次结果；面板点击更新后展开说明，确认才启动原有更新器。关闭面板或取消不会下载；说明仅展示目标版本。

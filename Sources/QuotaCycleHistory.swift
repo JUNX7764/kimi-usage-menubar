@@ -357,11 +357,34 @@ struct QuotaCycleSnapshot: Equatable {
         loaded: false, closed: [], current: nil,
         pendingTransition: nil, persistenceFailed: false)
 
-    /// Fixed in-memory preview fixture (five closed cycles + the current
-    /// one). It is built from a constant epoch, never touches disk,
-    /// credentials or the real clock, and preview paths inject it instead of
-    /// ever constructing a coordinator or a real history store.
-    static let previewFixture: QuotaCycleSnapshot = {
+    /// Fixed in-memory preview fixture (twelve closed cycles + the current
+    /// one, thirteen rounds in total so paging geometry can be checked).
+    /// It is built from a constant epoch, never touches disk, credentials or
+    /// the real clock, and preview paths inject it instead of ever
+    /// constructing a coordinator or a real history store.
+    static let previewFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [(100, .natural), (58, .natural), (72, .windowChanged), (40, .gap),
+                 (93, .natural), (66, .natural), (88, .windowChanged), (44, .natural),
+                 (30, .gap), (100, .natural), (62, .windowChanged), (85, .natural)],
+        currentUsed: 36, pending: false)
+    /// 短历史（3 个已结束 + 当前，共 4 轮 < 6 轮）：验证不足一轮屏时卡片保持固定高度。
+    static let previewShortFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [(81, .natural), (72, .windowChanged), (40, .gap)],
+        currentUsed: 36, pending: false)
+    /// 当前轮次带未确认窗口变化候选：详情显示「窗口变化待确认」，不产生新历史柱。
+    static let previewPendingFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [(81, .natural), (72, .windowChanged)],
+        currentUsed: 36, pending: true)
+    /// 已加载但零记录：空态占位文案，不渲染图表、不伪造历史。
+    static let previewEmptyFixture = QuotaCycleSnapshot(
+        loaded: true, closed: [], current: nil,
+        pendingTransition: nil, persistenceFailed: false)
+
+    private static func makePreviewFixture(
+        closed usedEnds: [(used: Double, end: QuotaCycleEnd)],
+        currentUsed: Double?,
+        pending: Bool
+    ) -> QuotaCycleSnapshot {
         let day: TimeInterval = 24 * 60 * 60
         let base = Date(timeIntervalSince1970: 1_763_000_000)
         func evidence(_ requestOffset: Double, _ used: Double,
@@ -372,50 +395,61 @@ struct QuotaCycleSnapshot: Equatable {
                 usedPercent: used,
                 resetAt: base.addingTimeInterval(resetOffset))
         }
-        func closedCycle(_ cycleBack: Int, _ used: Double, _ end: QuotaCycleEnd,
-                         _ boundaryUpperOffset: Double) -> QuotaCycleRecord {
+        var closed: [QuotaCycleRecord] = []
+        for (index, entry) in usedEnds.enumerated() {
+            // 由旧到新：最早一轮在 -count 周，最新一轮在 -1 周。
+            let cycleBack = index - usedEnds.count
             let reset = base.addingTimeInterval(Double(cycleBack) * 7 * day)
-            let first = evidence(reset.timeIntervalSince(base) - 6 * day, used, reset.timeIntervalSince(base))
-            let last = evidence(boundaryUpperOffset - 120, used, reset.timeIntervalSince(base))
-            return QuotaCycleRecord(
+            let boundaryOffset = Double(cycleBack + 1) * 7 * day
+                + (entry.end == .gap ? 3600 : 240)
+            let first = evidence(reset.timeIntervalSince(base) - 6 * day,
+                                 entry.used, reset.timeIntervalSince(base))
+            let last = evidence(boundaryOffset - 120, entry.used,
+                                reset.timeIntervalSince(base))
+            closed.append(QuotaCycleRecord(
                 id: UUID(),
                 startKind: .inferred,
                 inferredStartAt: reset.addingTimeInterval(-7 * day),
                 firstObservedAt: first.observedAt,
                 expectedResetAt: reset,
                 lastObservedAt: last.observedAt,
-                lastObservedUsedPercent: used,
+                lastObservedUsedPercent: entry.used,
                 boundaryLower: last.observedAt,
-                boundaryUpper: base.addingTimeInterval(boundaryUpperOffset),
-                end: end,
+                boundaryUpper: base.addingTimeInterval(boundaryOffset),
+                end: entry.end,
                 incomplete: true,
-                evidence: [first, last])
+                evidence: [first, last]))
         }
-        var closed: [QuotaCycleRecord] = []
-        // 由旧到新：用满一轮、81% 自然到期、72% 窗口变化（原因未知）、gap、93% 自然到期。
-        closed.append(closedCycle(-5, 100, .natural, -4 * 7 * day + 300))
-        closed.append(closedCycle(-4, 81, .natural, -3 * 7 * day + 300))
-        closed.append(closedCycle(-3, 72, .windowChanged, -2 * 7 * day + 240))
-        closed.append(closedCycle(-2, 55, .gap, -1 * 7 * day + 3600))
-        closed.append(closedCycle(-1, 93, .natural, 300))
-        let currentReset = base.addingTimeInterval(7 * day)
-        let current = QuotaCycleRecord(
-            id: UUID(),
-            startKind: .inferred,
-            inferredStartAt: currentReset.addingTimeInterval(-7 * day),
-            firstObservedAt: evidence(-6 * day, 8, 7 * day).observedAt,
-            expectedResetAt: currentReset,
-            lastObservedAt: evidence(-3600, 36, 7 * day).observedAt,
-            lastObservedUsedPercent: 36,
-            boundaryLower: nil,
-            boundaryUpper: nil,
-            end: nil,
-            incomplete: true,
-            evidence: [evidence(-3600, 36, 7 * day)])
+        var current: QuotaCycleRecord?
+        var pendingTransition: PendingQuotaTransition?
+        if let currentUsed {
+            let currentReset = base.addingTimeInterval(7 * day)
+            current = QuotaCycleRecord(
+                id: UUID(),
+                startKind: .inferred,
+                inferredStartAt: currentReset.addingTimeInterval(-7 * day),
+                firstObservedAt: evidence(-6 * day, currentUsed, 7 * day).observedAt,
+                expectedResetAt: currentReset,
+                lastObservedAt: evidence(-3600, currentUsed, 7 * day).observedAt,
+                lastObservedUsedPercent: currentUsed,
+                boundaryLower: nil,
+                boundaryUpper: nil,
+                end: nil,
+                incomplete: true,
+                evidence: [evidence(-3600, currentUsed, 7 * day)])
+            if pending, let current {
+                pendingTransition = PendingQuotaTransition(
+                    previousCycleID: current.id,
+                    firstNewWindowSample: evidence(-1200, 3, 14 * day),
+                    reason: .windowChanged,
+                    awaitingConfirmation: true,
+                    isProportionFix: false)
+            }
+        }
         return QuotaCycleSnapshot(
             loaded: true, closed: closed, current: current,
-            pendingTransition: nil, persistenceFailed: false)
-    }()
+            pendingTransition: pendingTransition, persistenceFailed: false)
+    }
 
     var recordCount: Int { closed.count + (current == nil ? 0 : 1) }
 }

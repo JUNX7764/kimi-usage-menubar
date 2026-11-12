@@ -2549,6 +2549,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var usageExpanded = true
     private var briefExpanded = true
     private var toolsExpanded = false
+    private var historyExpanded = true   // 额度周期回顾：独立折叠，默认展开；跨重建保持由 Task 7 接管
     private var toolPeriodIndex = 1   // 工具明细默认「7 天」（板块折叠状态独立于周期选择）
     private var briefSelectedIndex: Int?   // 用量简析选中日（重建保留；nil = 最新一日）
     private var expandedUsageBuckets: Set<Int> = []
@@ -2606,6 +2607,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     /// --self-test 用：内容视图身份（切换背景样式不得重建内容）；未建内容时先补一次重建。
     var arrangedContentViewsForTest: [NSView] {
         if stack.arrangedSubviews.isEmpty && model != nil { rebuildContent() }
+        return stack.arrangedSubviews
+    }
+    /// --self-test 用：按指定面板宽度强制重建并布局内容栈，返回各行（几何/顺序断言用）。
+    /// 面板保持关闭：不依赖屏幕、窗口或 Popover 展示路径。
+    @discardableResult
+    func rebuildContentForTest(width: CGFloat) -> [NSView] {
+        panelWidth = min(width, Self.maximumWidth)
+        rebuildContent()
+        stack.frame = NSRect(x: 0, y: 0, width: panelWidth - 32, height: 200_000)
+        stack.layoutSubtreeIfNeeded()
         return stack.arrangedSubviews
     }
     /// 预览菜单烟测用：头部真实的「背景样式」按钮（经 PanelHeaderView 记录）。
@@ -2789,6 +2800,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             onSelect: { [weak self] index in self?.briefSelectedIndex = index })
         addContentRow(PanelCardView(containing: briefView))
 
+        let historyView = QuotaCycleHistorySectionView(model: model.history, expanded: historyExpanded,
+            target: self, action: #selector(toggleHistory))
+        addContentRow(PanelCardView(containing: historyView))
+
         let toolsView = ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
             target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools))
         addContentRow(PanelCardView(containing: toolsView))
@@ -2909,6 +2924,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc private func toggleUsage() { usageExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleBrief() { briefExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleTools() { toolsExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleHistory() { historyExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleToolPeriod(_ sender: NSButton) {
         guard sender.tag != toolPeriodIndex else { return }
         toolPeriodIndex = sender.tag
@@ -3052,6 +3068,75 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     func expandToolsForPreview() {
         toolsExpanded = true
         refreshPanelLayout()
+    }
+
+    /// 额度周期回顾几何守门（--visual-preview-test / --visual-preview-quota-geometry）：
+    /// 卡片位于用量简析之后、工具明细之前；六组双柱不重叠且不越出画布；详情固定高度。
+    /// 直接读已布局的真实 Popover 内容，不用文字存在冒充几何通过。
+    func verifyQuotaHistoryGeometryForPreview() -> Bool {
+        func fail(_ message: String) -> Bool {
+            fputs("KimiUsage quota history geometry test: FAIL: \(message)\n", stderr)
+            return false
+        }
+        contentController.view.layoutSubtreeIfNeeded()
+        stack.layoutSubtreeIfNeeded()
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        let rows = stack.arrangedSubviews
+        func rowTitle(_ row: NSView) -> String? {
+            descendants(row).compactMap { ($0 as? NSTextField)?.stringValue }
+                .first { ["用量情况", "用量简析", "额度周期回顾", "工具明细"].contains($0) }
+        }
+        // 注意保持原行索引：无标题行（更新按钮等）不参与 compact，索引必须落在 rows 上。
+        let titled = rows.enumerated().compactMap { index, row in rowTitle(row).map { (index, $0) } }
+        guard let brief = titled.first(where: { $0.1 == "用量简析" })?.0,
+              let history = titled.first(where: { $0.1 == "额度周期回顾" })?.0,
+              let tools = titled.first(where: { $0.1 == "工具明细" })?.0,
+              brief < history, history < tools else {
+            return fail("card order wrong: \(titled.map(\.1))")
+        }
+        let card = rows[history]
+        let cardFrame = card.convert(card.bounds, to: contentController.view)
+        guard abs(cardFrame.width - (panelWidth - 32)) < 0.5 else {
+            return fail("history card width \(cardFrame.width) != panelWidth-32 \(panelWidth - 32)")
+        }
+        guard cardFrame.maxX <= panelWidth - 16 + 0.5, cardFrame.minX >= 16 - 0.5 else {
+            return fail("history card overflows panel: \(cardFrame) in \(panelWidth)")
+        }
+        guard let canvas = descendants(card).compactMap({ $0 as? QuotaCycleChartCanvas }).first else {
+            return fail("history chart canvas missing")
+        }
+        canvas.layoutSubtreeIfNeeded()
+        let groups = canvas.groupFramesForTest
+        let expectedItems = QuotaCyclePresentation.items(from: model?.history ?? .inactive)
+        guard !expectedItems.isEmpty else { return fail("history fixture has no records") }
+        guard groups.count == min(QuotaCyclePresentation.pageSize, expectedItems.count) else {
+            return fail("expected \(min(QuotaCyclePresentation.pageSize, expectedItems.count)) groups, got \(groups.count)")
+        }
+        for (index, group) in groups.enumerated() {
+            guard group.slot.minX >= -0.5, group.slot.maxX <= canvas.bounds.width + 0.5,
+                  group.cap.maxY <= canvas.bounds.height + 0.5, group.cap.minY >= -0.5 else {
+                return fail("group \(index) out of canvas bounds: \(group) in \(canvas.bounds)")
+            }
+            guard group.cap.width > 0.5, group.used.width > 0.5,
+                  abs(group.cap.minX - group.used.minX) > 0.5 else {
+                return fail("group \(index) does not have two distinct bars: \(group)")
+            }
+            guard group.used.maxY <= group.cap.maxY + 0.5 else {
+                return fail("group \(index) used bar exceeds 100% cap: \(group)")
+            }
+            if index > 0, groups[index - 1].slot.maxX > group.slot.minX + 0.5 {
+                return fail("group \(index) overlaps previous group: \(group.slot) vs \(groups[index - 1].slot)")
+            }
+        }
+        guard let detail = descendants(card).compactMap({ $0 as? QuotaCycleDetailView }).first else {
+            return fail("history detail view missing")
+        }
+        guard abs(detail.frame.height - QuotaCycleDetailView.fixedHeight) < 1 else {
+            return fail("detail height \(detail.frame.height) != fixed \(QuotaCycleDetailView.fixedHeight)")
+        }
+        return true
     }
 
     /// 逐一点击两个板块的三个周期行，核对明细数量、列坐标和刷新后的展开状态。
@@ -4709,6 +4794,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.previewSuppressesPersistence = true
         // 额度周期回顾预览只注入固定内存快照：不创建协调器、不创建真实历史目录、不读凭据。
         historySnapshot = .previewFixture
+        // 固定历史形态覆盖（均内存快照，互不创建真实仓库）：短历史/空态/待确认/写失败。
+        if args.contains("--visual-preview-quota-short") { historySnapshot = .previewShortFixture }
+        if args.contains("--visual-preview-quota-empty") { historySnapshot = .previewEmptyFixture }
+        if args.contains("--visual-preview-quota-pending") { historySnapshot = .previewPendingFixture }
+        if args.contains("--visual-preview-quota-save-failed") {
+            historySnapshot.persistenceFailed = true
+        }
         if args.contains("--visual-preview-dark") {
             NSApp.appearance = NSAppearance(named: .darkAqua)
             panelController.previewAppearance = NSAppearance(named: .darkAqua)
@@ -4850,6 +4942,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 button.performClick(nil)
                 guard self.panelController.isOpen else { fputs("toggle open failed\n", stderr); exit(1) }
                 print("KimiUsage visual interaction test: PASS")
+                exit(0)
+            }
+            if args.contains("--visual-preview-quota-geometry") {
+                guard self.panelController.verifyQuotaHistoryGeometryForPreview() else { exit(1) }
+                print("KimiUsage quota history geometry test: PASS")
                 exit(0)
             }
             if let arg = args.first(where: { $0.hasPrefix("--visual-preview-popover-test=") }) {
@@ -5569,6 +5666,115 @@ enum KimiOfflineRegression {
             styleController.previewSuppressesPersistence = false
             styleController.applyBackgroundStyle()
             try expect(!styleController.effect.isHidden, "classic rendering lost after preview override release")
+
+            // MARK: 额度周期回顾卡片（固定 fixture：顺序 / 双柱几何 / 固定详情 / 短历史等高 / 空态与状态文案）
+            try expect(QuotaCycleSnapshot.previewFixture.recordCount >= 13,
+                       "preview fixture must offer at least 13 cycles for paging geometry checks")
+            try expect(QuotaCycleSnapshot.previewShortFixture.recordCount == 4,
+                       "short fixture must hold fewer than six cycles")
+            try expect(QuotaCycleSnapshot.previewPendingFixture.pendingTransition != nil,
+                       "pending fixture must carry an unconfirmed transition")
+            try expect(QuotaCycleSnapshot.previewEmptyFixture.loaded
+                       && QuotaCycleSnapshot.previewEmptyFixture.recordCount == 0,
+                       "empty fixture must be loaded with zero cycles")
+            func makeHistoryPanelModel(history: QuotaCycleSnapshot) -> UsagePanelModel {
+                UsagePanelModel(
+                    updateItem: nil, title: "Kimi 用量", planName: nil, accountLine: nil, quotas: [],
+                    usage: UsagePanelModel.TokenSection(title: "用量情况", accent: .codex, buckets: [], notices: []),
+                    brief: UsagePanelModel.BriefSection(days: [],
+                        day: UsagePanelModel.BriefComparison(label: "较昨日", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        week: UsagePanelModel.BriefComparison(label: "较前 7 天", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        notices: []),
+                    tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    history: history,
+                    notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
+                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
+                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
+            }
+            let historyController = UsagePanelController()
+            historyController.previewReduceTransparencyOverride = false
+            /// 各行 → 卡片标题（用量情况 / 用量简析 / 额度周期回顾 / 工具明细）
+            func cardTitles(_ rows: [NSView]) -> [String] {
+                rows.map { row in
+                    descendants(row).compactMap { ($0 as? NSTextField)?.stringValue }
+                        .first { ["用量情况", "用量简析", "额度周期回顾", "工具明细"].contains($0) }
+                }.compactMap { $0 }
+            }
+            func historyCard(in rows: [NSView]) throws -> NSView {
+                guard let card = rows.first(where: { row in
+                    descendants(row).contains { ($0 as? NSTextField)?.stringValue == "额度周期回顾" }
+                }) else { throw Failure(description: "quota history card missing") }
+                return card
+            }
+            historyController.update(model: makeHistoryPanelModel(history: .previewFixture))
+            var fullHeight: CGFloat = 0
+            for width in [CGFloat(330), CGFloat(300)] {
+                let rows = historyController.rebuildContentForTest(width: width)
+                let order = cardTitles(rows)
+                try expect(order == ["用量情况", "用量简析", "额度周期回顾", "工具明细"],
+                           "card order wrong at \(width)pt: \(order)")
+                let card = try historyCard(in: rows)
+                try expect(abs(card.frame.width - (width - 32)) < 0.5,
+                           "history card width \(card.frame.width) != \(width - 32)")
+                guard let canvas = descendants(card).compactMap({ $0 as? QuotaCycleChartCanvas }).first else {
+                    throw Failure(description: "quota chart canvas missing at \(width)pt")
+                }
+                let groups = canvas.groupFramesForTest
+                try expect(groups.count == 6,
+                           "13-cycle fixture must render exactly 6 groups per page at \(width)pt, got \(groups.count)")
+                for (index, group) in groups.enumerated() {
+                    try expect(group.slot.minX >= -0.5 && group.slot.maxX <= canvas.bounds.width + 0.5
+                               && group.cap.maxY <= canvas.bounds.height + 0.5,
+                               "group \(index) out of bounds at \(width)pt: \(group.slot)")
+                    try expect(group.cap.width > 0.5 && group.used.width > 0.5
+                               && abs(group.cap.minX - group.used.minX) > 0.5,
+                               "group \(index) must have two distinct bars at \(width)pt")
+                    try expect(group.used.maxY <= group.cap.maxY + 0.5,
+                               "group \(index) used bar exceeds 100% cap at \(width)pt")
+                    if index > 0 {
+                        try expect(groups[index - 1].slot.maxX <= group.slot.minX + 0.5,
+                                   "group \(index) overlaps previous at \(width)pt")
+                    }
+                }
+                guard let detail = descendants(card).compactMap({ $0 as? QuotaCycleDetailView }).first else {
+                    throw Failure(description: "quota detail view missing at \(width)pt")
+                }
+                try expect(abs(detail.frame.height - QuotaCycleDetailView.fixedHeight) < 1,
+                           "detail must keep fixed height at \(width)pt, got \(detail.frame.height)")
+                fullHeight = card.frame.height
+            }
+            // 短历史（4 轮 < 6 轮）保持同一卡片高度：不伪造历史、不塌缩图区
+            historyController.update(model: makeHistoryPanelModel(history: .previewShortFixture))
+            let shortRows = historyController.rebuildContentForTest(width: 330)
+            let shortCard = try historyCard(in: shortRows)
+            try expect(abs(shortCard.frame.height - fullHeight) < 0.5,
+                       "short history must keep full card height: \(shortCard.frame.height) vs \(fullHeight)")
+            // 状态文案：pending 详情、空态、写失败提示
+            historyController.update(model: makeHistoryPanelModel(history: .previewPendingFixture))
+            let pendingRows = historyController.rebuildContentForTest(width: 330)
+            let pendingTexts = descendants(try historyCard(in: pendingRows))
+                .compactMap { ($0 as? NSTextField)?.stringValue }
+            try expect(pendingTexts.contains { $0.contains("窗口变化待确认") },
+                       "pending detail must show 窗口变化待确认")
+            historyController.update(model: makeHistoryPanelModel(history: .previewEmptyFixture))
+            let emptyRows = historyController.rebuildContentForTest(width: 330)
+            let emptyCard = try historyCard(in: emptyRows)
+            try expect(!descendants(emptyCard).contains { $0 is QuotaCycleChartCanvas },
+                       "empty history must not render a chart")
+            let emptyTexts = descendants(emptyCard).compactMap { ($0 as? NSTextField)?.stringValue }
+            try expect(emptyTexts.contains { $0.contains("从首次成功读取") },
+                       "empty history must show the start-recording placeholder")
+            var failedSnapshot = QuotaCycleSnapshot.previewShortFixture
+            failedSnapshot.persistenceFailed = true
+            historyController.update(model: makeHistoryPanelModel(history: failedSnapshot))
+            let failedRows = historyController.rebuildContentForTest(width: 330)
+            let failedTexts = descendants(try historyCard(in: failedRows))
+                .compactMap { ($0 as? NSTextField)?.stringValue }
+            try expect(failedTexts.contains { $0.contains("历史未保存") },
+                       "persistence failure must surface 历史未保存")
 
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")

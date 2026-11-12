@@ -2343,6 +2343,8 @@ final class PanelHeaderView: NSView {
         titles.alignment = .leading
         let titleRow = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         let title = PanelUI.label(model.title, size: 15, weight: .semibold, wrapping: false)
+        // 标题与套餐都完整保留；横向空间不足时只压缩下方账号行，避免刷新后标题被截断。
+        title.setContentCompressionResistancePriority(.required, for: .horizontal)
         titleRow.addArrangedSubview(title)
         if let plan = model.planName, !plan.isEmpty {
             let tag = PlanTagView(text: plan)
@@ -5395,10 +5397,13 @@ enum KimiOfflineRegression {
                 let header = makeHeader(plan: "Allegretto", account: "Test User (138****0000)")
                 header.frame = NSRect(x: 0, y: 0, width: width, height: 60)
                 header.layoutSubtreeIfNeeded()
-                guard let planLabel = descendants(header).compactMap({ $0 as? NSTextField })
-                    .first(where: { $0.stringValue == "Allegretto" }) else {
-                    throw Failure(description: "plan label missing")
+                let labels = descendants(header).compactMap { $0 as? NSTextField }
+                guard let titleLabel = labels.first(where: { $0.stringValue == "Kimi 用量" }),
+                      let planLabel = labels.first(where: { $0.stringValue == "Allegretto" }) else {
+                    throw Failure(description: "header title or plan label missing")
                 }
+                try expect(titleLabel.frame.width + 0.5 >= titleLabel.intrinsicContentSize.width,
+                           "title truncated at header width \(width): \(titleLabel.frame.width) < \(titleLabel.intrinsicContentSize.width)")
                 try expect(planLabel.frame.width + 0.5 >= planLabel.intrinsicContentSize.width,
                            "plan label truncated at header width \(width): \(planLabel.frame.width) < \(planLabel.intrinsicContentSize.width)")
             }

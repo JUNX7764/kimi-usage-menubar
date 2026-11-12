@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "Sources" / "QuotaCycleHistory.swift"
+STORE = ROOT / "Sources" / "QuotaCycleStore.swift"
 FIXTURE = ROOT / "tests" / "fixtures" / "quota-cycle-history" / "main.swift"
 
 
@@ -14,7 +15,7 @@ class QuotaCycleHistoryTest(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.runner = Path(cls._tmp.name) / "quota-cycle-history-runner"
         compile_result = subprocess.run(
-            ["swiftc", str(MODEL), str(FIXTURE), "-o", str(cls.runner)],
+            ["swiftc", str(MODEL), str(STORE), str(FIXTURE), "-o", str(cls.runner)],
             capture_output=True, text=True)
         if compile_result.returncode != 0:
             raise RuntimeError(
@@ -88,6 +89,24 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_first_observation_mid_cycle_is_incomplete(self):
         self.run_case("firstObservationMidCycle")
+
+    def test_scope_key_round_trip_with_restart(self):
+        self.run_case("scopeRoundTrip")
+
+    def test_scope_isolation_between_fake_api_keys(self):
+        self.run_case("scopeIsolation")
+
+    def test_salt_and_permission_enforcement(self):
+        self.run_case("scopePermissions")
+
+    def test_corrupt_future_and_time_regression_files_preserved(self):
+        self.run_case("corruptAndFuturePreserved")
+
+    def test_writer_failure_keeps_last_good_disk_state(self):
+        self.run_case("writerFailureKeepsLastGood")
+
+    def test_save_dedup_and_heartbeat_semantics(self):
+        self.run_case("saveDedupAndHeartbeat")
 
 
 if __name__ == "__main__":

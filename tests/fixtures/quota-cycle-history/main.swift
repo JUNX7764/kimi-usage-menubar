@@ -16,6 +16,33 @@ func makeReducer() -> QuotaCycleReducer {
     QuotaCycleReducer(policy: QuotaCyclePolicy())
 }
 
+// MARK: - Task 3 helpers (all I/O inside per-case temporary directories)
+
+func makeTempRoot() -> URL {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("quota-cycle-store-" + UUID().uuidString, isDirectory: true)
+    try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    return url
+}
+
+func removeTempRoot(_ url: URL) {
+    try? FileManager.default.removeItem(at: url)
+}
+
+let atomicWriter: QuotaCycleStore.Writer = { data, url in
+    try data.write(to: url, options: .atomic)
+}
+
+func posixMode(_ url: URL) -> UInt32? {
+    guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+          let number = attrs[.posixPermissions] as? NSNumber else { return nil }
+    return UInt32(truncating: number) & 0o7777
+}
+
+func loadFails(_ store: QuotaCycleStore, _ scopeKey: String) -> Bool {
+    (try? store.load(scopeKey: scopeKey)) == nil
+}
+
 switch CommandLine.arguments[1] {
 
 case "firstObservation":
@@ -333,6 +360,219 @@ case "firstObservationMidCycle":
     check(state.current?.remainingAtLastObservation == 28, "remaining follows raw percent")
     check(state.current?.wasObservedFull == false, "72% is not observed full")
     print("PASS: firstObservationMidCycle")
+
+case "scopeRoundTrip":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let keyA = "fake-kimi-code-key-alpha"
+    let scopeA = try! store.scopeKey(apiKey: keyA)
+    check(scopeA.count == 64, "scope key is a fixed 64-char hex string")
+    check(scopeA.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+          "scope key is lowercase hex only")
+    check(try! store.scopeKey(apiKey: keyA) == scopeA, "scope key is stable for the same root and key")
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(0, 72), into: &state)
+    reducer.ingest(sample(100, 2, 605800), into: &state)   // pending window-change candidate
+    try! store.save(state, scopeKey: scopeA)
+    // Restart: a brand-new store instance over the same root must restore
+    // the exact state, including a still-unconfirmed candidate.
+    let restarted = QuotaCycleStore(root: root, writer: atomicWriter)
+    let restored = try! restarted.load(scopeKey: scopeA)
+    check(restored == state, "round trip restores the exact state")
+    check(restored.pendingTransition != nil, "pending candidate survives a restart")
+    check(restored.closed.isEmpty, "restart must not fabricate closed cycles")
+    check(restored.current?.lastObservedUsedPercent == 72,
+          "candidate sample never overwrote the confirmed current percent")
+    // A fresh root has its own random salt, so the same key lands elsewhere.
+    let otherRoot = makeTempRoot()
+    defer { removeTempRoot(otherRoot) }
+    let otherStore = QuotaCycleStore(root: otherRoot, writer: atomicWriter)
+    check(try! otherStore.scopeKey(apiKey: keyA) != scopeA,
+          "random per-root salt derives a different scope for the same key")
+    print("PASS: scopeRoundTrip")
+
+case "scopeIsolation":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let keyA = "fake-kimi-code-key-alpha"
+    let keyB = "fake-kimi-code-key-beta"
+    let scopeA = try! store.scopeKey(apiKey: keyA)
+    let scopeB = try! store.scopeKey(apiKey: keyB)
+    check(scopeA != scopeB, "different credentials must not share a partition")
+    var state = QuotaCycleState()
+    makeReducer().ingest(sample(0, 43), into: &state)
+    try! store.save(state, scopeKey: scopeA)
+    let loadedB = try! store.load(scopeKey: scopeB)
+    check(loadedB == QuotaCycleState(), "another scope starts from an empty state")
+    check(loadedB.current == nil, "no history leaks across credential scopes")
+    let loadedA = try! store.load(scopeKey: scopeA)
+    check(loadedA.current?.lastObservedUsedPercent == 43, "own scope sees its own history")
+    // Credential material must never land in the history JSON.
+    let file = root.appendingPathComponent(scopeA).appendingPathComponent("history-v1.json")
+    let json = String(data: try! Data(contentsOf: file), encoding: .utf8)!
+    check(!json.contains(keyA), "api key must not appear in the history JSON")
+    check(!json.contains(keyB), "other api key must not appear either")
+    let salt = try! Data(contentsOf: root.appendingPathComponent("scope-salt"))
+    let saltHex = salt.map { String(format: "%02x", $0) }.joined()
+    check(!json.contains(saltHex), "salt must not appear in the history JSON")
+    check(json.contains("schemaVersion"), "history JSON carries the schema version")
+    print("PASS: scopeIsolation")
+
+case "scopePermissions":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-kimi-code-key")
+    check(posixMode(root) == 0o700, "history root is enforced to 0700")
+    let saltURL = root.appendingPathComponent("scope-salt")
+    check((try! Data(contentsOf: saltURL)).count == 32, "scope salt is exactly 32 random bytes")
+    check(posixMode(saltURL) == 0o600, "scope salt file is 0600")
+    let partition = root.appendingPathComponent(scope)
+    try! store.save(QuotaCycleState(), scopeKey: scope)
+    check(posixMode(partition) == 0o700, "credential partition directory is 0700")
+    let file = partition.appendingPathComponent("history-v1.json")
+    check(posixMode(file) == 0o600, "history file is enforced to 0600")
+    // Only fixed-length hex scope keys are accepted; traversal is rejected.
+    for bad in ["", "../evil", scope + "x", String(repeating: "z", count: 64),
+                "..", scope.uppercased()] {
+        check(loadFails(store, bad), "malformed scope key must be rejected: \(bad)")
+    }
+    print("PASS: scopePermissions")
+
+case "corruptAndFuturePreserved":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-kimi-code-key")
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(0, 72), into: &state)
+    reducer.ingest(sample(604900, 3, 1_209_600), into: &state)
+    reducer.ingest(sample(604920, 4, 1_209_600), into: &state)
+    try! store.save(state, scopeKey: scope)
+    let file = root.appendingPathComponent(scope).appendingPathComponent("history-v1.json")
+    let original = try! JSONSerialization.jsonObject(with: try! Data(contentsOf: file)) as! [String: Any]
+
+    // Garbage bytes: load fails, file untouched.
+    let garbage = Data("not json at all".utf8)
+    try! garbage.write(to: file)
+    check(loadFails(store, scope), "garbage file must fail to load")
+    check(try! Data(contentsOf: file) == garbage, "corrupt file is left untouched")
+
+    // A future schema version is reported, never downgraded or overwritten.
+    var future = original
+    future["schemaVersion"] = 2
+    let futureData = try! JSONSerialization.data(withJSONObject: future, options: [.sortedKeys])
+    try! futureData.write(to: file)
+    do {
+        _ = try store.load(scopeKey: scope)
+        check(false, "future schema must not load")
+    } catch QuotaCycleStoreError.unsupportedSchema(let found) {
+        check(found == 2, "the future schema version is reported")
+    } catch {
+        check(false, "future schema must surface as unsupportedSchema, got \(error)")
+    }
+    check(try! Data(contentsOf: file) == futureData, "future-version file is left untouched")
+
+    // A newer request paired with an older response (time regression) is
+    // rejected at decode time instead of silently moving history backwards.
+    var tampered = original
+    var closed = tampered["closed"] as! [[String: Any]]
+    var evidence = closed[0]["evidence"] as! [[String: Any]]
+    evidence[0]["requestStartedAt"] = (evidence[0]["observedAt"] as! Double) + 5000
+    closed[0]["evidence"] = evidence
+    tampered["closed"] = closed
+    let tamperedData = try! JSONSerialization.data(withJSONObject: tampered, options: [.sortedKeys])
+    try! tamperedData.write(to: file)
+    check(loadFails(store, scope), "request/response time regression must fail to load")
+    check(try! Data(contentsOf: file) == tamperedData, "tampered file is left untouched")
+
+    // The untouched good state is still intact after all failed loads.
+    try! JSONSerialization.data(withJSONObject: original, options: [.sortedKeys]).write(to: file)
+    let restored = try! store.load(scopeKey: scope)
+    check(restored.closed.count == 1, "the original good state still loads")
+    print("PASS: corruptAndFuturePreserved")
+
+case "writerFailureKeepsLastGood":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    var writerCalls = 0
+    var failWrites = false
+    let countingWriter: QuotaCycleStore.Writer = { data, url in
+        writerCalls += 1
+        if failWrites {
+            throw NSError(domain: "TestWriter", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "injected write failure"])
+        }
+        try data.write(to: url, options: .atomic)
+    }
+    let store = QuotaCycleStore(root: root, writer: countingWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-kimi-code-key")
+    var state = QuotaCycleState()
+    makeReducer().ingest(sample(0, 43), into: &state)
+    try! store.save(state, scopeKey: scope)
+    let callsAfterFirstSave = writerCalls
+    makeReducer().ingest(sample(600, 58), into: &state)
+    failWrites = true
+    do {
+        try store.save(state, scopeKey: scope)
+        check(false, "a failing writer must propagate the error")
+    } catch {
+        // expected: the caller learns the write failed
+    }
+    check(writerCalls == callsAfterFirstSave + 1, "the failed save invoked the writer exactly once")
+    // The last successful disk state survives; the caller keeps observing in memory.
+    let disk = try! QuotaCycleStore(root: root, writer: countingWriter).load(scopeKey: scope)
+    check(disk.current?.lastObservedUsedPercent == 43,
+          "a failed write must not clobber the last good disk state")
+    check(state.current?.lastObservedUsedPercent == 58,
+          "the caller keeps its in-memory observations after a write failure")
+    print("PASS: writerFailureKeepsLastGood")
+
+case "saveDedupAndHeartbeat":
+    let scheduler = QuotaCycleSaveScheduler(heartbeatInterval: 300)
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(0, 43), into: &state)
+    check(scheduler.shouldSave(state: state, diskState: nil, now: t, lastSaveAt: nil),
+          "the first observation always saves")
+    let disk = state
+    let lastSave = t
+    check(!scheduler.shouldSave(state: state, diskState: disk,
+                                now: t.addingTimeInterval(60), lastSaveAt: lastSave),
+          "an unchanged state inside the heartbeat window is not rewritten")
+    check(scheduler.shouldSave(state: state, diskState: disk,
+                               now: t.addingTimeInterval(301), lastSaveAt: lastSave),
+          "an unchanged state past the heartbeat interval is rewritten")
+    // A duplicate replay is rejected by the reducer (counted, but no content
+    // changes) and must not trigger a save.
+    reducer.ingest(sample(0, 43), into: &state)   // exact replay: rejected as out-of-order
+    check(state.rejectedOutOfOrderCount == 1, "a duplicate replay is counted as rejected")
+    check(state.current?.evidence.count == 1, "a rejected duplicate adds no evidence")
+    check(!scheduler.shouldSave(state: state, diskState: disk,
+                                now: t.addingTimeInterval(120), lastSaveAt: lastSave),
+          "dedup: a rejected duplicate must not trigger a rewrite")
+    // Any accepted change (including a still-unconfirmed candidate) is
+    // persisted immediately, never deferred to the heartbeat.
+    reducer.ingest(sample(600, 41), into: &state)   // 2pp drop on the same reset
+    check(state.pendingTransition != nil, "a meaningful drop opens an abnormal candidate")
+    check(scheduler.shouldSave(state: state, diskState: disk,
+                               now: t.addingTimeInterval(121), lastSaveAt: lastSave),
+          "candidate transitions save immediately")
+    // A heartbeat decision never mutates the state: no equal-value evidence
+    // is appended and the candidate is never compressed away.
+    let evidenceBefore = state.current?.evidence.count
+    let pendingBefore = state.pendingTransition
+    _ = scheduler.shouldSave(state: state, diskState: disk,
+                             now: t.addingTimeInterval(4000), lastSaveAt: lastSave)
+    check(state.current?.evidence.count == evidenceBefore,
+          "a heartbeat decision never appends evidence")
+    check(state.pendingTransition == pendingBefore, "a heartbeat never compresses a candidate away")
+    check(state != disk, "the candidate still marks the state as changed")
+    print("PASS: saveDedupAndHeartbeat")
 
 default:
     fputs("FAIL: unknown case \(CommandLine.arguments[1])\n", stderr)

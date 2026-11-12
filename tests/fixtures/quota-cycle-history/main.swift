@@ -1111,6 +1111,27 @@ case "coordinatorRejectsStaleGenerationAfterRoundTrip":
           "no fabricated cycles or evidence from the stale sample")
     print("PASS: coordinatorRejectsStaleGenerationAfterRoundTrip")
 
+case "observedTimeRegressionRejected":
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(600, 50), into: &state)
+    let id = state.current?.id
+    let regressed = QuotaObservation(
+        requestStartedAt: t.addingTimeInterval(599.5),
+        observedAt: t.addingTimeInterval(599.6),
+        usedPercent: 91,
+        resetAt: t.addingTimeInterval(604800))
+    reducer.ingest(regressed, into: &state)
+    check(state.current?.id == id, "time regression must keep the confirmed cycle")
+    check(state.current?.lastObservedUsedPercent == 50,
+          "time regression must not overwrite the current percentage")
+    check(state.rejectedOutOfOrderCount == 1, "time regression is rejected")
+    // Rejection must not advance lastRequestStartedAt and poison a later valid request.
+    reducer.ingest(sample(900, 60), into: &state)
+    check(state.current?.lastObservedUsedPercent == 60,
+          "valid later observation still applies after time-regression rejection")
+    print("PASS: observedTimeRegressionRejected")
+
 default:
     fputs("FAIL: unknown case \(CommandLine.arguments[1])\n", stderr)
     exit(1)

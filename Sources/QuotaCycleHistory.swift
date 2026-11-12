@@ -129,6 +129,13 @@ struct QuotaCycleReducer {
             state.rejectedOutOfOrderCount += 1
             return
         }
+        if let lastObservation = state.lastObservation,
+           sample.observedAt < lastObservation.observedAt {
+            // A newer request paired with an older response observation (or a
+            // clock rollback) must not move cycle time backwards.
+            state.rejectedOutOfOrderCount += 1
+            return
+        }
         state.lastRequestStartedAt = sample.requestStartedAt
 
         guard let current = state.current else {

@@ -7,7 +7,7 @@ APP="$DIR/KimiUsage.app"
 
 # 版本注入：tag 即版本（git describe），无 tag 退化短 hash，未提交改动追加 -dirty。
 # 打包时写进产物 Info.plist 自定义键（CUBuildVersion），app 运行时读 Bundle——不能生成第二个 .swift：
-# 多文件编译下只有 main.swift 允许 top-level 代码，KimiUsage.swift 的命令行入口依赖 top-level
+# 多文件编译下只有根目录 main.swift 包含 top-level 命令行入口
 VERSION_DESCRIBE="$(git -C "$DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 COMMIT="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 

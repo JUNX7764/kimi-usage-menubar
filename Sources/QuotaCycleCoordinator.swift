@@ -103,7 +103,8 @@ final class QuotaCycleCoordinator {
             active = nil
             deliver(QuotaCycleSnapshot(
                 loaded: false, closed: [], current: nil,
-                pendingTransition: nil, persistenceFailed: true))
+                pendingTransition: nil, generation: generation,
+                persistenceFailed: true))
             return
         }
 
@@ -128,7 +129,8 @@ final class QuotaCycleCoordinator {
             // 「读取历史」 state with the failure notice.
             deliver(QuotaCycleSnapshot(
                 loaded: false, closed: [], current: nil,
-                pendingTransition: nil, persistenceFailed: true))
+                pendingTransition: nil, generation: generation,
+                persistenceFailed: true))
         } else {
             deliver(snapshot(of: context))
         }
@@ -210,6 +212,7 @@ final class QuotaCycleCoordinator {
             closed: context.state.closed,
             current: context.state.current,
             pendingTransition: context.state.pendingTransition,
+            generation: context.generation,
             persistenceFailed: context.persistenceFailed)
     }
 

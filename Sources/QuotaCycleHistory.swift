@@ -343,6 +343,11 @@ struct QuotaCycleSnapshot: Equatable {
     var closed: [QuotaCycleRecord]
     var current: QuotaCycleRecord?
     var pendingTransition: PendingQuotaTransition?
+    /// Credential-round generation this snapshot belongs to. Production
+    /// snapshots always carry it so a late main-thread delivery from a
+    /// superseded round can be dropped before touching the UI; `inactive`
+    /// and preview fixtures use `nil`. Never carries apiKey/scopeKey.
+    var generation: Int? = nil
     /// True when the scope's last load or save failed. The UI shows
     /// 「历史未保存」 without discarding the in-memory observations.
     var persistenceFailed: Bool

@@ -4149,6 +4149,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }, deliver: { [weak self] snapshot in
             DispatchQueue.main.async {
                 guard let self else { return }
+                // 竞态防护：协调器交付时本轮可能已切到新凭据作用域（generation 已递增、
+                // UI 已清空），这个迟到闭包不得用旧作用域快照覆盖新 UI——按代际丢弃。
+                guard snapshot.generation == self.historyGeneration else { return }
                 self.historySnapshot = snapshot
                 self.rebuildMenu()
             }
@@ -6427,6 +6430,49 @@ enum KimiOfflineRegression {
                        "preview fixture must offer at least six cycles from a fixed snapshot")
             try expect(QuotaCycleSnapshot.inactive.loaded == false,
                        "inactive snapshot must render the neutral placeholder state")
+
+            // 竞态回归：旧代际快照在「AppDelegate 已同步切到新作用域」之后才执行时，
+            // 生产 guard 必须丢弃它，不得覆盖新 UI。用被闸门卡住的模拟主队列确定性复现
+            // 乱序窗口（不靠 sleep）：A(gen1) 快照已入队未执行 → 同步切到 gen2 → 放行。
+            let raceRoot = root.appendingPathComponent("quota-history-race", isDirectory: true)
+            let mainSim = DispatchQueue(label: "KimiUsage-self-test.main-sim")
+            let raceGate = DispatchSemaphore(value: 0)
+            mainSim.async { raceGate.wait() }   // 卡住模拟主队列，制造「入队后、执行前」窗口
+            let genLock = NSLock()
+            var currentGen = 1
+            var applied = 0
+            var uiSnapshot = QuotaCycleSnapshot.inactive
+            let appliedSem = DispatchSemaphore(value: 0)
+            let raceRecorder = HistorySnapshotRecorder()
+            let raceSem = DispatchSemaphore(value: 0)
+            let raceCoordinator = QuotaCycleCoordinator(root: raceRoot, writer: atomicHistoryWriter,
+                deliver: { snapshot in
+                    raceRecorder.append(snapshot); raceSem.signal()
+                    // 复刻 AppDelegate 交付路径：异步 hop 到主队列 + 代际 guard
+                    mainSim.async {
+                        genLock.lock(); let generation = currentGen; genLock.unlock()
+                        if snapshot.generation == generation {
+                            uiSnapshot = snapshot
+                            applied += 1
+                        }
+                        appliedSem.signal()
+                    }
+                })
+            raceCoordinator.activate(apiKey: "fake-race-key-A", generation: 1)
+            try awaitHistoryDelivery(raceSem, "race: scope A snapshot delivered to the hop queue")
+            try expect(raceRecorder.last?.generation == 1, "production snapshots must carry their generation")
+            // A 的闭包仍在模拟主队列里等待；此刻 AppDelegate 同步切到新作用域（gen 递增、UI 清空）。
+            genLock.lock(); currentGen = 2; genLock.unlock()
+            raceGate.signal()
+            try awaitHistoryDelivery(appliedSem, "race: stale A closure executed")
+            try expect(applied == 0 && uiSnapshot.loaded == false,
+                       "stale-generation snapshot delivered after the scope switch must be dropped, not overwrite the UI")
+            // 新代际快照正常通过 guard。
+            raceCoordinator.activate(apiKey: "fake-race-key-B", generation: 2)
+            try awaitHistoryDelivery(raceSem, "race: scope B delivered")
+            try awaitHistoryDelivery(appliedSem, "race: scope B applied")
+            try expect(applied == 1 && uiSnapshot.loaded == true && uiSnapshot.current == nil,
+                       "the current generation's snapshot must apply normally after the stale one is dropped")
 
             print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
             return 0

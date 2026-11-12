@@ -108,6 +108,12 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_save_dedup_and_heartbeat_semantics(self):
         self.run_case("saveDedupAndHeartbeat")
 
+    def test_equivalent_samples_deduped_until_heartbeat(self):
+        self.run_case("equivalentSampleDedup")
+
+    def test_load_repairs_existing_history_file_permissions(self):
+        self.run_case("loadFixesFilePermissions")
+
 
 if __name__ == "__main__":
     unittest.main()

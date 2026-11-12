@@ -93,6 +93,10 @@ final class QuotaCycleStore {
         guard fileManager.fileExists(atPath: file.path) else {
             return QuotaCycleState()
         }
+        // Repair metadata left loose by an older build before reading. This
+        // only changes permissions, never the file's bytes, so corrupt or
+        // future-schema data below is still preserved untouched.
+        try enforceMode(file, mode: 0o600)
         let data = try Data(contentsOf: file)
         let state: QuotaCycleState
         do {
@@ -271,8 +275,9 @@ struct QuotaCycleSaveScheduler {
         self.heartbeatInterval = heartbeatInterval
     }
 
-    /// Diagnostic-only counters never justify a write; only real content
-    /// changes (percentages, cycles, candidates, evidence) do.
+    /// Diagnostic-only counters and heartbeat-only timestamp advances never
+    /// justify a write; only real content changes (percentages, cycles,
+    /// candidates, evidence) do.
     func shouldSave(
         state: QuotaCycleState,
         diskState: QuotaCycleState?,
@@ -296,6 +301,14 @@ struct QuotaCycleSaveScheduler {
             copy.rejectedAmbiguousCount = 0
             copy.rollbackCount = 0
             copy.expiredCandidateCount = 0
+            // Equivalent samples may advance these markers in memory; that
+            // alone is what the five-minute heartbeat is for.
+            copy.lastRequestStartedAt = nil
+            copy.lastObservation = nil
+            if var current = copy.current {
+                current.lastObservedAt = Date(timeIntervalSince1970: 0)
+                copy.current = current
+            }
             return copy
         }
         return normalized(diskState) != normalized(state)

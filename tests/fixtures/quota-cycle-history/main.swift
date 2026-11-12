@@ -489,6 +489,8 @@ case "corruptAndFuturePreserved":
     try! tamperedData.write(to: file)
     check(loadFails(store, scope), "request/response time regression must fail to load")
     check(try! Data(contentsOf: file) == tamperedData, "tampered file is left untouched")
+    check(posixMode(file) == 0o600,
+          "permission repair on load fixes the mode without touching bytes")
 
     // The untouched good state is still intact after all failed loads.
     try! JSONSerialization.data(withJSONObject: original, options: [.sortedKeys]).write(to: file)
@@ -573,6 +575,87 @@ case "saveDedupAndHeartbeat":
     check(state.pendingTransition == pendingBefore, "a heartbeat never compresses a candidate away")
     check(state != disk, "the candidate still marks the state as changed")
     print("PASS: saveDedupAndHeartbeat")
+
+case "equivalentSampleDedup":
+    let scheduler = QuotaCycleSaveScheduler(heartbeatInterval: 300)
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(0, 43), into: &state)
+    let disk = state
+    // The first observation was persisted shortly after it arrived; the
+    // equivalent sample below lands 200s after that save.
+    let lastSave = t.addingTimeInterval(400)
+    // An independent request (new requestStartedAt) with an unchanged
+    // percentage on the same window is a heartbeat-equivalent sample.
+    reducer.ingest(sample(600, 43), into: &state)
+    check(state.current?.evidence.count == 1, "an equivalent sample must not grow evidence")
+    check(state.current?.lastObservedAt == t.addingTimeInterval(600),
+          "the in-memory last-observed time may advance")
+    check(state.lastObservation?.observedAt == t.addingTimeInterval(600),
+          "the in-memory last-observation marker may advance")
+    check(!scheduler.shouldSave(state: state, diskState: disk,
+                                now: t.addingTimeInterval(600), lastSaveAt: lastSave),
+          "equivalent samples must not write before the heartbeat")
+    check(scheduler.shouldSave(state: state, diskState: disk,
+                               now: t.addingTimeInterval(700), lastSaveAt: lastSave),
+          "equivalent samples are written at the heartbeat at the earliest")
+    // A real percentage change still grows evidence and saves immediately.
+    reducer.ingest(sample(700, 44), into: &state)
+    check(state.current?.evidence.count == 2, "a percentage change grows evidence again")
+    check(scheduler.shouldSave(state: state, diskState: disk,
+                               now: t.addingTimeInterval(700), lastSaveAt: lastSave),
+          "a percentage change still saves immediately")
+    let savedAfterPercent = state
+    let savedAfterPercentAt = t.addingTimeInterval(700)
+    // Candidate transitions also stay immediate.
+    reducer.ingest(sample(800, 42), into: &state)   // 2pp drop on the same reset
+    check(state.pendingTransition != nil, "a meaningful drop opens a candidate")
+    check(scheduler.shouldSave(state: state, diskState: savedAfterPercent,
+                               now: t.addingTimeInterval(701), lastSaveAt: savedAfterPercentAt),
+          "candidate creation still saves immediately")
+    let savedAfterCandidate = state
+    // Rollbacks also stay immediate.
+    reducer.ingest(sample(900, 44), into: &state)   // back to the old window value
+    check(state.pendingTransition == nil, "returning to the old window rolls back the candidate")
+    check(state.rollbackCount == 1, "rollback is counted")
+    check(scheduler.shouldSave(state: state, diskState: savedAfterCandidate,
+                               now: t.addingTimeInterval(702), lastSaveAt: t.addingTimeInterval(701)),
+          "a rollback still saves immediately")
+    // Natural rotations also persist immediately.
+    var rotated = QuotaCycleState()
+    let rotationReducer = makeReducer()
+    rotationReducer.ingest(sample(0, 10), into: &rotated)
+    rotationReducer.ingest(sample(604700, 20), into: &rotated)
+    let rotationDisk = rotated
+    rotationReducer.ingest(sample(604900, 1, 1_209_600), into: &rotated)
+    rotationReducer.ingest(sample(604950, 2, 1_209_600), into: &rotated)
+    check(rotated.closed.count == 1, "rotation closes the old cycle")
+    check(rotated.closed[0].end == .natural, "crossed deadline is a natural rotation")
+    check(scheduler.shouldSave(state: rotated, diskState: rotationDisk,
+                               now: t.addingTimeInterval(604950), lastSaveAt: t),
+          "a rotation still saves immediately")
+    print("PASS: equivalentSampleDedup")
+
+case "loadFixesFilePermissions":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-kimi-code-key")
+    var state = QuotaCycleState()
+    makeReducer().ingest(sample(0, 43), into: &state)
+    try! store.save(state, scopeKey: scope)
+    let file = root.appendingPathComponent(scope).appendingPathComponent("history-v1.json")
+    // Simulate a history file left with looser permissions by an older build.
+    try! FileManager.default.setAttributes(
+        [.posixPermissions: NSNumber(value: 0o644)], ofItemAtPath: file.path)
+    check(posixMode(file) == 0o644, "fixture loosened the file mode")
+    let bytesBefore = try! Data(contentsOf: file)
+    let loaded = try! store.load(scopeKey: scope)
+    check(loaded == state, "load still returns the stored state")
+    check(posixMode(file) == 0o600, "load enforces 0600 on an existing history file")
+    check(try! Data(contentsOf: file) == bytesBefore,
+          "permission repair never rewrites file bytes")
+    print("PASS: loadFixesFilePermissions")
 
 default:
     fputs("FAIL: unknown case \(CommandLine.arguments[1])\n", stderr)

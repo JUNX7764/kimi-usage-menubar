@@ -205,6 +205,15 @@ struct QuotaCycleReducer {
             state.lastObservation = sample
             return
         }
+        if drop == 0 {
+            // Equivalent sample (same window, same percentage): advance the
+            // in-memory last-observed markers but do not grow evidence, so a
+            // 10-second refresh poll never churns the persisted history.
+            current.lastObservedAt = sample.observedAt
+            state.current = current
+            state.lastObservation = sample
+            return
+        }
         current.lastObservedAt = sample.observedAt
         current.lastObservedUsedPercent = sample.usedPercent
         current.evidence.append(sample)

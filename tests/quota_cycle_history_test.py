@@ -122,6 +122,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_browser_paging_covers_record_count_boundaries(self):
         self.run_case("browserPagingBounds")
 
+    def test_browser_windowed_browsing_extends_by_batch(self):
+        self.run_case("browserWindowedBrowsing")
+
     def test_browser_keeps_page_anchor_when_new_records_arrive(self):
         self.run_case("browserKeepsPageOnNewRecords")
 

@@ -505,7 +505,47 @@ struct QuotaCycleBrowser: Equatable {
         windowSize = max(pageSize, initialWindow)
     }
 
+    // MARK: - 窗口化浏览（首批最近 initialWindow 条，「更早记录」每次再扩展一批）
+    //
+    // 图表永远不一次性展示全部历史：可浏览条数 = min(总条数, 浏览窗口)，页码基于
+    // 可浏览条数 clamp；窗口是页大小的整数倍，映射回全量索引后最旧一页恰好覆盖
+    // 窗口起点。扩展只由用户主动触发（「更早记录」按钮或方向键到达最旧已载页）。
+
+    /// 当前可浏览条数（浏览窗口内）。
+    static func browsableCount(total: Int, windowSize: Int) -> Int {
+        min(max(0, total), max(1, windowSize))
+    }
+
+    /// 窗口之外是否还有未载入的更早记录（决定「更早记录」入口是否可用）。
+    static func hasMoreBeyondWindow(total: Int, windowSize: Int) -> Bool {
+        total > max(1, windowSize)
+    }
+
+    /// 某一屏在全量（旧→新）索引中的范围。页码先按可浏览条数 clamp，
+    /// 再映射回全量索引；窗口为页大小整数倍时最旧页不会越过窗口起点。
+    static func windowedRange(total: Int, windowSize: Int,
+                              pageOffset: Int, pageSize: Int = 6) -> Range<Int> {
+        let browsable = browsableCount(total: total, windowSize: windowSize)
+        guard browsable > 0 else { return 0..<0 }
+        let safeSize = max(1, pageSize)
+        let maxPage = max(0, (browsable - 1) / safeSize)
+        let page = min(max(0, pageOffset), maxPage)
+        let upper = max(0, total - page * safeSize)
+        return max(0, upper - safeSize)..<upper
+    }
+
     mutating func select(_ id: UUID?) { selectedCycleID = id }
+
+    /// 把固定选择移动到指定轮次，并把页锚点跟过去（键盘逐组/跨页用）。
+    /// 只锚定当前浏览窗口内的 ID：窗口之外的更早 ID 由调用方先 `loadEarlier()`
+    /// 扩展窗口，再 reveal；不在窗口内时不改页锚（渲染端按可浏览条数 clamp）。
+    mutating func reveal(_ id: UUID, chronologicalIDs: [UUID]) {
+        selectedCycleID = id
+        let windowed = Array(chronologicalIDs.suffix(max(pageSize, windowSize)))
+        guard let index = windowed.firstIndex(of: id) else { return }
+        let total = windowed.count
+        olderPage = max(0, (total - 1 - index) / pageSize)
+    }
 
     /// The record list changed (e.g. a cycle closed while the user browses
     /// history). Pages never jump back to the newest page on their own —

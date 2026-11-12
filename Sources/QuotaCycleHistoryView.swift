@@ -15,6 +15,9 @@ struct QuotaCycleItem: Equatable {
     let isCurrent: Bool
     let detailTitle: String    // 第一行：日期区间 · 结束/进行状态
     let detailValue: String    // 第二行：已用与剩余（百分比，非 Token）
+    let lastObservedAt: Date?  // 最后观测时间（VoiceOver 与 tooltip 完整读值）
+    /// VoiceOver 完整选中详情：开始精度、结束状态、已用、剩余与最后观测时间。
+    let accessibilityText: String
 }
 
 enum QuotaCyclePresentation {
@@ -26,6 +29,18 @@ enum QuotaCyclePresentation {
         formatter.dateFormat = "MM/dd"
         return formatter
     }()
+
+    private static let fullFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy年MM月dd日 HH:mm"
+        return formatter
+    }()
+
+    private static func fullLabel(_ date: Date?) -> String {
+        guard let date else { return "未知" }
+        return fullFormatter.string(from: date)
+    }
 
     private static func dayLabel(_ date: Date?) -> String {
         guard let date else { return "--" }
@@ -59,9 +74,19 @@ enum QuotaCyclePresentation {
         return Array(items[lower..<upper])
     }
 
+    // 窗口化浏览的范围/条数计算在 QuotaCycleBrowser 上（纯整数，可离线断言）。
+
     static func pageCount(_ items: [QuotaCycleItem]) -> Int {
         guard !items.isEmpty else { return 0 }
         return (items.count - 1) / pageSize + 1
+    }
+
+    private static func startPrecision(_ record: QuotaCycleRecord) -> String {
+        switch record.startKind {
+        case .inferred: return "开始时间为推算"
+        case .observedTransition: return "开始时间已观测"
+        case .afterGap: return "开始时间未知（观测缺口之后）"
+        }
     }
 
     private static func makeClosedItem(_ record: QuotaCycleRecord) -> QuotaCycleItem {
@@ -70,6 +95,7 @@ enum QuotaCyclePresentation {
         let remaining = record.remainingAtLastObservation
         let title: String
         let value: String
+        let spokenEnd: String
         switch record.end {
         case .natural:
             // 正常到期：到期时刻 = 接口 reset，非约值。
@@ -77,21 +103,29 @@ enum QuotaCyclePresentation {
             value = record.wasObservedFull
                 ? "最后观测已用 100% · 已用满"
                 : "最后观测已用 \(percent(used)) · 到期未用约 \(percent(remaining))"
+            spokenEnd = "正常到期"
         case .windowChanged:
             // 异常窗口变化：边界只有观测区间，标（约）；原因未知，不归因。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 窗口变化（原因未知）"
             value = "最后观测已用 \(percent(used)) · 窗口变化前剩余约 \(percent(remaining))"
+            spokenEnd = "窗口变化，原因未知"
         case .gap:
             // 观测缺口：不计算确定的到期未用百分比。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 观测缺口"
             value = "最后观测已用 \(percent(used)) · 观测缺口，剩余无法判定"
+            spokenEnd = "观测缺口，剩余无法判定"
         case .none:
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约）"
             value = "最后观测已用 \(percent(used))"
+            spokenEnd = "结束状态未知"
         }
+        let accessibility = "\(startPrecision(record))，\(spokenEnd)，已用 \(percent(used))"
+            + (record.end == .gap ? "" : "，剩余 \(percent(remaining))")
+            + "，最后观测时间 \(fullLabel(record.lastObservedAt))"
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
-            isCurrent: false, detailTitle: title, detailValue: value)
+            isCurrent: false, detailTitle: title, detailValue: value,
+            lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }
 
     private static func makeCurrentItem(_ record: QuotaCycleRecord, pending: Bool) -> QuotaCycleItem {
@@ -105,9 +139,14 @@ enum QuotaCyclePresentation {
         let value = pending
             ? "最后观测已用 \(percent(used)) · 当前剩余 \(percent(remaining))"
             : "已用 \(percent(used)) · 当前剩余 \(percent(remaining))"
+        let spokenState = pending ? "窗口变化待确认" : "当前轮次进行中"
+        let accessibility = "\(startPrecision(record))，\(spokenState)，已用 \(percent(used))"
+            + "，当前剩余 \(percent(remaining))"
+            + "，最后观测时间 \(fullLabel(record.lastObservedAt))"
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
-            isCurrent: true, detailTitle: title, detailValue: value)
+            isCurrent: true, detailTitle: title, detailValue: value,
+            lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }
 }
 
@@ -121,12 +160,37 @@ final class QuotaCycleChartCanvas: NSView {
     }
 
     var items: [QuotaCycleItem] = []
-    var selectedID: UUID?
-    /// 点击选择回调（Task 7 再接悬停/键盘/跨页方向键与状态保持）
-    var onSelect: ((UUID) -> Void)?
+    /// 固定选择（控制器持久状态）；高亮与详情按「悬停 ?? 固定 ?? 本屏最新」显示。
+    private(set) var fallbackID: UUID?
+    /// 悬停临时查看的轮次；鼠标移出后清空并恢复固定选择。不发网络、不写盘。
+    private(set) var hoveredID: UUID?
+    /// 点击固定选择回调（控制器记录稳定 ID）。
+    var onPin: ((UUID) -> Void)?
+    /// 悬停变化回调（nil = 移出，恢复固定选择展示）。
+    var onHover: ((UUID?) -> Void)?
+    /// 左右方向键逐组（可能跨页/触发扩展，由控制器裁决）。
+    var onStep: ((Int) -> Void)?
+    private var trackingArea: NSTrackingArea?
 
     private let barGap: CGFloat = 2
     private let maxBarWidth: CGFloat = 13
+
+    /// 当前实际高亮的轮次（悬停优先）。
+    var effectiveID: UUID? { hoveredID ?? fallbackID }
+
+    override var acceptsFirstResponder: Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3).fill() }
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
+    }
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { noteFocusRingMaskChanged() }
+        return accepted
+    }
 
     var groupFramesForTest: [GroupFrame] { groupFrames(in: bounds) }
 
@@ -155,39 +219,104 @@ final class QuotaCycleChartCanvas: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let frames = groupFrames(in: bounds)
+        let effective = effectiveID
         // 基线：1pt 全宽发丝线（与日图同款）
         NSColor.labelColor.withAlphaComponent(0.15).setFill()
         NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
         guard !frames.isEmpty else { return }
         for (frame, item) in zip(frames, items) {
-            if item.id == selectedID {
+            if item.id == effective {
                 // 选中组浅色高亮：整列圆角底，深浅色/三种背景下都可辨
                 NSColor.labelColor.withAlphaComponent(0.07).setFill()
                 NSBezierPath(roundedRect: frame.slot.insetBy(dx: 1, dy: 0),
                              xRadius: 5, yRadius: 5).fill()
             }
             // 灰柱 = 额度上限 100%（secondaryLabelColor 动态色，读感弱化）
-            NSColor.secondaryLabelColor.withAlphaComponent(item.id == selectedID ? 0.4 : 0.28).setFill()
+            NSColor.secondaryLabelColor.withAlphaComponent(item.id == effective ? 0.4 : 0.28).setFill()
             frame.cap.fill()
             // 蓝柱 = 已用比例（Kimi 动态深蓝，复用 PanelAccent.codex）
             PanelAccent.codex.color
-                .withAlphaComponent(item.id == selectedID ? 1 : 0.78).setFill()
+                .withAlphaComponent(item.id == effective ? 1 : 0.78).setFill()
             frame.used.fill()
         }
     }
 
+    // MARK: 命中、悬停与键盘（整列命中；悬停临时查看，点击固定，方向键逐组）
+
+    private func itemIndex(atX x: CGFloat) -> Int? {
+        let frames = groupFrames(in: bounds)
+        return frames.firstIndex(where: { $0.slot.contains(CGPoint(x: x, y: bounds.midY)) })
+    }
+
+    override func updateTrackingAreas() { installTrackingArea() }
+    // 面板重建、Popover 关开切换：不依赖 AppKit 时机，入窗/布局时主动重挂
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installTrackingArea()
+    }
+    override func layout() {
+        super.layout()
+        installTrackingArea()
+    }
+    private func installTrackingArea() {
+        if let old = trackingArea { removeTrackingArea(old); trackingArea = nil }
+        guard window != nil else { return }
+        let area = NSTrackingArea(rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        // 进入图表即高亮光标所在列（用户在列间移动主要靠 mouseMoved，
+        // 从图外直接进入同样给出即时详情）。
+        updateHover(at: convert(event.locationInWindow, from: nil).x)
+    }
+    override func mouseMoved(with event: NSEvent) {
+        updateHover(at: convert(event.locationInWindow, from: nil).x)
+    }
+    private func updateHover(at x: CGFloat) {
+        guard let index = itemIndex(atX: x) else { return }
+        let id = items[index].id
+        guard id != hoveredID else { return }
+        hoveredID = id
+        onHover?(id)
+        needsDisplay = true
+    }
+    override func mouseExited(with event: NSEvent) {
+        // 移出图表：恢复固定选择展示（与日图「保留最后选中」不同，本卡悬停是临时的）
+        guard hoveredID != nil else { return }
+        hoveredID = nil
+        onHover?(nil)
+        needsDisplay = true
+    }
     override func mouseDown(with event: NSEvent) {
         let x = convert(event.locationInWindow, from: nil).x
-        let frames = groupFrames(in: bounds)
-        guard let index = frames.firstIndex(where: { $0.slot.contains(CGPoint(x: x, y: bounds.midY)) }) else { return }
-        selectedID = items[index].id
-        onSelect?(items[index].id)
+        guard let index = itemIndex(atX: x) else { return }
+        hoveredID = nil
+        onHover?(nil)
+        window?.makeFirstResponder(self)   // 点击后即可用方向键继续逐组
+        onPin?(items[index].id)
+        needsDisplay = true
+    }
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 123: onStep?(-1)   // ← 向更早一组
+        case 124: onStep?(1)    // → 向更新一组
+        default: super.keyDown(with: event)
+        }
+    }
+
+    /// 重建后由上层注入固定选择（nil = 本屏最新一轮为默认）。
+    func setFallback(_ id: UUID?) {
+        fallbackID = id ?? items.last?.id
+        setAccessibilityValue(fallbackItem()?.accessibilityText ?? "")
         needsDisplay = true
     }
 
-    func select(_ id: UUID?) {
-        selectedID = id
-        needsDisplay = true
+    func fallbackItem() -> QuotaCycleItem? {
+        items.first { $0.id == fallbackID } ?? items.last
     }
 }
 
@@ -238,14 +367,30 @@ final class QuotaCycleDetailView: NSView {
         titleLabel.stringValue = item.detailTitle
         valueLabel.stringValue = item.detailValue
         toolTip = "\(item.detailTitle)\n\(item.detailValue)"
-        setAccessibilityLabel("\(item.detailTitle)，\(item.detailValue)")
+        // VoiceOver 详情：两行文案 + 最后观测时间，读全不依赖柱形推断。
+        setAccessibilityLabel(item.accessibilityText)
     }
 }
 
 // MARK: - 板块视图
 
+/// 板块渲染状态：全部由控制器按 QuotaCycleBrowser 计算后注入；视图只持有悬停这类
+/// 转瞬即逝的临时状态，翻页/固定选择跨重建保持不变，不存在双状态。
+struct QuotaCycleViewState: Equatable {
+    /// 本屏可见轮次（旧→新）。
+    var visibleItems: [QuotaCycleItem]
+    /// 当前页码（0 = 已载入窗口内最新一屏）。
+    var pageOffset: Int
+    /// 已载入窗口内的总页数。
+    var pageCount: Int
+    /// 窗口之外是否还有未载入的更早记录（决定「更早记录」是否可用）。
+    var hasMoreBeyondWindow: Bool
+    /// 固定选择（nil = 默认本屏最新一轮）。
+    var pinnedID: UUID?
+}
+
 /// 额度周期回顾：header（图标+标题+折叠箭头）+ 图例/翻页 + 双柱图 + 日期行 + 固定详情 + 提示。
-/// 展开目标高度约 190pt；翻页/选择状态为视图内临时状态，跨重建保持由 Task 7 接管。
+/// 展开目标高度约 190pt；交互整列命中：悬停临时详情、点击固定、方向键逐组跨页。
 final class QuotaCycleHistorySectionView: NSView {
     private let canvas = QuotaCycleChartCanvas()
     private let detail = QuotaCycleDetailView()
@@ -255,13 +400,22 @@ final class QuotaCycleHistorySectionView: NSView {
                                                    wrapping: false, monospacedDigits: true)
     private let backButton: NSButton
     private let forwardButton: NSButton
-    private let bodyStack = QuotaCycleWidget.stack(spacing: 4)
+    /// 「更早记录」：只在已载入的最旧页且窗口外还有记录时出现，每次扩展 12 条。
+    private let earlierButton = QuotaCycleWidget.textLinkButton("更早记录")
 
-    private var allItems: [QuotaCycleItem] = []
-    private var pageItems: [QuotaCycleItem] = []
-    private var pageOffset = 0
+    let viewState: QuotaCycleViewState
+    /// 测试断言用：当前展示详情对应的轮次（悬停 ?? 固定 ?? 本屏最新）。
+    private(set) var displayedItem: QuotaCycleItem?
 
-    init(model: QuotaCycleSnapshot, expanded: Bool, target: AnyObject, action: Selector) {
+    init(model: QuotaCycleSnapshot, state: QuotaCycleViewState, expanded: Bool,
+         target: AnyObject, action: Selector,
+         onPin: @escaping (UUID) -> Void,
+         onPage: @escaping (Int) -> Void,
+         onExtendWindow: @escaping () -> Void,
+         onStep: @escaping (Int) -> Void) {
+        viewState = state
+        onPageCallback = onPage
+        onExtendCallback = onExtendWindow
         let back = QuotaCycleWidget.pagerButton(symbol: "chevron.left")
         let forward = QuotaCycleWidget.pagerButton(symbol: "chevron.right")
         backButton = back
@@ -277,13 +431,12 @@ final class QuotaCycleHistorySectionView: NSView {
                                         trailing: [toggle]), to: root)
 
         if expanded {
-            allItems = QuotaCyclePresentation.items(from: model)
             if !model.loaded {
                 // 作用域切换/读取中：中性占位，绝不显示上一账号数据
                 let placeholder = QuotaCycleWidget.label("读取历史…", size: 11,
                                                          color: .secondaryLabelColor)
                 QuotaCycleWidget.addFullWidth(placeholder, to: root)
-            } else if allItems.isEmpty {
+            } else if state.visibleItems.isEmpty {
                 // 空态：从首次成功读取后开始记录；不伪造历史柱
                 let placeholder = QuotaCycleWidget.label(
                     "从首次成功读取 7 天额度后开始记录", size: 11, color: .secondaryLabelColor)
@@ -314,12 +467,45 @@ final class QuotaCycleHistorySectionView: NSView {
                 datesRow.distribution = .fillEqually
                 QuotaCycleWidget.addFullWidth(datesRow, to: root)
                 QuotaCycleWidget.addFullWidth(detail, to: root)
-                canvas.onSelect = { [weak self] id in self?.selectItem(id) }
+
+                // 「更早记录」位于详情之下、卡片内：只在已载入的最旧一页且窗口外
+                // 还有未载入记录时出现（隐藏会让卡片高度漂移，故用 isHidden）。
+                earlierButton.isHidden = true
+                earlierButton.translatesAutoresizingMaskIntoConstraints = false
+                earlierButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
+                earlierButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                let earlierRow = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 0)
+                earlierRow.addArrangedSubview(QuotaCycleWidget.spacer())
+                earlierRow.addArrangedSubview(earlierButton)
+                earlierRow.addArrangedSubview(QuotaCycleWidget.spacer())
+                QuotaCycleWidget.addFullWidth(earlierRow, to: root)
+
+                canvas.items = state.visibleItems
+                canvas.onHover = { [weak self] id in self?.updateSelectionDisplay(hovering: id) }
+                canvas.onPin = { [weak self] id in
+                    guard let self else { return }
+                    onPin(id)   // 控制器记录稳定 ID（不重建，视图就地更新）
+                    self.updateSelectionDisplay(hovering: nil, pinnedOverride: id)
+                }
+                canvas.onStep = onStep
                 back.target = self
                 back.action = #selector(pageBack)
                 forward.target = self
                 forward.action = #selector(pageForward)
-                showPage(0)
+                earlierButton.target = self
+                earlierButton.action = #selector(extendWindow)
+
+                rebuildDates()
+                pageLabel.stringValue = Self.pageLabelText(state)
+                backButton.isEnabled = state.pageCount > 1 && state.pageOffset < state.pageCount - 1
+                forwardButton.isEnabled = state.pageCount > 1 && state.pageOffset > 0
+                // 「更早记录」只在已载入的最旧页且窗口外还有记录时可用。
+                let atOldestLoadedPage = state.pageOffset >= state.pageCount - 1
+                earlierButton.isHidden = !(state.hasMoreBeyondWindow && atOldestLoadedPage)
+                earlierButton.setAccessibilityLabel("更早记录：再载入 12 个周期")
+                backButton.setAccessibilityLabel("更早 6 个周期")
+                forwardButton.setAccessibilityLabel("更新 6 个周期")
+                updateSelectionDisplay(hovering: nil)
             }
             if model.persistenceFailed {
                 // 写盘失败：保留内存观测，明确提示未落盘（warning 语义色与日图同款橙）
@@ -332,43 +518,48 @@ final class QuotaCycleHistorySectionView: NSView {
         QuotaCycleWidget.pin(root, to: self)
     }
 
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    // MARK: 翻页与选择（Task 6：静态控件可用；跨页方向键/悬停/状态保持归 Task 7）
-
-    @objc private func pageBack() { showPage(pageOffset + 1) }
-
-    @objc private func pageForward() { showPage(pageOffset - 1) }
-
-    private func showPage(_ offset: Int) {
-        pageOffset = max(0, min(offset, max(0, QuotaCyclePresentation.pageCount(allItems) - 1)))
-        pageItems = QuotaCyclePresentation.page(allItems, pageOffset: pageOffset)
-        canvas.items = pageItems
-        // 默认选中本屏最新一轮（最右）
-        selectItem(pageItems.last?.id)
-        rebuildDates()
-        let totalPages = QuotaCyclePresentation.pageCount(allItems)
-        // 控件常驻（隐藏会让图例行塌缩、卡片高度随页数漂移）：单页时禁用并显示实际条数。
-        pageLabel.stringValue = totalPages <= 1 ? "共 \(allItems.count) 个"
-            : (pageOffset == 0 ? "最近 6 个" : "第 \(pageOffset + 1)/\(totalPages) 页")
-        backButton.isEnabled = totalPages > 1 && pageOffset < totalPages - 1
-        forwardButton.isEnabled = totalPages > 1 && pageOffset > 0
-        backButton.setAccessibilityLabel("更早 6 个周期")
-        forwardButton.setAccessibilityLabel("更新 6 个周期")
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented")
     }
 
-    private func selectItem(_ id: UUID?) {
-        canvas.select(id)
-        guard let id, let item = pageItems.first(where: { $0.id == id }) else { return }
-        detail.configure(item: item)
-        for (view, item) in zip(datesRow.arrangedSubviews, pageItems) {
-            (view as? NSTextField)?.textColor = item.id == id ? .labelColor : .secondaryLabelColor
+    static func pageLabelText(_ state: QuotaCycleViewState) -> String {
+        guard state.pageCount > 1 else { return "共 \(state.visibleItems.count) 个" }
+        return state.pageOffset == 0 ? "最近 \(QuotaCyclePresentation.pageSize) 个"
+            : "第 \(state.pageOffset + 1)/\(state.pageCount) 页"
+    }
+
+    // MARK: 翻页、扩展与选择显示
+
+    private var onPageCallback: ((Int) -> Void)?
+    private var onExtendCallback: (() -> Void)?
+
+    @objc private func pageBack() { onPageCallback?(+1) }
+
+    @objc private func pageForward() { onPageCallback?(-1) }
+
+    @objc private func extendWindow() { onExtendCallback?() }
+
+    /// 详情/高亮/日期行统一跟随「悬停 ?? 固定 ?? 本屏最新」。悬停为 nil 时恢复固定选择。
+    private func updateSelectionDisplay(hovering hoveredID: UUID?,
+                                        pinnedOverride: UUID? = nil) {
+        let pinned = pinnedOverride ?? viewState.pinnedID
+        let effectiveID = hoveredID
+            ?? pinned
+            ?? viewState.visibleItems.last?.id
+        canvas.setFallback(pinned)
+        displayedItem = viewState.visibleItems.first { $0.id == effectiveID }
+            ?? viewState.visibleItems.last
+        if let item = displayedItem {
+            detail.configure(item: item)
+            canvas.setAccessibilityValue(item.accessibilityText)
+        }
+        for (view, item) in zip(datesRow.arrangedSubviews, viewState.visibleItems) {
+            (view as? NSTextField)?.textColor = item.id == effectiveID ? .labelColor : .secondaryLabelColor
         }
     }
 
     private func rebuildDates() {
         for view in datesRow.arrangedSubviews { datesRow.removeArrangedSubview(view); view.removeFromSuperview() }
-        for item in pageItems {
+        for item in viewState.visibleItems {
             let label = QuotaCycleWidget.label(item.startLabel, size: 10,
                                                color: .secondaryLabelColor, wrapping: false,
                                                monospacedDigits: true)
@@ -461,6 +652,19 @@ private enum QuotaCycleWidget {
         toggle.widthAnchor.constraint(equalToConstant: 24).isActive = true
         toggle.heightAnchor.constraint(equalToConstant: 22).isActive = true
         return toggle
+    }
+
+    /// 文字链接式小按钮（「更早记录」）：无边框、强调色文字，hover 手型由系统按钮行为给出。
+    static func textLinkButton(_ title: String) -> NSButton {
+        let button = NSButton(title: title, target: nil, action: nil)
+        button.isBordered = false
+        button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        button.contentTintColor = PanelAccent.codex.color
+        button.attributedTitle = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: PanelAccent.codex.color
+        ])
+        return button
     }
 
     static func pagerButton(symbol: String) -> NSButton {

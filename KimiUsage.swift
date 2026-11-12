@@ -2549,7 +2549,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var usageExpanded = true
     private var briefExpanded = true
     private var toolsExpanded = false
-    private var historyExpanded = true   // 额度周期回顾：独立折叠，默认展开；跨重建保持由 Task 7 接管
+    private var historyExpanded = true   // 额度周期回顾：独立折叠，默认展开
+    /// 额度周期回顾浏览状态：页锚点/固定选择/浏览窗口都在控制器，视图每次重建即销毁，
+    /// 不能藏视图里。关闭重开与刷新保留本进程状态；重启进程回到默认（最新页、默认选择）；
+    /// 凭据作用域切换由 AppDelegate 调 resetQuotaHistoryBrowsing() 整体重置。
+    private var quotaBrowser = QuotaCycleBrowser()
+    /// 上次渲染时的轮次 ID 序列：刷新带来新轮次时把页锚点跟到固定选择，不跳回最新页。
+    private var quotaHistoryRecordIDs: [UUID] = []
     private var toolPeriodIndex = 1   // 工具明细默认「7 天」（板块折叠状态独立于周期选择）
     private var briefSelectedIndex: Int?   // 用量简析选中日（重建保留；nil = 最新一日）
     private var expandedUsageBuckets: Set<Int> = []
@@ -2800,8 +2806,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             onSelect: { [weak self] index in self?.briefSelectedIndex = index })
         addContentRow(PanelCardView(containing: briefView))
 
-        let historyView = QuotaCycleHistorySectionView(model: model.history, expanded: historyExpanded,
-            target: self, action: #selector(toggleHistory))
+        let historyView = makeQuotaHistoryView(model: model)
         addContentRow(PanelCardView(containing: historyView))
 
         let toolsView = ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
@@ -2909,9 +2914,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private func refreshPanelLayout() {
         let previousOrigin = scrollView.contentView.bounds.origin
+        // 重建前第一响应者是图表画布（用户正在方向键逐组）时，重建后恢复焦点，
+        // 否则 10 秒刷新重建会让方向键输入无声落地。
+        let hadCanvasFocus = contentController.view.window?.firstResponder is QuotaCycleChartCanvas
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         rebuildContent()
+        if hadCanvasFocus { restoreQuotaHistoryCanvasFocus() }
         if let button = anchorButton, let window = button.window {
             layoutPanel(buttonWindow: window)
             let clip = scrollView.contentView
@@ -2925,6 +2934,122 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc private func toggleBrief() { briefExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleTools() { toolsExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleHistory() { historyExpanded.toggle(); refreshPanelLayout() }
+
+    // MARK: 额度周期回顾：浏览状态与交互（状态在控制器，视图无重建即可销毁）
+
+    /// 凭据作用域切换（AppDelegate 代际递增处调用）：清空页锚点、固定选择与浏览窗口。
+    /// 重启进程不经过这里——新控制器自带默认状态，天然回到最新页。
+    func resetQuotaHistoryBrowsing() {
+        quotaBrowser.reset()
+        quotaHistoryRecordIDs = []
+        if model != nil { refreshPanelLayout() }
+    }
+
+    /// 测试断言用：当前浏览状态（页锚点、固定选择、浏览窗口）。
+    var quotaBrowserForTest: QuotaCycleBrowser { quotaBrowser }
+
+    private func makeQuotaHistoryView(model: UsagePanelModel) -> QuotaCycleHistorySectionView {
+        let items = QuotaCyclePresentation.items(from: model.history)
+        let chronologicalIDs = items.map(\.id)
+        if chronologicalIDs != quotaHistoryRecordIDs {
+            // 刷新带来新轮次：只在固定选择存在时把页锚点跟过去保证可见，否则保持当前页。
+            quotaBrowser.noteRecordsChanged(chronologicalIDs: chronologicalIDs)
+            quotaHistoryRecordIDs = chronologicalIDs
+        }
+        let total = items.count
+        let windowSize = quotaBrowser.windowSize
+        let range = QuotaCycleBrowser.windowedRange(
+            total: total, windowSize: windowSize, pageOffset: quotaBrowser.olderPage)
+        let browsable = QuotaCycleBrowser.browsableCount(total: total, windowSize: windowSize)
+        let pageCount = browsable == 0 ? 0 : (browsable - 1) / QuotaCyclePresentation.pageSize + 1
+        let state = QuotaCycleViewState(
+            visibleItems: Array(items[range]),
+            pageOffset: min(max(0, quotaBrowser.olderPage), max(0, pageCount - 1)),
+            pageCount: pageCount,
+            hasMoreBeyondWindow: QuotaCycleBrowser.hasMoreBeyondWindow(
+                total: total, windowSize: windowSize),
+            pinnedID: quotaBrowser.selectedCycleID)
+        return QuotaCycleHistorySectionView(
+            model: model.history, state: state, expanded: historyExpanded,
+            target: self, action: #selector(toggleHistory),
+            onPin: { [weak self] id in self?.quotaHistoryPin(id) },
+            onPage: { [weak self] delta in self?.quotaHistoryPage(delta) },
+            onExtendWindow: { [weak self] in self?.quotaHistoryExtendWindow() },
+            onStep: { [weak self] delta in self?.quotaHistoryStep(delta) })
+    }
+
+    /// 点击固定选择：只记录稳定 ID，不重建面板（悬停/点击不发网络、不写盘）。
+    private func quotaHistoryPin(_ id: UUID) {
+        quotaBrowser.select(id)
+    }
+
+    /// 翻页按钮：在已载入窗口内 ±1 页；翻页后默认选中本屏最新一轮（最右）。
+    private func quotaHistoryPage(_ delta: Int) {
+        guard let model else { return }
+        let items = QuotaCyclePresentation.items(from: model.history)
+        let total = items.count
+        guard total > 0 else { return }
+        let windowSize = quotaBrowser.windowSize
+        let browsable = QuotaCycleBrowser.browsableCount(total: total, windowSize: windowSize)
+        let maxPage = max(0, (browsable - 1) / QuotaCyclePresentation.pageSize)
+        let target = quotaBrowser.olderPage + delta
+        guard target >= 0, target <= maxPage else { return }
+        if delta > 0 { quotaBrowser.showOlderPage() } else { quotaBrowser.showNewerPage() }
+        let range = QuotaCycleBrowser.windowedRange(
+            total: total, windowSize: windowSize, pageOffset: quotaBrowser.olderPage)
+        quotaBrowser.select(items[range].last?.id)
+        refreshPanelLayout()
+    }
+
+    /// 「更早记录」：浏览窗口每次扩展一批（首批 12，之后每次 +12），不设存储上限；
+    /// 当前页位置不动，用户继续翻页或按方向键进入新载入的更早记录。
+    private func quotaHistoryExtendWindow() {
+        quotaBrowser.loadEarlier()
+        refreshPanelLayout()
+    }
+
+    /// 方向键逐组：在全部轮次（旧→新）内移动固定选择，跨页自动翻页；
+    /// 目标落在当前浏览窗口之外时按 12 的批次扩展窗口（键盘可到达全部历史）；
+    /// 到达最早/最新一轮时钳住不动。
+    private func quotaHistoryStep(_ delta: Int) {
+        guard let model else { return }
+        let items = QuotaCyclePresentation.items(from: model.history)
+        let total = items.count
+        guard total > 0 else { return }
+        let chronologicalIDs = items.map(\.id)
+        var index = total - 1
+        if let pinned = quotaBrowser.selectedCycleID,
+           let pinnedIndex = chronologicalIDs.firstIndex(of: pinned) {
+            index = pinnedIndex
+        }
+        index += delta
+        guard index >= 0, index < total else { return }
+        // 窗口之外的更早目标：按 12 一批扩展直到覆盖（每次 loadEarlier 恰好 +12）。
+        while index < max(0, total - quotaBrowser.windowSize) {
+            quotaBrowser.loadEarlier()
+        }
+        quotaBrowser.reveal(chronologicalIDs[index], chronologicalIDs: chronologicalIDs)
+        refreshPanelLayout()
+        restoreQuotaHistoryCanvasFocus()
+    }
+
+    /// 重建后把第一响应者还给图表画布，方向键可连续逐组（与日图点击后行为一致）。
+    private func restoreQuotaHistoryCanvasFocus() {
+        guard let window = contentController.view.window else { return }
+        func find(_ view: NSView) -> QuotaCycleChartCanvas? {
+            if let canvas = view as? QuotaCycleChartCanvas { return canvas }
+            for child in view.subviews {
+                if let found = find(child) { return found }
+            }
+            return nil
+        }
+        for row in stack.arrangedSubviews {
+            if let canvas = find(row) {
+                window.makeFirstResponder(canvas)
+                return
+            }
+        }
+    }
     @objc private func toggleToolPeriod(_ sender: NSButton) {
         guard sender.tag != toolPeriodIndex else { return }
         toolPeriodIndex = sender.tag
@@ -3136,6 +3261,278 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard abs(detail.frame.height - QuotaCycleDetailView.fixedHeight) < 1 else {
             return fail("detail height \(detail.frame.height) != fixed \(QuotaCycleDetailView.fixedHeight)")
         }
+        return true
+    }
+
+    // MARK: 额度周期回顾原生交互守门
+    //
+    // --visual-preview --visual-preview-quota-history --visual-preview-test：
+    // 悬停临时详情/点击固定/移出恢复/方向键逐组跨页/翻页按钮/「更早记录」每次扩展 12/
+    // 折叠重开与刷新保持/作用域切换重置/VoiceOver 详情，全部用真实 AppKit 事件
+    // （performClick + NSEvent 投递）驱动；不直调 handler 冒充点击。fixture 为 13 轮
+    // 固定快照：首批浏览窗口 12（两页），窗口外恰好 1 条更早记录。
+    func verifyQuotaHistoryInteractionsForPreview() -> Bool {
+        func fail(_ message: String) -> Bool {
+            fputs("KimiUsage quota history interaction test: FAIL: \(message)\n", stderr)
+            return false
+        }
+        func descendants(_ view: NSView) -> [NSView] {
+            [view] + view.subviews.flatMap { descendants($0) }
+        }
+        func section() -> QuotaCycleHistorySectionView? {
+            descendants(contentController.view).compactMap { $0 as? QuotaCycleHistorySectionView }.first
+        }
+        func canvas(_ section: QuotaCycleHistorySectionView) -> QuotaCycleChartCanvas? {
+            descendants(section).compactMap { $0 as? QuotaCycleChartCanvas }.first
+        }
+        func hasLabel(_ text: String, in section: QuotaCycleHistorySectionView) -> Bool {
+            descendants(section).compactMap { $0 as? NSTextField }
+                .contains { $0.stringValue == text }
+        }
+        guard isOpen, historyExpanded, let model = model else { return fail("initial state") }
+        let items = QuotaCyclePresentation.items(from: model.history)
+        guard items.count == 13 else { return fail("fixture expects 13 rounds, got \(items.count)") }
+        let chronologicalIDs = items.map(\.id)
+        // 13 轮快照：12 个固定 UUID + 当前轮；当前轮永远排在最后（最新一屏最右）。
+        let newestID = chronologicalIDs[12]
+        guard let window = keyWindowForPreview() else { return fail("no key window") }
+        let timestamp = ProcessInfo.processInfo.systemUptime
+        func postMouse(_ type: NSEvent.EventType, at point: CGPoint, clickCount: Int = 0) -> Bool {
+            guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
+                timestamp: timestamp, windowNumber: window.windowNumber, context: nil,
+                eventNumber: 0, clickCount: clickCount, pressure: clickCount > 0 ? 1 : 0) else { return false }
+            NSApp.sendEvent(event)
+            return true
+        }
+        /// 悬停进出：用窗口跟踪区表分发的 enter/exit 真实事件（trackingNumber 命中
+        /// 画布跟踪区，与系统鼠标进入/退出同一派发路径；合成 mouseMoved 不被
+        /// NSWindow 派发给跟踪区，AppKit 限制，故悬停断言以 enter/exit 为准）。
+        func postEnterExit(_ type: NSEvent.EventType, at point: CGPoint,
+                           in canvas: QuotaCycleChartCanvas) -> Bool {
+            guard let area = canvas.trackingAreas.first,
+                  let event = NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [],
+                      timestamp: timestamp, windowNumber: window.windowNumber, context: nil,
+                      eventNumber: 0, trackingNumber: area.hash,
+                      userData: nil) else { return false }
+            NSApp.sendEvent(event)
+            return true
+        }
+        func postKey(_ keyCode: UInt16, _ character: String) -> Bool {
+            guard let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [],
+                timestamp: timestamp, windowNumber: window.windowNumber, context: nil,
+                characters: character, charactersIgnoringModifiers: character,
+                isARepeat: false, keyCode: keyCode) else { return false }
+            NSApp.sendEvent(event)
+            return true
+        }
+        func slotCenter(_ section: QuotaCycleHistorySectionView, _ index: Int) -> CGPoint? {
+            guard let canvas = canvas(section),
+                  canvas.groupFramesForTest.indices.contains(index) else { return nil }
+            let slot = canvas.groupFramesForTest[index].slot
+            return canvas.convert(CGPoint(x: slot.midX, y: slot.midY), to: nil)
+        }
+        func runLoopUntil(_ what: String, _ condition: () -> Bool) -> Bool {
+            let deadline = Date().addingTimeInterval(3)
+            while !condition() {
+                if Date() >= deadline { return fail("timeout waiting for \(what)") }
+                _ = RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+            return true
+        }
+
+        // A. 初始态：默认最新页、默认选中当前轮；VoiceOver 详情齐全。
+        guard let initial = section(), let initialCanvas = canvas(initial) else { return fail("section missing") }
+        guard initialCanvas.items.count == QuotaCyclePresentation.pageSize else {
+            return fail("newest page must show 6 groups, got \(initialCanvas.items.count)")
+        }
+        guard hasLabel("最近 6 个", in: initial) else { return fail("initial page label") }
+        // 初始固定选择为 nil：「默认选中最新轮」是显示层语义（悬停/点击后才落稳定 ID）。
+        guard quotaBrowser.olderPage == 0, quotaBrowser.windowSize == 12,
+              quotaBrowser.selectedCycleID == nil else {
+            return fail("initial browser state: page=\(quotaBrowser.olderPage) "
+                + "window=\(quotaBrowser.windowSize) selected=\(String(describing: quotaBrowser.selectedCycleID))")
+        }
+        guard initial.displayedItem?.id == newestID else { return fail("default selection must be current cycle") }
+        guard let canvasValue = initialCanvas.accessibilityValue() as? String,
+              canvasValue.contains("最后观测时间"), canvasValue.contains("已用") else {
+            return fail("canvas VoiceOver value incomplete: \(String(describing: initialCanvas.accessibilityValue()))")
+        }
+        guard let detailLabel = descendants(initial).compactMap({ $0 as? QuotaCycleDetailView }).first?.accessibilityLabel() as? String,
+              detailLabel.contains("已用"), detailLabel.contains("最后观测时间") else {
+            return fail("detail VoiceOver label incomplete")
+        }
+
+        // B. 整列悬停临时详情：固定选择不动，移出后恢复。
+        guard let hoverPoint = slotCenter(initial, 0) else { return fail("slot 0 frame") }
+        guard postEnterExit(.mouseEntered, at: hoverPoint, in: initialCanvas) else {
+            return fail("post hover enter event")
+        }
+        guard initial.displayedItem?.id == chronologicalIDs[7] else {
+            return fail("hover column 0 must temporarily show item 7, got \(String(describing: initial.displayedItem?.id))")
+        }
+        guard quotaBrowser.selectedCycleID == nil else { return fail("hover must not pin a selection") }
+        guard let detailView = descendants(initial).compactMap({ $0 as? QuotaCycleDetailView }).first,
+              let exitPoint = Optional(detailView.convert(
+                  CGPoint(x: detailView.bounds.midX, y: detailView.bounds.midY), to: nil)) else {
+            return fail("detail view frame")
+        }
+        guard postEnterExit(.mouseExited, at: exitPoint, in: initialCanvas) else {
+            return fail("post hover exit event")
+        }
+        guard initial.displayedItem?.id == newestID else { return fail("mouse exit must restore the default display") }
+
+        // C. 点击固定：真实 mouseDown 落在第 4 列（本屏第 4 个 = 全量下标 10）。
+        guard let clickPoint = slotCenter(initial, 3) else { return fail("slot 3 frame") }
+        guard postMouse(.leftMouseDown, at: clickPoint, clickCount: 1),
+              postMouse(.leftMouseUp, at: clickPoint, clickCount: 1) else { return fail("post click events") }
+        guard quotaBrowser.selectedCycleID == chronologicalIDs[10] else {
+            return fail("click must pin item 10, got \(String(describing: quotaBrowser.selectedCycleID))")
+        }
+        guard window.firstResponder === initialCanvas else { return fail("click must focus canvas for arrow keys") }
+        guard postEnterExit(.mouseExited, at: exitPoint, in: initialCanvas) else {
+            return fail("post exit after click")
+        }
+        guard initial.displayedItem?.id == chronologicalIDs[10] else {
+            return fail("mouse exit after click must keep pinned display")
+        }
+
+        // D. 方向键逐组并跨页：10 → 7 同页，再一格跨到上一页（第 2/2 页，选中该屏最右）。
+        for (step, expectedID) in [(0, chronologicalIDs[9]), (1, chronologicalIDs[8]), (2, chronologicalIDs[7])] {
+            _ = step
+            guard postKey(123, "\u{2190}") else { return fail("post left arrow \(step)") }
+            guard quotaBrowser.selectedCycleID == expectedID else { return fail("arrow step \(step) selection") }
+        }
+        guard postKey(123, "\u{2190}") else { return fail("post crossing arrow") }
+        guard quotaBrowser.olderPage == 1, quotaBrowser.selectedCycleID == chronologicalIDs[6] else {
+            return fail("left arrow must cross to the older page keeping adjacency")
+        }
+        guard let paged = section(), hasLabel("第 2/2 页", in: paged) else { return fail("page 2 label") }
+        guard paged.displayedItem?.id == chronologicalIDs[6] else { return fail("page 2 selection display") }
+        guard postKey(124, "\u{2192}") else { return fail("post right arrow") }
+        guard quotaBrowser.olderPage == 0, quotaBrowser.selectedCycleID == chronologicalIDs[7] else {
+            return fail("right arrow must cross back to the newest page")
+        }
+        guard window.firstResponder === canvas(section()!) else { return fail("focus lost after stepping") }
+
+        // E. 最旧已载页再向左：窗口按 12 扩展，直达全部 13 轮的最旧一条（第 3/3 页）。
+        for expectedID in [chronologicalIDs[6], chronologicalIDs[5], chronologicalIDs[4],
+                           chronologicalIDs[3], chronologicalIDs[2], chronologicalIDs[1]] {
+            guard postKey(123, "\u{2190}") else { return fail("post boundary arrow") }
+            guard quotaBrowser.selectedCycleID == expectedID else { return fail("boundary step to \(expectedID)") }
+        }
+        guard postKey(123, "\u{2190}") else { return fail("post extending arrow") }
+        guard quotaBrowser.windowSize == 24, quotaBrowser.olderPage == 2,
+              quotaBrowser.selectedCycleID == chronologicalIDs[0] else {
+            return fail("left at the oldest loaded item must extend the window by 12 "
+                + "(window=\(quotaBrowser.windowSize) page=\(quotaBrowser.olderPage) "
+                + "selected=\(String(describing: quotaBrowser.selectedCycleID)))")
+        }
+        guard let extended = section(), hasLabel("第 3/3 页", in: extended) else { return fail("page 3 label") }
+        guard extended.displayedItem?.id == chronologicalIDs[0] else { return fail("oldest item display") }
+        // 最早一轮再向左钳住不动。
+        guard postKey(123, "\u{2190}") else { return fail("post clamp arrow") }
+        guard quotaBrowser.selectedCycleID == chronologicalIDs[0] else { return fail("oldest clamp") }
+
+        // F. 翻页按钮 performClick：±页 + 翻页后选中本屏最右。
+        func pagerButton(_ title: String, in section: QuotaCycleHistorySectionView) -> NSButton? {
+            descendants(section).compactMap { $0 as? NSButton }
+                .first { $0.accessibilityLabel() == title }
+        }
+        func freshPager(_ title: String) -> NSButton? {
+            guard let current = section() else { return nil }
+            return pagerButton(title, in: current)
+        }
+        guard freshPager("更新 6 个周期") != nil,
+              freshPager("更早 6 个周期") != nil else { return fail("pager buttons") }
+        freshPager("更新 6 个周期")?.performClick(nil)
+        guard quotaBrowser.olderPage == 1, quotaBrowser.selectedCycleID == chronologicalIDs[6] else {
+            return fail("pager forward must land on the newer page's last item")
+        }
+        freshPager("更早 6 个周期")?.performClick(nil)
+        guard quotaBrowser.olderPage == 2, quotaBrowser.selectedCycleID == chronologicalIDs[0] else {
+            return fail("pager back must land on the older page's last item")
+        }
+        freshPager("更新 6 个周期")?.performClick(nil)
+        guard quotaBrowser.olderPage == 1, quotaBrowser.selectedCycleID == chronologicalIDs[6],
+              freshPager("更新 6 个周期")?.isEnabled == true else {
+            return fail("pager back/forward round trip")
+        }
+
+        // G. 「更早记录」：重置后回到两页窗口，最旧页出现入口；点击每次扩展 12。
+        resetQuotaHistoryBrowsing()
+        guard quotaBrowser.olderPage == 0, quotaBrowser.selectedCycleID == nil,
+              quotaBrowser.windowSize == 12 else { return fail("scope reset state") }
+        guard let resetSection = section(), hasLabel("最近 6 个", in: resetSection),
+              resetSection.displayedItem?.id == newestID else { return fail("reset view state") }
+        guard let resetBack = pagerButton("更早 6 个周期", in: resetSection) else { return fail("reset pager") }
+        resetBack.performClick(nil)
+        guard quotaBrowser.olderPage == 1 else { return fail("reset back to page 2") }
+        guard let windowedSection = section(),
+              let earlier = descendants(windowedSection).compactMap({ $0 as? NSButton })
+                  .first(where: { $0.accessibilityLabel() == "更早记录：再载入 12 个周期" }),
+              !earlier.isHidden else { return fail("earlier-record entry must show on the oldest loaded page") }
+        guard pagerButton("更早 6 个周期", in: windowedSection)?.isEnabled == false else {
+            return fail("back must be disabled at the window edge")
+        }
+        earlier.performClick(nil)
+        guard quotaBrowser.windowSize == 24, quotaBrowser.olderPage == 1 else {
+            return fail("earlier-record click must extend the window by 12 in place")
+        }
+        guard let grownSection = section(), hasLabel("第 2/3 页", in: grownSection) else {
+            return fail("grown window page label")
+        }
+        pagerButton("更早 6 个周期", in: grownSection)?.performClick(nil)
+        guard quotaBrowser.olderPage == 2, quotaBrowser.selectedCycleID == chronologicalIDs[0] else {
+            return fail("paging into the newly loaded records")
+        }
+
+        // H. 刷新保持：同一模型再次 update()（异步重建），页位置与固定选择不动。
+        let retainedPage = quotaBrowser.olderPage
+        let retainedSelection = quotaBrowser.selectedCycleID
+        update(model: model)
+        guard runLoopUntil("refresh rebuild", { section() != nil
+            && section()!.viewState.pageOffset == retainedPage }) else { return false }
+        guard let refreshed = section() else { return fail("refreshed section") }
+        guard refreshed.displayedItem?.id == retainedSelection else { return fail("refresh must keep selection") }
+        guard refreshed.displayedItem?.id == chronologicalIDs[0],
+              hasLabel("第 3/3 页", in: refreshed) else { return fail("refresh must keep the page anchor") }
+
+        // I. 折叠重开保留本进程状态。
+        toggleHistory()
+        guard !historyExpanded, let collapsed = section(), canvas(collapsed) == nil else {
+            return fail("collapse must hide the chart")
+        }
+        toggleHistory()
+        guard historyExpanded, let reopened = section(),
+              reopened.displayedItem?.id == chronologicalIDs[0],
+              hasLabel("第 3/3 页", in: reopened) else { return fail("reopen must retain browsing state") }
+
+        // J. 凭据作用域切换重置：生产由 syncHistoryScope 走同一路径。
+        resetQuotaHistoryBrowsing()
+        guard quotaBrowser.selectedCycleID == nil, quotaBrowser.olderPage == 0,
+              quotaBrowser.windowSize == 12 else { return fail("scope-switch reset") }
+        guard let scopeSection = section(), hasLabel("最近 6 个", in: scopeSection),
+              scopeSection.displayedItem?.id == newestID else { return fail("scope-switch view reset") }
+
+        // K. 边界钳住：默认选择（nil）在最右继续向右不落地；退一步即固定到相邻轮，
+        // 再前进回到当前轮后真正钳住。Esc 关闭与外点关闭回归由通用交互测试覆盖。
+        guard let finalCanvas = canvas(scopeSection) else { return fail("final canvas") }
+        window.makeFirstResponder(finalCanvas)
+        for _ in 0..<3 {
+            guard postKey(124, "\u{2192}") else { return fail("post clamp right arrow") }
+        }
+        guard quotaBrowser.selectedCycleID == nil,
+              scopeSection.displayedItem?.id == newestID else { return fail("newest clamp from default") }
+        guard postKey(123, "\u{2190}") else { return fail("post step-left from default") }
+        guard quotaBrowser.selectedCycleID == chronologicalIDs[11] else {
+            return fail("first left step from default must pin the previous cycle")
+        }
+        guard postKey(124, "\u{2192}") else { return fail("post step-right back") }
+        guard quotaBrowser.selectedCycleID == newestID else { return fail("step back to current") }
+        for _ in 0..<2 {
+            guard postKey(124, "\u{2192}") else { return fail("post pinned clamp arrow") }
+        }
+        guard quotaBrowser.selectedCycleID == newestID else { return fail("pinned newest clamp") }
         return true
     }
 
@@ -4251,6 +4648,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         historyApiKey = codeApiKey
         historyGeneration += 1
         historySnapshot = .inactive
+        // 浏览状态（页锚点/固定选择/浏览窗口）随作用域一并重置：旧账号的选中与页位置
+        // 不能带到新账号；面板下一轮重建显示中性「读取历史」占位。
+        panelController.resetQuotaHistoryBrowsing()
         if let codeApiKey {
             historyCoordinator?.activate(apiKey: codeApiKey, generation: historyGeneration)
         }
@@ -4795,6 +5195,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 额度周期回顾预览只注入固定内存快照：不创建协调器、不创建真实历史目录、不读凭据。
         historySnapshot = .previewFixture
         // 固定历史形态覆盖（均内存快照，互不创建真实仓库）：短历史/空态/待确认/写失败。
+        // 交互测试旗标：13 轮固定快照（首批窗口 12 + 窗口外 1 条），覆盖翻页/扩展/跨页键。
+        if args.contains("--visual-preview-quota-history") { historySnapshot = .previewFixture }
         if args.contains("--visual-preview-quota-short") { historySnapshot = .previewShortFixture }
         if args.contains("--visual-preview-quota-empty") { historySnapshot = .previewEmptyFixture }
         if args.contains("--visual-preview-quota-pending") { historySnapshot = .previewPendingFixture }
@@ -4936,6 +5338,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if args.contains("--visual-preview-test") {
                 guard self.panelController.verifyPreviewInteractions(expectScroll: args.contains("--visual-preview-long")) else {
                     fputs("KimiUsage visual interaction test: FAIL\n", stderr); exit(1)
+                }
+                if args.contains("--visual-preview-quota-history") {
+                    // 额度周期回顾交互：必须在通用交互（折叠/滚动/外点）之后、关开往返之前跑。
+                    guard self.panelController.verifyQuotaHistoryInteractionsForPreview() else {
+                        fputs("KimiUsage quota history interaction test: FAIL\n", stderr); exit(1)
+                    }
+                    print("KimiUsage quota history interaction test: PASS")
                 }
                 button.performClick(nil)
                 guard !self.panelController.isOpen else { fputs("toggle close failed\n", stderr); exit(1) }

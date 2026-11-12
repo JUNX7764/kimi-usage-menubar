@@ -761,6 +761,57 @@ case "browserPagingBounds":
     check(browser.windowSize == 12, "reset restores the initial window")
     print("PASS: browserPagingBounds")
 
+case "browserWindowedBrowsing":
+    // 首批浏览最近 12 条，「更早记录」每次再扩展 12；页码基于可浏览条数 clamp，
+    // 映射回全量索引后最旧一页恰好覆盖窗口起点（窗口是页大小的整数倍）。
+    check(QuotaCycleBrowser.browsableCount(total: 0, windowSize: 12) == 0, "0 records browse empty")
+    check(QuotaCycleBrowser.browsableCount(total: 13, windowSize: 12) == 12,
+          "13 records browse only the first 12")
+    check(QuotaCycleBrowser.hasMoreBeyondWindow(total: 13, windowSize: 12),
+          "13 records with a 12 window have one record beyond")
+    check(!QuotaCycleBrowser.hasMoreBeyondWindow(total: 12, windowSize: 12),
+          "a full first window has nothing beyond")
+    check(QuotaCycleBrowser.windowedRange(total: 13, windowSize: 12, pageOffset: 0) == 7..<13,
+          "newest page shows the last 6 of 13")
+    check(QuotaCycleBrowser.windowedRange(total: 13, windowSize: 12, pageOffset: 1) == 1..<7,
+          "the older page stays inside the 12-record window")
+    check(QuotaCycleBrowser.windowedRange(total: 13, windowSize: 12, pageOffset: 99) == 1..<7,
+          "page offset clamps at the oldest loaded page")
+    check(QuotaCycleBrowser.windowedRange(total: 25, windowSize: 12, pageOffset: 0) == 19..<25,
+          "the windowed newest page never exposes records beyond the window")
+    check(QuotaCycleBrowser.windowedRange(total: 25, windowSize: 24, pageOffset: 2) == 7..<13,
+          "an extended window reaches further back")
+    check(QuotaCycleBrowser.windowedRange(total: 4, windowSize: 12, pageOffset: 0) == 0..<4,
+          "a short history keeps its real records without padding")
+    // reveal：键盘逐组/跨页的稳定 ID 锚点。
+    let revealIDs = (0..<25).map { UUID(uuidString: String(format: "%08d-0000-0000-0000-000000000000", $0))! }
+    var revealBrowser = QuotaCycleBrowser()
+    revealBrowser.reveal(revealIDs[3], chronologicalIDs: Array(revealIDs[0..<13]))
+    check(revealBrowser.selectedCycleID == revealIDs[3], "reveal selects the target id")
+    check(revealBrowser.olderPage == 1, "reveal anchors the page on the selection")
+    check(revealBrowser.visibleRange(total: 13) == 1..<7,
+          "reveal keeps the selection visible within the window")
+    // 目标在当前窗口之外：仍记录选择，但页锚不动（调用方先 loadEarlier 扩展窗口）。
+    revealBrowser.reveal(revealIDs[0], chronologicalIDs: revealIDs)
+    check(revealBrowser.selectedCycleID == revealIDs[0],
+          "an out-of-window reveal still records the selection")
+    check(revealBrowser.olderPage == 1,
+          "an out-of-window reveal must not move the page anchor")
+    // 扩展窗口后 reveal 直达窗口内最旧记录所在页（24 窗口从 ids[1] 起）。
+    revealBrowser.loadEarlier()   // 12 -> 24
+    revealBrowser.reveal(revealIDs[1], chronologicalIDs: revealIDs)
+    check(revealBrowser.olderPage == 3, "a 24-window reveal reaches the oldest loaded page of 25")
+    let browsable25 = QuotaCycleBrowser.browsableCount(total: 25, windowSize: revealBrowser.windowSize)
+    check(revealBrowser.visibleRange(total: browsable25) == 0..<6,
+          "the oldest page shows the first window batch")
+    // 再扩展一批（36 ≥ 25）后窗口覆盖全部记录，reveal 到真正的最旧一条。
+    revealBrowser.loadEarlier()   // 24 -> 36
+    revealBrowser.reveal(revealIDs[0], chronologicalIDs: revealIDs)
+    check(revealBrowser.olderPage == 4, "a full-window reveal reaches the oldest record of 25")
+    check(revealBrowser.visibleRange(total: 25) == 0..<1,
+          "the oldest page shows the single remaining record")
+    print("PASS: browserWindowedBrowsing")
+
 case "browserKeepsPageOnNewRecords":
     var ids = (0..<25).map { UUID(uuidString: String(format: "%08d-0000-0000-0000-000000000000", $0))! }
     var browser = QuotaCycleBrowser()

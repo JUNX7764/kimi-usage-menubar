@@ -4,7 +4,7 @@
 
 验收分支：`plan/quota-cycle-history-20261112`
 
-验收构建：`2713936`（含预览矩阵补充）
+验收构建：`8fa1fd1`（含预览矩阵与时间回拨边界补充）
 
 ## 结论
 
@@ -28,7 +28,7 @@ codesign --verify --deep --strict KimiUsage.app
 - 构建通过，SDK 27.2，目标保持 arm64 / macOS 13；`file` 报告 `Mach-O 64-bit executable arm64`。
 - ad-hoc 签名与 `codesign --verify --deep --strict` 通过。
 - `--self-test`：PASS。覆盖严格额度解析、样本 gate、作用域/代际隔离、主队列旧快照拒绝、预览 fixture 及原有限额、Token、更新和背景回归。
-- Python：77 tests，全部 OK。其中额度历史覆盖首样本、同窗口、候选确认/回滚/超时、自然轮换 0→0、观测缺口、非法与乱序、持久化往返、权限、损坏/未来 schema 保全、写失败恢复、等值去重与心跳、A/B/A 代际、分页及 0/1/5/6/7/12/13/25 边界。
+- Python：78 tests，全部 OK。其中额度历史覆盖首样本、同窗口、候选确认/回滚/超时、自然轮换 0→0、观测缺口、非法/乱序/观测时间倒退、持久化往返、权限、损坏/未来 schema 保全、写失败恢复、等值去重与心跳、A/B/A 代际、分页及 0/1/5/6/7/12/13/25 边界。
 - 三个 shell 脚本语法检查通过。
 
 ## 原生预览与事件回归

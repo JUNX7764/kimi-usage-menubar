@@ -140,6 +140,9 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_coordinator_rejects_stale_generation_samples(self):
         self.run_case("coordinatorRejectsStaleGeneration")
 
+    def test_coordinator_rejects_stale_generation_after_a_b_a_round_trip(self):
+        self.run_case("coordinatorRejectsStaleGenerationAfterRoundTrip")
+
 
 if __name__ == "__main__":
     unittest.main()

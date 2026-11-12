@@ -970,29 +970,95 @@ case "coordinatorRejectsStaleGeneration":
     defer { removeTempRoot(root) }
     let recorder = SnapshotRecorder()
     let sem = DispatchSemaphore(value: 0)
-    let coordinator = makeCoordinator(root: root, writer: atomicWriter,
+    var writerCalls = 0
+    let countingWriter: QuotaCycleStore.Writer = { data, url in
+        writerCalls += 1
+        try data.write(to: url, options: .atomic)
+    }
+    let coordinator = makeCoordinator(root: root, writer: countingWriter,
         onDeliver: { snap in recorder.append(snap); sem.signal() },
         now: { t })
     coordinator.activate(apiKey: "fake-key-A", generation: 1)
     awaitDelivery(sem, "activate generation 1")
     let countAfterActivate = recorder.count
     // A sample claiming a different generation of the same key is stale:
-    // it must not be delivered, and it must not pollute the active context.
+    // fully rejected — no reduce, no write, no delivery.
     coordinator.observe(sample(0, 91), apiKey: "fake-key-A", generation: 2)
+    // FIFO: this current-generation observation's delivery proves the stale
+    // sample was already processed (and rejected) without side effects.
     coordinator.observe(sample(0, 12), apiKey: "fake-key-A", generation: 1)
     awaitDelivery(sem, "current-generation observation")
     check(recorder.count == countAfterActivate + 1,
           "a stale-generation sample must not produce a UI delivery")
     check(recorder.last?.current?.lastObservedUsedPercent == 12,
           "the current generation keeps exclusive control of the UI")
-    // The stale sample still landed in its own partition (same key here)
-    // and the current generation's data is what remains observable.
+    check(writerCalls == 1,
+          "the stale-generation sample must not cause any disk write")
+    // Direct disk evidence: only the current-generation sample is present.
     let store = QuotaCycleStore(root: root, writer: atomicWriter)
     let scope = try! store.scopeKey(apiKey: "fake-key-A")
     let disk = try! store.load(scopeKey: scope)
     check(disk.current?.lastObservedUsedPercent == 12,
-          "the current generation's history stays in its own partition")
+          "only the current generation's observation reaches the partition")
+    check(disk.current?.evidence.count == 1 && disk.closed.isEmpty,
+          "the stale sample left no reduce artifacts in the state")
+    check(disk.anomalousObservations.isEmpty,
+          "the stale sample is not kept even as abnormal evidence")
     print("PASS: coordinatorRejectsStaleGeneration")
+
+case "coordinatorRejectsStaleGenerationAfterRoundTrip":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    var writerCalls = 0
+    let countingWriter: QuotaCycleStore.Writer = { data, url in
+        writerCalls += 1
+        try data.write(to: url, options: .atomic)
+    }
+    let coordinator = makeCoordinator(root: root, writer: countingWriter,
+        onDeliver: { snap in recorder.append(snap); sem.signal() },
+        now: { t })
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate A generation 1")
+    coordinator.observe(sample(0, 43), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "A generation 1 observation")
+    check(writerCalls == 1, "the first observation persists")
+    // A → B → A: key A is re-activated under a newer generation.
+    coordinator.activate(apiKey: "fake-key-B", generation: 2)
+    awaitDelivery(sem, "activate B")
+    coordinator.activate(apiKey: "fake-key-A", generation: 3)
+    awaitDelivery(sem, "re-activate A generation 3")
+    check(recorder.last?.current?.lastObservedUsedPercent == 43,
+          "re-activation restores A's own persisted history")
+    let callsAfterReactivate = writerCalls
+    let countAfterReactivate = recorder.count
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scopeA = try! store.scopeKey(apiKey: "fake-key-A")
+    let bytesBefore = try! Data(contentsOf:
+        root.appendingPathComponent(scopeA).appendingPathComponent("history-v1.json"))
+    // A late request from the superseded generation 1 round arrives now.
+    coordinator.observe(sample(600, 91), apiKey: "fake-key-A", generation: 1)
+    // FIFO: the generation-3 observation's delivery proves the stale sample
+    // was processed and rejected without touching disk or UI.
+    coordinator.observe(sample(700, 44), apiKey: "fake-key-A", generation: 3)
+    awaitDelivery(sem, "generation 3 observation")
+    check(recorder.count == countAfterReactivate + 1,
+          "the stale generation-1 sample must not deliver UI updates")
+    check(writerCalls == callsAfterReactivate + 1,
+          "exactly one write: only the generation-3 observation persists")
+    let bytesAfter = try! Data(contentsOf:
+        root.appendingPathComponent(scopeA).appendingPathComponent("history-v1.json"))
+    check(bytesAfter != bytesBefore,
+          "the generation-3 observation rewrote the partition once")
+    let disk = try! store.load(scopeKey: scopeA)
+    check(disk.current?.lastObservedUsedPercent == 44,
+          "the re-activated history continues from its own disk state")
+    check(disk.current?.evidence.map(\.usedPercent) == [43, 44],
+          "the stale 91%% sample left no trace in the persisted evidence")
+    check(disk.closed.isEmpty && disk.anomalousObservations.isEmpty,
+          "no fabricated cycles or evidence from the stale sample")
+    print("PASS: coordinatorRejectsStaleGenerationAfterRoundTrip")
 
 default:
     fputs("FAIL: unknown case \(CommandLine.arguments[1])\n", stderr)

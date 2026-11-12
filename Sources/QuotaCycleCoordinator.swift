@@ -72,9 +72,11 @@ final class QuotaCycleCoordinator {
     }
 
     /// Fold one accepted 7-day observation into its credential scope and
-    /// persist at the dedup/heartbeat cadence. Observations whose
-    /// `(apiKey, generation)` does not match the active scope still reach
-    /// their own partition but are never delivered to the UI.
+    /// persist at the dedup/heartbeat cadence. A sample for a different,
+    /// superseded apiKey still reaches its own stale partition but is never
+    /// delivered to the UI. A sample for the active apiKey with a stale
+    /// generation is fully rejected — no reduce, no write, no delivery — so
+    /// an old in-flight request can never pollute a re-activated scope.
     func observe(_ sample: QuotaObservation, apiKey: String, generation: Int) {
         queue.async {
             self.observeOnQueue(sample, apiKey: apiKey, generation: generation)
@@ -88,6 +90,9 @@ final class QuotaCycleCoordinator {
            current.apiKey != apiKey || current.generation != generation {
             staleScopes[current.apiKey] = current
         }
+        // A re-activated key supersedes any stale context of its own earlier
+        // generations; those samples are fully rejected from now on.
+        staleScopes.removeValue(forKey: apiKey)
 
         let scopeKey: String
         do {
@@ -135,8 +140,12 @@ final class QuotaCycleCoordinator {
         guard active != nil else { return }
         guard let scopeKey = try? cachedScopeKey(apiKey: apiKey) else { return }
 
-        if let current = active,
-           current.apiKey == apiKey && current.generation == generation {
+        if let current = active, current.apiKey == apiKey {
+            // Same key, stale generation: the sample belongs to a request
+            // round that was already superseded (e.g. A → B → A). It is
+            // fully rejected — no reduce, no write, no delivery — so an old
+            // in-flight request can never pollute the re-activated history.
+            guard current.generation == generation else { return }
             var context = current
             reducer.ingest(sample, into: &context.state)
             persistIfNeeded(&context)
@@ -145,7 +154,8 @@ final class QuotaCycleCoordinator {
             return
         }
 
-        // Superseded scope: keep its own partition up to date, never UI.
+        // A different superseded apiKey: keep its own partition up to date,
+        // never UI.
         var context = staleScopes[apiKey]
             ?? loadStaleContext(apiKey: apiKey, scopeKey: scopeKey,
                                 generation: generation)

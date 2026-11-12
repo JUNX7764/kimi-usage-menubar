@@ -56,6 +56,39 @@ class QuotaCycleHistoryTest(unittest.TestCase):
     def test_out_of_order_request_started_at_rejected(self):
         self.run_case("outOfOrderRejected")
 
+    def test_window_change_candidate_requires_independent_confirmation(self):
+        self.run_case("windowChangedCandidateConfirms")
+
+    def test_window_change_candidate_rolls_back_on_old_window(self):
+        self.run_case("windowChangedCandidateRollsBack")
+
+    def test_window_change_candidate_expires_past_confirmation_window(self):
+        self.run_case("windowChangedCandidateExpires")
+
+    def test_replayed_or_too_fast_request_does_not_confirm_candidate(self):
+        self.run_case("replayDoesNotConfirm")
+
+    def test_natural_rotation_accepts_zero_to_zero(self):
+        self.run_case("naturalRotationZeroToZero")
+
+    def test_full_cycle_natural_rotation(self):
+        self.run_case("fullCycleNatural")
+
+    def test_reset_moved_backward_is_rejected(self):
+        self.run_case("resetMovedBackwardRejected")
+
+    def test_forward_reset_move_without_drop_stays_pending(self):
+        self.run_case("forwardResetMoveWithoutDrop")
+
+    def test_proportion_fix_creates_candidate_and_rolls_back(self):
+        self.run_case("proportionFixCandidate")
+
+    def test_gap_across_three_weeks_closes_single_cycle(self):
+        self.run_case("gapAcrossThreeWeeks")
+
+    def test_first_observation_mid_cycle_is_incomplete(self):
+        self.run_case("firstObservationMidCycle")
+
 
 if __name__ == "__main__":
     unittest.main()

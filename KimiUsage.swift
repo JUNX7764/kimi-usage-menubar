@@ -3389,6 +3389,16 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("click must pin item 10, got \(String(describing: quotaBrowser.selectedCycleID))")
         }
         guard window.firstResponder === initialCanvas else { return fail("click must focus canvas for arrow keys") }
+        // 焦点进出回归：画布可成为第一响应者，主动退出后焦点真正离开
+        // （resignFirstResponder 误调 becomeFirstResponder 时焦点会卡住），
+        // 焦点不在画布时方向键不得改变选择。
+        window.makeFirstResponder(nil)
+        guard window.firstResponder !== initialCanvas else { return fail("canvas must release first responder") }
+        guard postKey(124, "\u{2192}") else { return fail("post unfocused arrow") }
+        guard quotaBrowser.selectedCycleID == chronologicalIDs[10] else {
+            return fail("arrow without canvas focus must not move the selection")
+        }
+        guard window.makeFirstResponder(initialCanvas) else { return fail("canvas must re-accept focus") }
         guard postEnterExit(.mouseExited, at: exitPoint, in: initialCanvas) else {
             return fail("post exit after click")
         }

@@ -187,7 +187,7 @@ final class QuotaCycleChartCanvas: NSView {
         return accepted
     }
     override func resignFirstResponder() -> Bool {
-        let accepted = super.becomeFirstResponder()
+        let accepted = super.resignFirstResponder()
         if accepted { noteFocusRingMaskChanged() }
         return accepted
     }

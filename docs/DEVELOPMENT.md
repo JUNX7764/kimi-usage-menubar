@@ -1,7 +1,7 @@
 # KimiUsage 开发与维护
 
 > **当前工程事实源**。构建、测试、发布或权限行为变化时，应在同一个提交中更新本文。
-> 最后核对：2026-11-11。
+> 最后核对：2026-11-12。
 
 ## 文档入口与效力
 
@@ -23,7 +23,7 @@
 ./build.sh
 ```
 
-`build.sh` 会重建项目内的 `KimiUsage.app`，并执行 ad-hoc 签名验证。版本号来自 Git 标签；拆分源码时必须保留合法 top-level 入口并同步调整构建脚本。
+`build.sh` 会重建项目内的 `KimiUsage.app`，并执行 ad-hoc 签名验证。版本号来自 Git 标签；多文件编译的唯一 top-level 入口是根目录 `main.swift`，新增生产模块必须显式加入构建脚本。
 
 ## 原理与数据边界
 
@@ -31,7 +31,9 @@
 - **月度接口 401**：读取最新 refresh token；续期请求进程内单飞（月度与账号两条 401 链共享同一次刷新结果），写回前重新读取最新 JSON，仅合并 Kimi Web 认证字段，跨进程写入经 `flock` 互斥，以唯一临时文件和同目录原子替换保存，并限制为仅所有者可读写。若检测到 Kimi 客户端已轮换 access/refresh token，则保留客户端版本。由于官方客户端不使用共享文件锁，检查与替换之间仍无法完全消除并发写入窗口
 - **配额**：通过 Kimi 远程接口查询 5 小时、7 天和月度额度
 - **头部账号行**：`GET https://www.kimi.com/api/user`（Kimi Web 认证）取昵称与手机号；手机号由服务端打码返回，客户端原样展示。Kimi 账号可能为手机号/微信注册，无 email 字段，账号行显示「昵称（打码手机号）」，两者皆缺时隐藏。随月度接口同在慢轮刷新，401 走相同的 refresh→重试链，失败保留旧值
-- **面板卡片布局**：固定头部与底部操作区，中间滚动区按额度、用量情况、用量简析、工具明细分为四张卡片；卡片只重组现有视图，不改变数据快照、默认展开状态或更新链路。面板宽 330pt（窄预览 300pt），卡片圆角 14pt、内容边距 10pt，底色和描边使用随外观变化的文字色，不加阴影。工具占比条固定 72pt，为完整工具名称保留空间，并按 `ToolID` 固定分色，不随周期或用量排序变化；展开、收起和异步刷新仍实时调整 Popover 高度，超过屏幕可用高度 85% 后内部滚动。
+- **面板卡片布局**：固定头部与底部操作区，中间滚动区按额度、用量情况、用量简析、额度周期回顾、工具明细分为五张卡片。面板宽 330pt（窄预览 300pt），卡片圆角 14pt、内容边距 10pt，底色和描边使用随外观变化的文字色，不加阴影。工具占比条固定 72pt，为完整工具名称保留空间，并按 `ToolID` 固定分色，不随周期或用量排序变化；展开、收起和异步刷新仍实时调整 Popover 高度，超过屏幕可用高度 85% 后内部滚动。
+- **额度周期回顾**：仅将本次有效 7 天额度响应写入本地历史，不新增网络请求，不使用 merged 旧值或本地 Token 反推。灰柱为 100% 上限、Kimi 动态蓝柱为已用比例；每屏 6 轮，首批 12 轮并可逐批扩展。状态机区分正常到期、窗口变化原因未知和观测缺口，候选需独立请求确认，缺口不补零。完整口径见 `docs/project/17-quota-cycle-history.md`。
+- **周期历史存储**：`~/Library/Application Support/KimiUsage/quota-history/` 按 Kimi Code API Key 的加盐 SHA256 作用域分区，原始 key/salt 不进入历史 JSON；目录 0700、文件 0600，复用 `AtomicJSONFile`。key 轮换后重新记录，等值样本只在五分钟心跳落盘；损坏/未来版本不得自动覆盖。协调器串行读写，快照经 generation 防止旧账号回调覆盖 UI。
 - **面板背景样式**：头部最右缘 24×24 `paintpalette` 按钮（icon + 标题区 + 弹性间隔 + 按钮）弹出原生 `NSMenu`（顺序固定 纯色 / 液态玻璃 / 经典毛玻璃，当前项打勾）。`PanelBackgroundStyle`（solid/liquidGlass/classicMaterial）以单个 UserDefaults key `panelBackgroundStyle` 持久化，缺省与非法值回退 solid。打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册，default center 收不到）统一走 `applyBackgroundStyle()`，只切背景层 hidden/opacity、不重建内容：solid 档 `PanelSolidBackgroundView` 全不透明（历史 0.9 混合已取消）、隐藏 effect；classicMaterial 档仅显示 `NSVisualEffectView(.popover)`；liquidGlass 档（macOS 26+）两层自绘背景全部隐藏，露出新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView 或 NSPanel。卡片底色与描边分别使用 `labelColor@0.035` 和 `labelColor@0.09`，深浅外观一致解析，不按背景样式分叉。旧系统该菜单项禁用，标题直接标注「液态玻璃（需 macOS 26+）」，存储的 liquidGlass 渲染降级 classicMaterial。「降低透明度」临时强制 solid，不改写偏好；NSMenu 弹出期间挂起面板 local/global monitor，结束后恢复，主 Popover 保持 transient。
 - **Token**：扫描本地会话 wire.jsonl / 客户端 JSONL 日志，并只读查询 ZCode、Hermes 的 sqlite 用量表聚合。ZCode 以 `model_usage` 逐请求表为唯一来源；输入包含缓存读取/创建，不重复加 cache 字段。近 7 天和近 30 天均包含今天。混接客户端缺失模型名时不归属 Kimi；可信 Kimi Code 旧格式可兼容并归入「未知模型」。ZCode 暂时不可读时保留最近成功快照并提示，其他来源继续更新。Work 优先按请求 ID，或同一 agent 的 `llm.request` 与 `turnStep` 关联模型和双写用量；同一请求内用量一致且两侧各一条的 `usage.record` / `step.end` 只计一次，不受工具执行耗时限制。没有请求上下文的旧日志仍只匹配时间和位置邻近的事件。保留独有历史调用和压缩用量，跳过子任务完成汇总；只有缺少可靠模型依据的用量才进入「未知模型」。
 - **模型明细**：`scan-state-v6.json` 按「日 × 模型」保存文件贡献，ZCode 与 Hermes 同步保留模型维度；周期汇总和展开行从同一数据源计算，模型输入、输出之和等于汇总。Work 扫描修订 v4 会重建旧文件贡献，保留 sqlite 增量快照；文件追加后重扫 Work 请求上下文，未变化文件直接复用缓存。用量情况板块的周期整行控制展开与收起，模型明细行与表头四列对齐，数字列与汇总行共用等宽布局。
@@ -66,6 +68,14 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 视觉预览可附加 `--visual-preview-models`（展开模型明细）、`--visual-preview-tools`（展开工具明细）、`--visual-preview-dark`、`--visual-preview-narrow`、`--visual-preview-empty`、`--visual-preview-states` 或 `--visual-preview-long`。`--once` 会读取真实登录态并联网，不属于离线测试；等待超时（45s）以非零退出码报告。
 
+额度周期回顾预览使用固定内存快照，不创建真实历史仓库：`--visual-preview-quota-history` 为 13 轮交互夹具，另有 `--visual-preview-quota-one`、`--visual-preview-quota-six`、`--visual-preview-quota-long`、`--visual-preview-quota-short`、`--visual-preview-quota-empty`、`--visual-preview-quota-pending`、`--visual-preview-quota-save-failed`、`--visual-preview-quota-load-failed`、`--visual-preview-quota-cross-year`。交互与几何回归：
+
+```bash
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview --visual-preview-quota-history --visual-preview-test
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview --visual-preview-quota-geometry
+./KimiUsage.app/Contents/MacOS/KimiUsage --visual-preview-narrow --visual-preview-quota-geometry
+```
+
 背景样式预览与回归（所有 `--visual-preview*` 路径统一禁止写真实 UserDefaults；未传 `--visual-preview-reduce-transparency` 时显式按未开启渲染，绝不读真实无障碍状态；矩阵/单拍不弹真实 NSMenu）：
 
 ```bash
@@ -87,7 +97,13 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 | 文件 | 说明 |
 |---|---|
-| `KimiUsage.swift` | 当前全部 Swift 源码；单文件 AppKit 菜单栏应用 |
+| `KimiUsage.swift` | 凭据、网络、Token 聚合、更新、面板控制器与离线自检 |
+| `main.swift` | 唯一 Swift top-level 可执行入口 |
+| `Sources/QuotaCycleHistory.swift` | 7 天额度周期模型、状态机、快照与浏览模型 |
+| `Sources/QuotaCycleStore.swift` | 凭据作用域、权限、版本化持久化与保存节奏 |
+| `Sources/QuotaCycleCoordinator.swift` | 串行读写、代际隔离与快照交付 |
+| `Sources/QuotaCycleHistoryView.swift` | 原生双柱卡片、详情和交互 |
+| `tests/quota_cycle_history_test.py` / `tests/fixtures/quota-cycle-history/` | 独立 Swift 模型与持久化回归 |
 | `build.sh` | 编译、打包和 ad-hoc 签名 |
 | `Info.plist` | Bundle 身份、最低系统版本和菜单栏常驻配置 |
 | `AppIcon.icns` | 应用图标（`AppIcon.iconset/` 为本机生成中间产物，不入库） |

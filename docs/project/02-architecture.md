@@ -1,11 +1,11 @@
 # KimiUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-11。
+> 状态：当前架构摘要。最后核对：2026-11-12。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
 
-KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当前 Swift 实现集中在 `KimiUsage.swift`，无 Swift Package 依赖。面板使用原生 `NSPopover`，不是 SwiftUI 面板。
+KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 Swift Package 依赖。凭据、网络、Token 聚合和面板控制仍在 `KimiUsage.swift`；额度周期历史已拆入 `Sources/QuotaCycle*.swift`，唯一顶层入口为根目录 `main.swift`。面板使用原生 `NSPopover`，不是 SwiftUI 面板。
 
 应用身份保持为：
 
@@ -22,11 +22,15 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当�
 | `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
-| `UsagePanelController` | 原生 Popover、额度与模型明细交互、面板背景样式（纯色/液态玻璃/经典毛玻璃） |
-| `AppDelegate` | 生命周期、刷新调度、自启和状态聚合 |
+| `UsagePanelController` | 原生 Popover、额度与模型明细交互、周期浏览状态、面板背景样式（纯色/液态玻璃/经典毛玻璃） |
+| `QuotaCycleHistory` | 7 天额度观测模型、候选/确认状态机、UI 快照与稳定分页 |
+| `QuotaCycleStore` | 加盐凭据作用域、0700/0600 权限、版本化 JSON 与保存节奏 |
+| `QuotaCycleCoordinator` | 串行 load → reduce → persist、作用域代际和失败回退 |
+| `QuotaCycleHistoryView` | 原生双柱、固定详情、翻页、选择、键盘与 VoiceOver |
+| `AppDelegate` | 生命周期、刷新调度、自启、历史样本 gate 和状态聚合 |
 | `KimiOfflineRegression` | 使用临时目录与假数据的离线自检 |
 
-单文件是当前实现状态，不是永久架构约束。后续拆分时优先分离凭据、网络、Token 聚合、更新和 UI。
+多文件编译保持根目录 `main.swift` 为唯一 top-level 入口，`build.sh` 显式列出生产源文件。后续拆分仍优先分离凭据、网络、Token 聚合、更新和 UI，不把周期算法重新堆回主文件。
 
 ## 3. 主要数据流
 
@@ -35,6 +39,10 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，当�
 Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度与错误合并 → Popover 和诊断状态。
 
 401 续期是当前配置写回路径。写回必须保留客户端并发轮换结果、原子替换和仅所有者权限；认证字段不得写入日志、缓存、测试或提交。
+
+### 额度周期历史
+
+本次有效 7 天额度响应 → 样本 gate → 凭据加盐作用域与代际 → 串行状态机/持久化 → typed 快照 → 原生双柱卡片。只复用现有 10 秒额度请求，不读取慢轮账号信息、不使用 merged 旧值、不从本地 Token 反推。完整口径见 `17-quota-cycle-history.md`。
 
 ### 本地 Token
 

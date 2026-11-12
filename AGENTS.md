@@ -2,11 +2,11 @@
 
 ## 项目地图
 
-- KimiUsage 是面向 Apple Silicon、macOS 13+ 的本地菜单栏工具。`KimiUsage.swift` 是单文件 AppKit/Foundation/SQLite3 应用，包含凭据读取、额度接口、本地 Token 聚合、原生 Popover、更新检查和离线测试；底部有顶层命令行入口，拆文件时需要调整 Swift 可执行入口。
+- KimiUsage 是面向 Apple Silicon、macOS 13+ 的本地菜单栏工具。`KimiUsage.swift` 包含凭据、额度接口、本地 Token 聚合、原生 Popover、更新检查和离线测试；7 天额度周期历史拆在 `Sources/QuotaCycle*.swift`，唯一顶层命令行入口是根目录 `main.swift`，新增生产文件须显式加入 `build.sh`。
 - `README.md` 为用户使用入口，`docs/DEVELOPMENT.md` 说明维护、统计口径与验证命令；`docs/project/`（02-architecture / 07-standards / 10-release）是已填实的当前工程事实文档，与 DEVELOPMENT.md 同级效力，实现变化时同步更新。
 - `build.sh` 以 `swiftc -O -target arm64-apple-macos13.0` 编译，重建仓库内 `KimiUsage.app` 并做 ad-hoc 签名；构建版本来自 `git describe`，注入产物的 `CUBuildVersion`。需要保留现有运行包时，直接编译到会话工作台，避免覆盖它。
 - `scripts/update.sh` 接收目标 tag 和当前应用路径，校验 Release ZIP/SHA256、构建版本与签名完整性，暂存换包并在失败时尝试回滚；换包中断（SIGKILL/断电）后下次运行会经恢复标记自愈。update.sh 的步骤文案（"4/5"/"5/5"）被 Swift 侧 grep 用于判定更新阶段，受 `tests/script_test.py` 协议锁定，不可改文案。`scripts/release.sh vX.Y.Z` 涉及远端 tag 与 GitHub Release，是实际发布操作，不作为普通验证命令执行。
-- 本地数据路径由源码中的 `CredStore`、`TokenAggregator` 定义；认证信息来自 Kimi 桌面配置，续期会写回官方客户端配置。扫描覆盖 Work、CLI/Proma/Claude JSONL 与 ZCode/Hermes SQLite；缓存位于用户 Application Support/KimiUsage。审查与测试优先使用临时目录和假凭据，不输出真实 token 或会话正文。
+- 本地数据路径由源码中的 `CredStore`、`TokenAggregator` 定义；认证信息来自 Kimi 桌面配置，续期会写回官方客户端配置。扫描覆盖 Work、CLI/Proma/Claude JSONL 与 ZCode/Hermes SQLite；缓存与加盐分区的额度周期历史位于用户 Application Support/KimiUsage，历史不得保存原始 API Key 或无盐哈希。审查与测试优先使用临时目录和假凭据，不输出真实 token 或会话正文。
 
 ## 验证入口
 
@@ -19,6 +19,6 @@
 ## 记忆维护
 
 - 项目记忆索引：[MEMORY.md](</Users/Chester/.proma/agent-workspaces/kimi-usage-menubar/memory/MEMORY.md>)；详细主题按索引按需读取，新增、移动、归档主题时同步索引。
-- 全局用户画像：[user_profile.md](</Users/Chester/.proma/memory/user_profile.md>)，跨项目共享；本项目补充偏好存入 /Users/Chester/.proma/agent-workspaces/kimi-usage-menubar/memory/project-preferences.md 并加入项目索引，仅在本项目覆盖全局偏好。
+- 全局用户画像：[user_profile.md](</Users/Chester/.proma/memory/user_profile.md>)，跨项目共享；本项目补充偏好按主题存入 /Users/Chester/.proma/agent-workspaces/kimi-usage-menubar/memory/*.md 并加入项目索引，仅在本项目覆盖全局偏好，不新建 project-preferences.md。
 - 在任务中及时修订已确认的偏好、经验和决策，保留来源、适用范围和核验日期；不把临时任务进度写成永久偏好。超过一周的阶段性要求结合本轮证据复查；到期或被替代的内容移出有效入口并可恢复地归档。读取不等于核验，不编造用户事实。
 <!-- proma:memory:end -->

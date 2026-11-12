@@ -6,7 +6,7 @@
 
 **[下载 KimiUsage](https://github.com/JUNX7764/kimi-usage-menubar/releases/latest)** · macOS 13 或更高版本 · Apple Silicon
 
-<img src="docs/images/kimi-usage.png" alt="KimiUsage 当前面板：额度、重置时间、周期用量、每日趋势和周期对比" width="330"> <img src="docs/images/kimi-usage-tools.png" alt="KimiUsage 工具明细：各客户端 Token 用量与占比" width="330">
+<img src="docs/images/kimi-usage.png" alt="KimiUsage 当前面板：额度、周期用量、每日趋势、额度周期回顾和工具明细" width="330"> <img src="docs/images/kimi-usage-tools.png" alt="KimiUsage 工具明细：各客户端 Token 用量与占比" width="330">
 
 <sub>截图使用演示数据，展示当前版本界面。</sub>
 

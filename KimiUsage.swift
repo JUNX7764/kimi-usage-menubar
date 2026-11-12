@@ -5207,7 +5207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 固定历史形态覆盖（均内存快照，互不创建真实仓库）：短历史/空态/待确认/写失败。
         // 交互测试旗标：13 轮固定快照（首批窗口 12 + 窗口外 1 条），覆盖翻页/扩展/跨页键。
         if args.contains("--visual-preview-quota-history") { historySnapshot = .previewFixture }
+        if args.contains("--visual-preview-quota-one") { historySnapshot = .previewOneFixture }
+        if args.contains("--visual-preview-quota-six") { historySnapshot = .previewSixFixture }
+        if args.contains("--visual-preview-quota-long") { historySnapshot = .previewLongFixture }
         if args.contains("--visual-preview-quota-short") { historySnapshot = .previewShortFixture }
+        if args.contains("--visual-preview-quota-cross-year") { historySnapshot = .previewCrossYearFixture }
+        if args.contains("--visual-preview-quota-load-failed") { historySnapshot = .previewLoadFailedFixture }
         if args.contains("--visual-preview-quota-empty") { historySnapshot = .previewEmptyFixture }
         if args.contains("--visual-preview-quota-pending") { historySnapshot = .previewPendingFixture }
         if args.contains("--visual-preview-quota-save-failed") {
@@ -6091,6 +6096,17 @@ enum KimiOfflineRegression {
                        "preview fixture must offer at least 13 cycles for paging geometry checks")
             try expect(QuotaCycleSnapshot.previewShortFixture.recordCount == 4,
                        "short fixture must hold fewer than six cycles")
+            try expect(QuotaCycleSnapshot.previewOneFixture.recordCount == 1
+                       && QuotaCycleSnapshot.previewSixFixture.recordCount == 6
+                       && QuotaCycleSnapshot.previewLongFixture.recordCount == 25,
+                       "preview count matrix must cover 1/6/25 cycles")
+            let crossYearLabels = QuotaCyclePresentation.items(from: .previewCrossYearFixture).map(\.startLabel)
+            try expect(crossYearLabels.contains { $0.hasPrefix("12/") }
+                       && crossYearLabels.contains { $0.hasPrefix("01/") },
+                       "cross-year fixture must cover December and January")
+            try expect(!QuotaCycleSnapshot.previewLoadFailedFixture.loaded
+                       && QuotaCycleSnapshot.previewLoadFailedFixture.persistenceFailed,
+                       "load-failure fixture must be neutral and preserve the original file")
             try expect(QuotaCycleSnapshot.previewPendingFixture.pendingTransition != nil,
                        "pending fixture must carry an unconfirmed transition")
             try expect(QuotaCycleSnapshot.previewEmptyFixture.loaded

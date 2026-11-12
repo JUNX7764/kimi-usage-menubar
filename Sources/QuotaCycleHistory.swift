@@ -367,10 +367,24 @@ struct QuotaCycleSnapshot: Equatable {
                  (93, .natural), (66, .natural), (88, .windowChanged), (44, .natural),
                  (30, .gap), (100, .natural), (62, .windowChanged), (85, .natural)],
         currentUsed: 36, pending: false)
+    static let previewOneFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [], currentUsed: 36, pending: false)
+    static let previewSixFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [(81, .natural), (72, .windowChanged), (40, .gap), (93, .natural), (66, .natural)],
+        currentUsed: 36, pending: false)
+    static let previewLongFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: Array(repeating: (72, .natural), count: 24),
+        currentUsed: 36, pending: false)
     /// 短历史（3 个已结束 + 当前，共 4 轮 < 6 轮）：验证不足一轮屏时卡片保持固定高度。
     static let previewShortFixture: QuotaCycleSnapshot = makePreviewFixture(
         closed: [(81, .natural), (72, .windowChanged), (40, .gap)],
         currentUsed: 36, pending: false)
+    static let previewCrossYearFixture: QuotaCycleSnapshot = makePreviewFixture(
+        closed: [(81, .natural), (72, .windowChanged)], currentUsed: 36, pending: false,
+        base: Date(timeIntervalSince1970: 1_767_225_600)) // 2026-01-01 00:00 UTC
+    static let previewLoadFailedFixture = QuotaCycleSnapshot(
+        loaded: false, closed: [], current: nil,
+        pendingTransition: nil, persistenceFailed: true)
     /// 当前轮次带未确认窗口变化候选：详情显示「窗口变化待确认」，不产生新历史柱。
     static let previewPendingFixture: QuotaCycleSnapshot = makePreviewFixture(
         closed: [(81, .natural), (72, .windowChanged)],
@@ -383,10 +397,10 @@ struct QuotaCycleSnapshot: Equatable {
     private static func makePreviewFixture(
         closed usedEnds: [(used: Double, end: QuotaCycleEnd)],
         currentUsed: Double?,
-        pending: Bool
+        pending: Bool,
+        base: Date = Date(timeIntervalSince1970: 1_763_000_000)
     ) -> QuotaCycleSnapshot {
         let day: TimeInterval = 24 * 60 * 60
-        let base = Date(timeIntervalSince1970: 1_763_000_000)
         func evidence(_ requestOffset: Double, _ used: Double,
                       _ resetOffset: Double) -> QuotaObservation {
             QuotaObservation(

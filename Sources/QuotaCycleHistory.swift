@@ -308,3 +308,99 @@ struct QuotaCycleReducer {
             evidence: [sample])
     }
 }
+
+// MARK: - UI-facing snapshot
+
+/// Stable, UI-ready value type for one credential scope's quota cycle
+/// history. The view layer reads only snapshots; it never touches the store,
+/// the coordinator queue or mutable state. Snapshots are plain values, so a
+/// later state change can never retroactively alter what the UI is showing.
+struct QuotaCycleSnapshot: Equatable {
+    /// True once the scope's history has been read from disk (even when the
+    /// history is empty). False while no scope is active or a read failed,
+    /// when the UI shows a neutral placeholder instead of stale data.
+    var loaded: Bool
+    var closed: [QuotaCycleRecord]
+    var current: QuotaCycleRecord?
+    var pendingTransition: PendingQuotaTransition?
+    /// True when the scope's last load or save failed. The UI shows
+    /// 「历史未保存」 without discarding the in-memory observations.
+    var persistenceFailed: Bool
+
+    /// Snapshot delivered before any credential scope is active.
+    static let inactive = QuotaCycleSnapshot(
+        loaded: false, closed: [], current: nil,
+        pendingTransition: nil, persistenceFailed: false)
+
+    var recordCount: Int { closed.count + (current == nil ? 0 : 1) }
+}
+
+// MARK: - Browsing model
+
+/// Pure paging and selection model for the cycle history card.
+///
+/// Pages are anchored on the newest end of a chronological (oldest-first)
+/// record list and clamp to the available records; the browser never holds
+/// raw indices that a new record could silently invalidate. The selection is
+/// a stable cycle ID, so refresh and rebuild can restore the exact same
+/// viewing position.
+struct QuotaCycleBrowser: Equatable {
+    let pageSize: Int
+    let initialWindow: Int
+    private(set) var windowSize: Int
+    private(set) var olderPage: Int
+    var selectedCycleID: UUID?
+
+    init(pageSize: Int = 6, initialWindow: Int = 12) {
+        self.pageSize = max(1, pageSize)
+        self.initialWindow = max(self.pageSize, initialWindow)
+        self.windowSize = self.initialWindow
+        self.olderPage = 0
+        self.selectedCycleID = nil
+    }
+
+    /// Indices of the records visible right now. Page 0 is always the newest
+    /// `pageSize` records; each older page moves one page toward the oldest.
+    func visibleRange(total: Int) -> Range<Int> {
+        let safeTotal = max(0, total)
+        let safeSize = max(1, pageSize)
+        let maxPage = max(0, (safeTotal - 1) / safeSize)
+        let page = min(max(0, olderPage), maxPage)
+        let upper = max(0, safeTotal - page * safeSize)
+        return max(0, upper - safeSize)..<upper
+    }
+
+    mutating func showOlderPage() { olderPage += 1 }
+
+    mutating func showNewerPage() { olderPage = max(0, olderPage - 1) }
+
+    /// 「更早记录」: extend the browsable window by one initial batch. There
+    /// is no storage cap; the window only grows when the user asks.
+    mutating func loadEarlier() { windowSize += initialWindow }
+
+    /// The only reset trigger: switching the credential scope clears the
+    /// page anchor, the selection and the browsing window.
+    mutating func reset() {
+        olderPage = 0
+        selectedCycleID = nil
+        windowSize = max(pageSize, initialWindow)
+    }
+
+    mutating func select(_ id: UUID?) { selectedCycleID = id }
+
+    /// The record list changed (e.g. a cycle closed while the user browses
+    /// history). Pages never jump back to the newest page on their own —
+    /// only a credential scope switch does that. When a selection exists the
+    /// page anchor follows it so the selection stays visible; otherwise the
+    /// current page anchor is preserved as-is.
+    mutating func noteRecordsChanged(chronologicalIDs: [UUID]) {
+        guard let selected = selectedCycleID,
+              let index = chronologicalIDs.firstIndex(of: selected) else { return }
+        let total = chronologicalIDs.count
+        let safeSize = max(1, pageSize)
+        let pageOfSelected = (total - 1 - index) / safeSize
+        if pageOfSelected != olderPage {
+            olderPage = pageOfSelected
+        }
+    }
+}

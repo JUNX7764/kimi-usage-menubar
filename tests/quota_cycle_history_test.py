@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = ROOT / "Sources" / "QuotaCycleHistory.swift"
 STORE = ROOT / "Sources" / "QuotaCycleStore.swift"
+COORDINATOR = ROOT / "Sources" / "QuotaCycleCoordinator.swift"
 FIXTURE = ROOT / "tests" / "fixtures" / "quota-cycle-history" / "main.swift"
 
 
@@ -15,7 +16,8 @@ class QuotaCycleHistoryTest(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.runner = Path(cls._tmp.name) / "quota-cycle-history-runner"
         compile_result = subprocess.run(
-            ["swiftc", str(MODEL), str(STORE), str(FIXTURE), "-o", str(cls.runner)],
+            ["swiftc", str(MODEL), str(STORE), str(COORDINATOR),
+             str(FIXTURE), "-o", str(cls.runner)],
             capture_output=True, text=True)
         if compile_result.returncode != 0:
             raise RuntimeError(
@@ -113,6 +115,30 @@ class QuotaCycleHistoryTest(unittest.TestCase):
 
     def test_load_repairs_existing_history_file_permissions(self):
         self.run_case("loadFixesFilePermissions")
+
+    def test_snapshot_is_a_stable_ui_value_type(self):
+        self.run_case("snapshotStableValues")
+
+    def test_browser_paging_covers_record_count_boundaries(self):
+        self.run_case("browserPagingBounds")
+
+    def test_browser_keeps_page_anchor_when_new_records_arrive(self):
+        self.run_case("browserKeepsPageOnNewRecords")
+
+    def test_coordinator_serial_load_reduce_persist(self):
+        self.run_case("coordinatorActivatesAndPersists")
+
+    def test_coordinator_scope_switch_isolates_ui_and_partitions(self):
+        self.run_case("coordinatorScopeSwitchIsolatesUI")
+
+    def test_coordinator_write_failure_notice_clears_after_recovery(self):
+        self.run_case("coordinatorWriteFailureNotice")
+
+    def test_coordinator_equivalent_samples_do_not_degrade_into_poll_writes(self):
+        self.run_case("coordinatorHeartbeatNotDegraded")
+
+    def test_coordinator_rejects_stale_generation_samples(self):
+        self.run_case("coordinatorRejectsStaleGeneration")
 
 
 if __name__ == "__main__":

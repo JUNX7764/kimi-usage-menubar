@@ -43,6 +43,42 @@ func loadFails(_ store: QuotaCycleStore, _ scopeKey: String) -> Bool {
     (try? store.load(scopeKey: scopeKey)) == nil
 }
 
+// MARK: - Task 4 helpers (coordinator/browser; explicit semaphores, no sleeps)
+
+func makeCoordinator(
+    root: URL,
+    writer: @escaping QuotaCycleStore.Writer,
+    onDeliver: @escaping (QuotaCycleSnapshot) -> Void,
+    now: @escaping () -> Date
+) -> QuotaCycleCoordinator {
+    QuotaCycleCoordinator(
+        root: root, writer: writer, deliver: onDeliver, now: now)
+}
+
+final class SnapshotRecorder {
+    private let lock = NSLock()
+    private var storage: [QuotaCycleSnapshot] = []
+
+    func append(_ snapshot: QuotaCycleSnapshot) {
+        lock.lock(); storage.append(snapshot); lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock(); defer { lock.unlock() }; return storage.count
+    }
+
+    var last: QuotaCycleSnapshot? {
+        lock.lock(); defer { lock.unlock() }; return storage.last
+    }
+}
+
+func awaitDelivery(_ sem: DispatchSemaphore, _ what: String) {
+    if sem.wait(timeout: .now() + .seconds(5)) == .timedOut {
+        check(false, "timed out waiting for coordinator delivery: \(what)")
+    }
+}
+
+
 switch CommandLine.arguments[1] {
 
 case "firstObservation":
@@ -656,6 +692,307 @@ case "loadFixesFilePermissions":
     check(try! Data(contentsOf: file) == bytesBefore,
           "permission repair never rewrites file bytes")
     print("PASS: loadFixesFilePermissions")
+
+case "snapshotStableValues":
+    var state = QuotaCycleState()
+    let reducer = makeReducer()
+    reducer.ingest(sample(0, 72), into: &state)
+    reducer.ingest(sample(604700, 80), into: &state)
+    reducer.ingest(sample(604900, 3, 1_209_600), into: &state)
+    check(state.pendingTransition != nil, "fixture expects a pending candidate")
+    let snapshot = QuotaCycleSnapshot(
+        loaded: true, closed: state.closed, current: state.current,
+        pendingTransition: state.pendingTransition, persistenceFailed: false)
+    check(snapshot.loaded, "snapshot marks the scope as loaded")
+    check(snapshot.closed.isEmpty && snapshot.current != nil,
+          "snapshot carries current and closed records")
+    check(snapshot.pendingTransition?.firstNewWindowSample.usedPercent == 3,
+          "snapshot exposes the pending candidate sample")
+    check(!snapshot.persistenceFailed, "snapshot starts without a failure notice")
+    check(snapshot.recordCount == 1, "recordCount counts current and closed")
+    // Value semantics: later state mutations must not leak into the snapshot.
+    reducer.ingest(sample(604920, 4, 1_209_600), into: &state)
+    check(state.closed.count == 1, "fixture setup: confirmation closes the old cycle")
+    check(snapshot.closed.isEmpty && snapshot.recordCount == 1,
+          "a snapshot is a stable value independent of later state changes")
+    check(snapshot.pendingTransition?.firstNewWindowSample.usedPercent == 3,
+          "later confirmation must not mutate the earlier snapshot")
+    let same = QuotaCycleSnapshot(
+        loaded: true, closed: [], current: snapshot.current,
+        pendingTransition: snapshot.pendingTransition, persistenceFailed: false)
+    check(snapshot == same, "snapshots compare by value")
+    print("PASS: snapshotStableValues")
+
+case "browserPagingBounds":
+    var browser = QuotaCycleBrowser()
+    check(browser.visibleRange(total: 0) == 0..<0, "0 records show an empty page")
+    check(browser.visibleRange(total: 1) == 0..<1, "1 record fills a short page")
+    check(browser.visibleRange(total: 5) == 0..<5, "5 records do not pad to 6")
+    check(browser.visibleRange(total: 6) == 0..<6, "6 records fill exactly one page")
+    check(browser.visibleRange(total: 7) == 1..<7, "7 records overflow to the newest page")
+    check(browser.visibleRange(total: 12) == 6..<12, "12 records keep the newest 6")
+    check(browser.visibleRange(total: 13) == 7..<13, "13 records overflow again")
+    check(browser.visibleRange(total: 25) == 19..<25, "25 records default to the newest 6")
+    browser.showOlderPage()
+    check(browser.visibleRange(total: 25) == 13..<19, "one older page moves back 6")
+    check(browser.visibleRange(total: 13) == 1..<7, "the same anchor works on 13 records")
+    browser.showOlderPage()
+    check(browser.visibleRange(total: 13) == 0..<1,
+          "the formula's oldest page shows the remaining record")
+    browser.showOlderPage()
+    browser.showOlderPage()
+    check(browser.visibleRange(total: 13) == 0..<1,
+          "pages clamp at the oldest records, never past the end")
+    browser.showNewerPage()
+    browser.showNewerPage()
+    browser.showNewerPage()
+    check(browser.visibleRange(total: 13) == 1..<7, "newer page moves toward the newest")
+    browser.showNewerPage()
+    check(browser.visibleRange(total: 13) == 7..<13,
+          "newer paging clamps at the newest page, never below zero")
+    check(browser.windowSize == 12, "the first browsing window is 12 records")
+    browser.loadEarlier()
+    check(browser.windowSize == 24, "loadEarlier extends the window by 12")
+    browser.loadEarlier()
+    check(browser.windowSize == 36, "loadEarlier keeps extending by 12")
+    browser.reset()
+    check(browser.olderPage == 0 && browser.selectedCycleID == nil,
+          "reset clears the page anchor and the selection")
+    check(browser.windowSize == 12, "reset restores the initial window")
+    print("PASS: browserPagingBounds")
+
+case "browserKeepsPageOnNewRecords":
+    var ids = (0..<25).map { UUID(uuidString: String(format: "%08d-0000-0000-0000-000000000000", $0))! }
+    var browser = QuotaCycleBrowser()
+    browser.select(ids[13])
+    browser.showOlderPage()
+    check(browser.visibleRange(total: ids.count).contains(13),
+          "selected record is visible on the older page")
+    // A new record arrives while the user browses history.
+    ids.append(UUID(uuidString: "00000026-0000-0000-0000-000000000000")!)
+    browser.noteRecordsChanged(chronologicalIDs: ids)
+    check(browser.olderPage != 0, "new records must not jump back to the newest page")
+    check(browser.visibleRange(total: ids.count).contains(13),
+          "the selection stays visible after the record list changed")
+    // A browser without a selection stays on the newest page.
+    var fresh = QuotaCycleBrowser()
+    fresh.noteRecordsChanged(chronologicalIDs: ids)
+    check(fresh.olderPage == 0, "a fresh browser without selection stays newest")
+    check(fresh.visibleRange(total: ids.count) == 20..<26,
+          "the newest page still shows the latest records")
+    // A selection on the newest page stays put when records arrive.
+    var newest = QuotaCycleBrowser()
+    newest.select(ids[25])
+    newest.noteRecordsChanged(chronologicalIDs: ids)
+    check(newest.olderPage == 0, "newest-page selection never jumps older")
+    check(newest.visibleRange(total: ids.count).contains(25),
+          "the newest record itself stays visible")
+    // Credential scope switch is the only thing that resets browsing.
+    browser.reset()
+    check(browser.selectedCycleID == nil && browser.olderPage == 0,
+          "scope switch resets the browser")
+    print("PASS: browserKeepsPageOnNewRecords")
+
+case "coordinatorActivatesAndPersists":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    var writerCalls = 0
+    let countingWriter: QuotaCycleStore.Writer = { data, url in
+        writerCalls += 1
+        try data.write(to: url, options: .atomic)
+    }
+    var nowValue = t
+    let coordinator = makeCoordinator(root: root, writer: countingWriter,
+        onDeliver: { snap in recorder.append(snap); sem.signal() },
+        now: { nowValue })
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate")
+    check(recorder.last?.loaded == true, "activation delivers a loaded snapshot")
+    check(recorder.last?.current == nil, "a fresh scope starts empty")
+    coordinator.observe(sample(0, 43), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "first observation")
+    check(recorder.last?.current?.lastObservedUsedPercent == 43,
+          "observation reaches the UI snapshot")
+    check(!recorder.last!.persistenceFailed, "a healthy scope has no failure notice")
+    nowValue = t.addingTimeInterval(600)
+    coordinator.observe(sample(600, 58), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "second observation")
+    check(recorder.last?.current?.lastObservedUsedPercent == 58,
+          "serial reduce updates the delivered snapshot")
+    // load → reduce → persist: a brand-new store sees the same state on disk.
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-key-A")
+    let disk = try! store.load(scopeKey: scope)
+    check(disk.current?.lastObservedUsedPercent == 58,
+          "serial load-reduce-persist reaches the scope partition")
+    check(writerCalls >= 2, "each accepted change persisted through the injected writer")
+    print("PASS: coordinatorActivatesAndPersists")
+
+case "coordinatorScopeSwitchIsolatesUI":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    let coordinator = makeCoordinator(root: root, writer: atomicWriter,
+        onDeliver: { snap in recorder.append(snap); sem.signal() },
+        now: { t })
+    // Pre-seed scope A so a late load would show 43% if it ever won the UI.
+    let seedStore = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scopeA = try! seedStore.scopeKey(apiKey: "fake-key-A")
+    var seeded = QuotaCycleState()
+    makeReducer().ingest(sample(0, 43), into: &seeded)
+    try! seedStore.save(seeded, scopeKey: scopeA)
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate A")
+    check(recorder.last?.current?.lastObservedUsedPercent == 43,
+          "scope A loads its seeded history")
+    // Immediate switch: the late activation of B must be the final UI state.
+    coordinator.activate(apiKey: "fake-key-B", generation: 2)
+    awaitDelivery(sem, "activate B")
+    check(recorder.last?.current == nil && recorder.last?.loaded == true,
+          "the late load for the new scope wins the UI")
+    let countAfterSwitch = recorder.count
+    // A late observation from the old scope: it may persist to its own
+    // partition, but it must not be delivered as UI.
+    // An independent request (fresh requestStartedAt) from the old scope.
+    coordinator.observe(sample(600, 77), apiKey: "fake-key-A", generation: 1)
+    // FIFO ordering: this B observation's delivery proves the stale A write
+    // already completed without delivering.
+    coordinator.observe(sample(0, 11), apiKey: "fake-key-B", generation: 2)
+    awaitDelivery(sem, "B observation after stale A write")
+    check(recorder.count == countAfterSwitch + 1,
+          "old-scope observation must not deliver UI updates")
+    check(recorder.last?.current?.lastObservedUsedPercent == 11,
+          "the new scope's UI shows only its own data")
+    // The old scope still wrote its own partition.
+    let diskA = try! seedStore.load(scopeKey: scopeA)
+    check(diskA.current?.lastObservedUsedPercent == 77,
+          "the late old-scope observation persisted to its own partition")
+    let scopeB = try! seedStore.scopeKey(apiKey: "fake-key-B")
+    let diskB = try! seedStore.load(scopeKey: scopeB)
+    check(diskB.current?.lastObservedUsedPercent == 11,
+          "the new scope keeps its own history")
+    check(scopeA != scopeB, "the two scopes use different partitions")
+    print("PASS: coordinatorScopeSwitchIsolatesUI")
+
+case "coordinatorWriteFailureNotice":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    var failWrites = false
+    let flakyWriter: QuotaCycleStore.Writer = { data, url in
+        if failWrites {
+            throw NSError(domain: "TestWriter", code: 1)
+        }
+        try data.write(to: url, options: .atomic)
+    }
+    var nowValue = t
+    let coordinator = makeCoordinator(root: root, writer: flakyWriter,
+        onDeliver: { snap in recorder.append(snap); sem.signal() },
+        now: { nowValue })
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate")
+    failWrites = true
+    coordinator.observe(sample(0, 43), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "failing save")
+    check(recorder.last?.persistenceFailed == true,
+          "a failed save surfaces the 「历史未保存」 notice in the snapshot")
+    check(recorder.last?.current?.lastObservedUsedPercent == 43,
+          "in-memory observation survives a write failure")
+    // In-memory observation continues even while writes fail.
+    nowValue = t.addingTimeInterval(600)
+    coordinator.observe(sample(600, 58), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "observation during write failure")
+    check(recorder.last?.persistenceFailed == true,
+          "the notice persists while writes keep failing")
+    check(recorder.last?.current?.lastObservedUsedPercent == 58,
+          "the reducer keeps accepting observations during write failure")
+    // The last successful disk state is not clobbered.
+    failWrites = false
+    nowValue = t.addingTimeInterval(700)
+    coordinator.observe(sample(700, 59), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "recovered save")
+    check(recorder.last?.persistenceFailed == false,
+          "the first successful save clears the notice")
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-key-A")
+    let disk = try! store.load(scopeKey: scope)
+    check(disk.current?.lastObservedUsedPercent == 59,
+          "the recovered save persists the latest in-memory state")
+    print("PASS: coordinatorWriteFailureNotice")
+
+case "coordinatorHeartbeatNotDegraded":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    var writerCalls = 0
+    let countingWriter: QuotaCycleStore.Writer = { data, url in
+        writerCalls += 1
+        try data.write(to: url, options: .atomic)
+    }
+    var nowValue = t
+    let coordinator = QuotaCycleCoordinator(
+        root: root, writer: countingWriter,
+        deliver: { snap in recorder.append(snap); sem.signal() },
+        scheduler: QuotaCycleSaveScheduler(heartbeatInterval: 300),
+        now: { nowValue })
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate")
+    coordinator.observe(sample(0, 43), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "first observation")
+    check(writerCalls == 1, "the first observation saves exactly once")
+    // Equivalent 10-second refresh samples must not write every time.
+    for step in 1...5 {
+        nowValue = t.addingTimeInterval(Double(step) * 10)
+        coordinator.observe(sample(Double(step) * 10, 43),
+                            apiKey: "fake-key-A", generation: 1)
+        awaitDelivery(sem, "equivalent sample \(step)")
+        check(recorder.last?.current?.lastObservedUsedPercent == 43,
+              "equivalent sample \(step) still reaches the UI")
+    }
+    check(writerCalls == 1,
+          "equivalent samples never degrade into per-refresh disk writes")
+    check(recorder.last?.current?.evidence.count == 1,
+          "equivalent samples stay deduplicated in the model")
+    // Past the heartbeat the unchanged state is written once more.
+    nowValue = t.addingTimeInterval(400)
+    coordinator.observe(sample(400, 43), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "heartbeat sample")
+    check(writerCalls == 2, "the heartbeat writes the unchanged state once")
+    print("PASS: coordinatorHeartbeatNotDegraded")
+
+case "coordinatorRejectsStaleGeneration":
+    let root = makeTempRoot()
+    defer { removeTempRoot(root) }
+    let recorder = SnapshotRecorder()
+    let sem = DispatchSemaphore(value: 0)
+    let coordinator = makeCoordinator(root: root, writer: atomicWriter,
+        onDeliver: { snap in recorder.append(snap); sem.signal() },
+        now: { t })
+    coordinator.activate(apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "activate generation 1")
+    let countAfterActivate = recorder.count
+    // A sample claiming a different generation of the same key is stale:
+    // it must not be delivered, and it must not pollute the active context.
+    coordinator.observe(sample(0, 91), apiKey: "fake-key-A", generation: 2)
+    coordinator.observe(sample(0, 12), apiKey: "fake-key-A", generation: 1)
+    awaitDelivery(sem, "current-generation observation")
+    check(recorder.count == countAfterActivate + 1,
+          "a stale-generation sample must not produce a UI delivery")
+    check(recorder.last?.current?.lastObservedUsedPercent == 12,
+          "the current generation keeps exclusive control of the UI")
+    // The stale sample still landed in its own partition (same key here)
+    // and the current generation's data is what remains observable.
+    let store = QuotaCycleStore(root: root, writer: atomicWriter)
+    let scope = try! store.scopeKey(apiKey: "fake-key-A")
+    let disk = try! store.load(scopeKey: scope)
+    check(disk.current?.lastObservedUsedPercent == 12,
+          "the current generation's history stays in its own partition")
+    print("PASS: coordinatorRejectsStaleGeneration")
 
 default:
     fputs("FAIL: unknown case \(CommandLine.arguments[1])\n", stderr)

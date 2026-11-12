@@ -25,6 +25,26 @@ struct QuotaObservation: Codable, Equatable {
             && observedAt.timeIntervalSince1970.isFinite
             && requestStartedAt.timeIntervalSince1970.isFinite
     }
+
+    /// Build a history sample from one quota request round's **own** 7-day
+    /// response. Only a response that itself carries a valid ratio and reset
+    /// (and no error) yields a sample: a failed round, a missing field or a
+    /// merged old value never becomes an observation, so no fabricated or
+    /// stale percentages can enter the history.
+    static func accepted(
+        requestStartedAt: Date,
+        observedAt: Date,
+        usedRatio: Double?,
+        reset: Date?,
+        error: String?
+    ) -> QuotaObservation? {
+        guard error == nil, let usedRatio, usedRatio.isFinite,
+              (0...1).contains(usedRatio), let reset else { return nil }
+        let sample = QuotaObservation(
+            requestStartedAt: requestStartedAt, observedAt: observedAt,
+            usedPercent: usedRatio * 100, resetAt: reset)
+        return sample.isValid ? sample : nil
+    }
 }
 
 enum QuotaCycleEnd: String, Codable {
@@ -331,6 +351,66 @@ struct QuotaCycleSnapshot: Equatable {
     static let inactive = QuotaCycleSnapshot(
         loaded: false, closed: [], current: nil,
         pendingTransition: nil, persistenceFailed: false)
+
+    /// Fixed in-memory preview fixture (five closed cycles + the current
+    /// one). It is built from a constant epoch, never touches disk,
+    /// credentials or the real clock, and preview paths inject it instead of
+    /// ever constructing a coordinator or a real history store.
+    static let previewFixture: QuotaCycleSnapshot = {
+        let day: TimeInterval = 24 * 60 * 60
+        let base = Date(timeIntervalSince1970: 1_763_000_000)
+        func evidence(_ requestOffset: Double, _ used: Double,
+                      _ resetOffset: Double) -> QuotaObservation {
+            QuotaObservation(
+                requestStartedAt: base.addingTimeInterval(requestOffset),
+                observedAt: base.addingTimeInterval(requestOffset + 60),
+                usedPercent: used,
+                resetAt: base.addingTimeInterval(resetOffset))
+        }
+        func closedCycle(_ cycleBack: Int, _ used: Double, _ end: QuotaCycleEnd,
+                         _ boundaryUpperOffset: Double) -> QuotaCycleRecord {
+            let reset = base.addingTimeInterval(Double(cycleBack) * 7 * day)
+            let first = evidence(reset.timeIntervalSince(base) - 6 * day, used, reset.timeIntervalSince(base))
+            let last = evidence(boundaryUpperOffset - 120, used, reset.timeIntervalSince(base))
+            return QuotaCycleRecord(
+                id: UUID(),
+                startKind: .inferred,
+                inferredStartAt: reset.addingTimeInterval(-7 * day),
+                firstObservedAt: first.observedAt,
+                expectedResetAt: reset,
+                lastObservedAt: last.observedAt,
+                lastObservedUsedPercent: used,
+                boundaryLower: last.observedAt,
+                boundaryUpper: base.addingTimeInterval(boundaryUpperOffset),
+                end: end,
+                incomplete: true,
+                evidence: [first, last])
+        }
+        var closed: [QuotaCycleRecord] = []
+        // 由旧到新：用满一轮、81% 自然到期、72% 窗口变化（原因未知）、gap、93% 自然到期。
+        closed.append(closedCycle(-5, 100, .natural, -4 * 7 * day + 300))
+        closed.append(closedCycle(-4, 81, .natural, -3 * 7 * day + 300))
+        closed.append(closedCycle(-3, 72, .windowChanged, -2 * 7 * day + 240))
+        closed.append(closedCycle(-2, 55, .gap, -1 * 7 * day + 3600))
+        closed.append(closedCycle(-1, 93, .natural, 300))
+        let currentReset = base.addingTimeInterval(7 * day)
+        let current = QuotaCycleRecord(
+            id: UUID(),
+            startKind: .inferred,
+            inferredStartAt: currentReset.addingTimeInterval(-7 * day),
+            firstObservedAt: evidence(-6 * day, 8, 7 * day).observedAt,
+            expectedResetAt: currentReset,
+            lastObservedAt: evidence(-3600, 36, 7 * day).observedAt,
+            lastObservedUsedPercent: 36,
+            boundaryLower: nil,
+            boundaryUpper: nil,
+            end: nil,
+            incomplete: true,
+            evidence: [evidence(-3600, 36, 7 * day)])
+        return QuotaCycleSnapshot(
+            loaded: true, closed: closed, current: current,
+            pendingTransition: nil, persistenceFailed: false)
+    }()
 
     var recordCount: Int { closed.count + (current == nil ? 0 : 1) }
 }

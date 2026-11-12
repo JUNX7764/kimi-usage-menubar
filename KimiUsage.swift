@@ -1745,7 +1745,7 @@ final class UpdateProgressRowView: NSView {
 /// 构建版本：build.sh 打包时写入产物 Info.plist 自定义键（CUBuildVersion，git describe），
 /// 运行时读 Bundle。仓库模板没有该键 → 非 build.sh 产物（直接 swiftc 的裸二进制）为 unknown，
 /// 此时更新检查自然禁用、菜单显示「版本 unknown」。不生成第二个 .swift：多文件编译下
-/// 只有 main.swift 允许 top-level 代码，本文件的命令行入口依赖 top-level。
+/// 只有 main.swift 允许 top-level 代码，可执行入口已迁至根目录 main.swift。
 enum BuildInfo {
     static let version = (Bundle.main.infoDictionary?["CUBuildVersion"] as? String) ?? "unknown"
 }
@@ -2004,6 +2004,7 @@ struct UsagePanelModel {
     var usage: TokenSection      // 用量情况：合并本机全部来源，口径见 docs/DEVELOPMENT.md
     var brief: BriefSection      // 用量简析：近 30 天日图 + 较昨日/较前 7 天
     var tools: ToolsSection      // 工具明细：逐来源占比
+    var history: QuotaCycleSnapshot   // 额度周期回顾：typed 快照，视图不读磁盘/网络/凭据
     var notices: [Notice]
     var lastAttempt: String
     var version: String
@@ -4083,6 +4084,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // 月度接口的 accessToken 寿命短，过期后由 KimiUsage 自己用 refreshToken 续期
     // （GET /api/auth/token/refresh，会轮换 refresh_token 并写回 config.json）。
     // 记录最后一次月度拉取成功时间，用于菜单标注过期数据。
+    // 额度周期回顾：非预览路径创建生产协调器（root 为 Application Support/KimiUsage/quota-history，
+    // writer 复用 AtomicJSONFile）；预览只注入固定内存快照，绝不创建真实历史仓库。
+    // 凭据作用域只在 API Key 出现或变化时重新 activate——10 秒快轮不重复加载磁盘；
+    // key 变化立即清空旧 UI 并递增代际，同 key 旧代际样本由协调器整体拒绝。
+    private var historyCoordinator: QuotaCycleCoordinator?
+    private var historySnapshot = QuotaCycleSnapshot.inactive
+    private var historyApiKey: String?
+    private var historyGeneration = 0
     private var lastMonthSuccessAt: Date?
     private var lastFiveHourSuccessAt: Date?
     private var lastSevenDaySuccessAt: Date?
@@ -4103,6 +4112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         if visualPreview { configureVisualPreview(); return }
+        setupQuotaHistory()
         rebuildMenu()
         renderBar()
         // 面板内更新进度：状态翻转时重建内容（按钮↔进度行），进度百分比由进度行自刷；
@@ -4129,6 +4139,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.checkForUpdate() }
     }
 
+    /// 生产历史协调器：凭据作用域分区持久化 7 天额度周期。历史回调切主线程，
+    /// 只更新 typed 快照并 rebuildMenu()——不 renderBar()/writeStatus()，避免无关诊断写入。
+    private func setupQuotaHistory() {
+        let root = URL(fileURLWithPath: NSHomeDirectory()
+            + "/Library/Application Support/KimiUsage/quota-history", isDirectory: true)
+        let coordinator = QuotaCycleCoordinator(root: root, writer: { data, url in
+            try AtomicJSONFile.replace(data, at: url.path, mode: 0o600)
+        }, deliver: { [weak self] snapshot in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.historySnapshot = snapshot
+                self.rebuildMenu()
+            }
+        })
+        historyCoordinator = coordinator
+    }
+
+    /// 凭据作用域同步：同 key 直接返回（10 秒快轮不重复加载磁盘）；key 出现/变化时
+    /// 立即清空旧 UI、递增代际并 activate。协调器对同 key 旧代际样本整体拒绝。
+    private func syncHistoryScope(codeApiKey: String?) {
+        guard codeApiKey != historyApiKey else { return }
+        historyApiKey = codeApiKey
+        historyGeneration += 1
+        historySnapshot = .inactive
+        if let codeApiKey {
+            historyCoordinator?.activate(apiKey: codeApiKey, generation: historyGeneration)
+        }
+    }
+
     // 额度每 10s 刷新；月度和本地扫描按上次尝试时间每 5 分钟刷新。
     private func refresh(manual: Bool = false) {
         guard refreshGate.begin(manual: manual) else { return }
@@ -4153,10 +4192,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mergeLock.lock(); body(&merged); mergeLock.unlock()
         }
 
+        syncHistoryScope(codeApiKey: cred.codeApiKey.flatMap { $0.isEmpty ? nil : $0 })
         if let key = cred.codeApiKey, !key.isEmpty {
+            // 请求前捕获本轮请求起点与凭据代际；样本只用本轮响应自身值构造，
+            // 不等待慢轮、不回读 merged 旧值。
+            let requestStartedAt = Date()
+            let historyGeneration = self.historyGeneration
             group.enter()
             quotaGroup.enter()
-            Fetcher.fetchCodeUsage(apiKey: key) { r in
+            Fetcher.fetchCodeUsage(apiKey: key) { [weak self] r in
                 mutateMerged {
                     $0.fiveHourUsed = r.fiveHourUsed
                     $0.fiveHourReset = r.fiveHourReset
@@ -4164,6 +4208,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.sevenDayReset = r.sevenDayReset
                     $0.fiveHourError = r.fiveHourError
                     $0.sevenDayError = r.sevenDayError
+                }
+                // 历史样本：仅本次响应自身合法（sevenDayUsed/reset 在界内且 sevenDayError==nil）
+                // 才构造 percent 样本，observedAt 取回调真实时间；失败/缺字段轮次不入账。
+                if let self,
+                   let sample = QuotaObservation.accepted(
+                       requestStartedAt: requestStartedAt, observedAt: Date(),
+                       usedRatio: r.sevenDayUsed, reset: r.sevenDayReset,
+                       error: r.sevenDayError) {
+                    self.historyCoordinator?.observe(sample, apiKey: key, generation: historyGeneration)
                 }
                 quotaGroup.leave()
                 group.leave()
@@ -4642,6 +4695,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage: usageSection,
             brief: brief,
             tools: toolsSection,
+            history: historySnapshot,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
             refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
     }
@@ -4650,6 +4704,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let args = CommandLine.arguments
         // 所有 --visual-preview* 路径统一禁止持久化：预览运行真实二进制，样式选择只影响本次渲染。
         panelController.previewSuppressesPersistence = true
+        // 额度周期回顾预览只注入固定内存快照：不创建协调器、不创建真实历史目录、不读凭据。
+        historySnapshot = .previewFixture
         if args.contains("--visual-preview-dark") {
             NSApp.appearance = NSAppearance(named: .darkAqua)
             panelController.previewAppearance = NSAppearance(named: .darkAqua)
@@ -5158,6 +5214,24 @@ enum KimiOfflineRegression {
         if !value() { throw Failure(description: message) }
     }
 
+    /// Coordinator delivery recorder with an explicit completion signal —
+    /// the offline regression waits on semaphores, never on sleep guesses.
+    private final class HistorySnapshotRecorder {
+        private let lock = NSLock()
+        private var values: [QuotaCycleSnapshot] = []
+        var count: Int { lock.lock(); defer { lock.unlock() }; return values.count }
+        var last: QuotaCycleSnapshot? { lock.lock(); defer { lock.unlock() }; return values.last }
+        func append(_ snapshot: QuotaCycleSnapshot) {
+            lock.lock(); values.append(snapshot); lock.unlock()
+        }
+    }
+
+    private static func awaitHistoryDelivery(_ semaphore: DispatchSemaphore, _ message: String) throws {
+        if semaphore.wait(timeout: .now() + 5) == .timedOut {
+            throw Failure(description: "quota history delivery timed out: \(message)")
+        }
+    }
+
     static func run() -> Int32 {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("KimiUsage-self-test-\(UUID().uuidString)", isDirectory: true)
@@ -5312,6 +5386,7 @@ enum KimiOfflineRegression {
                         direction: .flat, detail: ""),
                     notices: []),
                 tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                history: QuotaCycleSnapshot.inactive,
                 notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                 refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
                 loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
@@ -5365,6 +5440,7 @@ enum KimiOfflineRegression {
                             direction: .flat, detail: ""),
                         notices: []),
                     tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
                     loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
@@ -6276,7 +6352,83 @@ enum KimiOfflineRegression {
 
             try expect(UpdateCheck.displayNotes("   ") == "本版本暂未提供详细更新说明", "empty update notes")
             try expect(UpdateCheck.displayNotes("## 新增\n- **新功能**") == "新增\n• 新功能", "update notes formatting")
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild)")
+
+            // 额度周期回顾接入回归：临时 root、假 API Key、注入 writer 与 recorder，
+            // 不读真实凭据、不联网、不触碰真实 Application Support。
+            let historyRoot = root.appendingPathComponent("quota-history", isDirectory: true)
+            let atomicHistoryWriter: QuotaCycleStore.Writer = { data, url in
+                try AtomicJSONFile.replace(data, at: url.path, mode: 0o600)
+            }
+            // 生产样本 gate：只用本轮响应自身的合法值构造样本——失败轮、缺字段轮绝不
+            // 入账，更不能回读 merged 旧值补样本。
+            let requestStartedAt = Date(timeIntervalSince1970: 1_800_000_000)
+            let requestReset = requestStartedAt.addingTimeInterval(604800)
+            let observedAt = requestStartedAt.addingTimeInterval(1)
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: 0.43, reset: requestReset, error: nil)?.usedPercent == 43,
+                       "valid 7-day response must yield a 43% sample")
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: nil, reset: requestReset, error: nil) == nil,
+                       "nil ratio this round must not fall back to old usage values")
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: 0.43, reset: nil, error: nil) == nil,
+                       "missing reset must not be recorded")
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: 0.43, reset: requestReset, error: "401") == nil,
+                       "errored round must not be recorded")
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: 1.2, reset: requestReset, error: nil) == nil,
+                       "out-of-range ratio rejected by the gate")
+            try expect(QuotaObservation.accepted(requestStartedAt: requestStartedAt, observedAt: observedAt,
+                        usedRatio: .nan, reset: requestReset, error: nil) == nil,
+                       "non-finite ratio rejected by the gate")
+            func historySample(_ requestOffset: Double, _ observedOffset: Double, _ used: Double) -> QuotaObservation {
+                QuotaObservation(requestStartedAt: requestStartedAt.addingTimeInterval(requestOffset),
+                                 observedAt: requestStartedAt.addingTimeInterval(observedOffset),
+                                 usedPercent: used, resetAt: requestReset)
+            }
+            let recorder = HistorySnapshotRecorder()
+            let historySem = DispatchSemaphore(value: 0)
+            let coordinator = QuotaCycleCoordinator(root: historyRoot, writer: atomicHistoryWriter,
+                deliver: { snapshot in recorder.append(snapshot); historySem.signal() })
+            coordinator.activate(apiKey: "fake-history-key-A", generation: 1)
+            try awaitHistoryDelivery(historySem, "activate scope A")
+            try expect(recorder.last?.loaded == true, "history scope activation must deliver a loaded snapshot")
+            try expect(recorder.last?.current == nil, "a fresh scope starts empty, never fabricated history")
+            coordinator.observe(historySample(0, 1, 43), apiKey: "fake-history-key-A", generation: 1)
+            try awaitHistoryDelivery(historySem, "first accepted observation")
+            try expect(recorder.last?.current?.lastObservedUsedPercent == 43,
+                       "accepted 43% sample must reach the UI snapshot")
+            // 旧代际拒绝：同 key、上一代的迟到样本被协调器整体拒绝（不 reduce、不交付）。
+            let deliveredBeforeStale = recorder.count
+            coordinator.observe(historySample(600, 601, 99), apiKey: "fake-history-key-A", generation: 0)
+            // FIFO：这次同代际观测的交付证明前面的旧代际样本已被处理且无交付。
+            coordinator.observe(historySample(700, 701, 44), apiKey: "fake-history-key-A", generation: 1)
+            try awaitHistoryDelivery(historySem, "same-generation observation after stale one")
+            try expect(recorder.count == deliveredBeforeStale + 1,
+                       "stale-generation sample must be rejected without any delivery")
+            try expect(recorder.last?.current?.lastObservedUsedPercent == 44,
+                       "stale sample must not pollute the re-activated scope's current cycle")
+            // A/B key 不串历史：切到 B 是空分区；同 root 重启后加载 A 仍只见 A 的数据。
+            coordinator.activate(apiKey: "fake-history-key-B", generation: 2)
+            try awaitHistoryDelivery(historySem, "switch to scope B")
+            try expect(recorder.last?.current == nil && recorder.last?.loaded == true,
+                       "scope B must start from its own empty partition")
+            let restartedRecorder = HistorySnapshotRecorder()
+            let restartedSem = DispatchSemaphore(value: 0)
+            let restarted = QuotaCycleCoordinator(root: historyRoot, writer: atomicHistoryWriter,
+                deliver: { snapshot in restartedRecorder.append(snapshot); restartedSem.signal() })
+            restarted.activate(apiKey: "fake-history-key-A", generation: 3)
+            try awaitHistoryDelivery(restartedSem, "restart reloads scope A")
+            try expect(restartedRecorder.last?.current?.lastObservedUsedPercent == 44,
+                       "scope A history survives a coordinator restart without scope B data")
+            // 预览快照是纯内存固定数据：预览不创建协调器、不读凭据、不依赖真实时钟。
+            try expect(QuotaCycleSnapshot.previewFixture.recordCount >= 6,
+                       "preview fixture must offer at least six cycles from a fixed snapshot")
+            try expect(QuotaCycleSnapshot.inactive.loaded == false,
+                       "inactive snapshot must render the neutral placeholder state")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)
@@ -6284,119 +6436,3 @@ enum KimiOfflineRegression {
         }
     }
 }
-
-// MARK: - 入口（支持 --once 命令行自检）
-
-let cliArgs = CommandLine.arguments.dropFirst()
-if cliArgs.contains("--help") {
-    print("""
-    KimiUsage — Kimi 用量菜单栏工具（无参数启动常驻应用）
-
-    用法:
-      --self-test        离线回归自检（只用临时数据，不读凭据、不联网）
-      --tokens-once      只统计本地 token（不读凭据、不联网、不写缓存）
-      --once             拉一次线上额度 + 本地统计后退出（读凭据、联网、可能续期并写缓存）
-      --visual-preview…  原生面板离线预览（子选项见 docs/DEVELOPMENT.md）
-      --help             显示本说明
-    """)
-    exit(0)
-}
-// 未知旗标一律拒绝：静默拉起常驻 GUI 会让用户无从察觉拼写错误
-let knownLongFlags: Set<String> = ["--self-test", "--tokens-once", "--once", "--help"]
-if let unknown = cliArgs.first(where: {
-    $0.hasPrefix("--") && !knownLongFlags.contains($0) && !$0.hasPrefix("--visual-preview")
-}) {
-    fputs("KimiUsage: 未知参数 \(unknown)（--help 查看用法）\n", stderr)
-    exit(2)
-}
-
-if CommandLine.arguments.contains("--self-test") {
-    exit(KimiOfflineRegression.run())
-}
-
-if CommandLine.arguments.contains("--tokens-once") {
-    // 纯本地验收：不读凭据、不联网、不写扫描状态，只打印两类 token 统计。
-    let detailed = TokenAggregator.aggregateBothDetailed(persist: false)
-    if let e = detailed.workError { print("work tokens error: \(e)") }
-    if let e = detailed.cliError { print("api tokens error: \(e)") }
-    func printTokens(_ label: String, _ stats: (TokenStat, TokenStat, TokenStat)) {
-        for (window, stat) in zip(["today", "7d", "30d"], [stats.0, stats.1, stats.2]) {
-            print("\(label) \(window): in=\(Fmt.tokens(stat.input)) out=\(Fmt.tokens(stat.output)) total=\(Fmt.tokens(stat.total))")
-        }
-    }
-    printTokens("work", detailed.work)
-    printTokens("api", detailed.cli)
-    exit(detailed.workError == nil && detailed.cliError == nil ? 0 : 1)
-}
-
-if CommandLine.arguments.contains("--once") {
-    // 命令行自检模式：拉一次数据打印后退出
-    let cred = CredStore.load()
-    let group = DispatchGroup()
-    // 网络回调来自不同线程，与 App 主路径同款经锁合并；避免 wait 超时后边写边读
-    let onceLock = NSLock()
-    var merged = UsageData()
-    func applyResult(_ body: (inout UsageData) -> Void, leave: Bool = true) {
-        onceLock.lock()
-        body(&merged)
-        onceLock.unlock()
-        if leave { group.leave() }
-    }
-    if let key = cred.codeApiKey {
-        group.enter()
-        Fetcher.fetchCodeUsage(apiKey: key) { r in
-            applyResult { current in
-                current.fiveHourUsed = r.fiveHourUsed
-                current.fiveHourReset = r.fiveHourReset
-                current.sevenDayUsed = r.sevenDayUsed
-                current.sevenDayReset = r.sevenDayReset
-                current.fiveHourError = r.fiveHourError
-            }
-        }
-    } else { print("no kimiCode apiKey found") }
-    if let token = cred.webToken {
-        group.enter()
-        Fetcher.fetchMonthUsageWithRetry(webToken: token) { r in
-            applyResult { current in
-                current.monthUsed = r.monthUsed
-                current.monthReset = r.monthReset
-                current.planName = r.planName
-                current.monthError = r.monthError
-            }
-        }
-    } else { print("no kimiWeb token found") }
-    // 月度 401 时存在 刷新→重试 串行链（每段最长 15s），45s 内应全部返回
-    let timedOut = group.wait(timeout: .now() + 45) == .timedOut
-    onceLock.lock()
-    let snapshot = merged
-    onceLock.unlock()
-    func rem(_ used: Double?) -> Double? { used.map { max(0, min(1, 1 - $0)) } }
-    let detailed = TokenAggregator.aggregateBothDetailed()
-    let (work, cli) = (detailed.work, detailed.cli)
-    if let e = detailed.workError { print("work tokens error: \(e)") }
-    if let e = detailed.cliError { print("api tokens error: \(e)") }
-    let (tt, tw, tm) = work
-    print("menubar: 5H \(Fmt.pct(rem(snapshot.fiveHourUsed))) / 7D \(Fmt.pct(rem(snapshot.sevenDayUsed)))")
-    print("5h remaining=\(Fmt.pctLong(rem(snapshot.fiveHourUsed))) reset=\(Fmt.dayTime(snapshot.fiveHourReset))")
-    print("7d remaining=\(Fmt.pctLong(rem(snapshot.sevenDayUsed))) reset=\(Fmt.dayTime(snapshot.sevenDayReset))")
-    print("month remaining=\(Fmt.pctLong(rem(snapshot.monthUsed))) reset=\(Fmt.dayTime(snapshot.monthReset))")
-    print("plan: \(snapshot.planName ?? "none")")
-    print("tokens today: in=\(Fmt.tokens(tt.input)) out=\(Fmt.tokens(tt.output)) total=\(Fmt.tokens(tt.total))")
-    print("tokens 7d:    in=\(Fmt.tokens(tw.input)) out=\(Fmt.tokens(tw.output)) total=\(Fmt.tokens(tw.total))")
-    print("tokens 30d:   in=\(Fmt.tokens(tm.input)) out=\(Fmt.tokens(tm.output)) total=\(Fmt.tokens(tm.total))")
-    let (ct, cw, cm) = cli
-    print("api tokens today: in=\(Fmt.tokens(ct.input)) out=\(Fmt.tokens(ct.output)) total=\(Fmt.tokens(ct.total))")
-    print("api tokens 7d:    in=\(Fmt.tokens(cw.input)) out=\(Fmt.tokens(cw.output)) total=\(Fmt.tokens(cw.total))")
-    print("api tokens 30d:   in=\(Fmt.tokens(cm.input)) out=\(Fmt.tokens(cm.output)) total=\(Fmt.tokens(cm.total))")
-    if let e = snapshot.fiveHourError { print("5h error: \(e)") }
-    if let e = snapshot.sevenDayError { print("7d error: \(e)") }
-    if let e = snapshot.monthError { print("month error: \(e)") }
-    if timedOut { fputs("KimiUsage --once: 等待网络结果超时（45s），以上为部分数据\n", stderr) }
-    exit(timedOut ? 1 : 0)
-}
-
-let app = NSApplication.shared
-app.setActivationPolicy(.accessory)   // 不显示 Dock 图标
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()

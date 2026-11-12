@@ -31,7 +31,14 @@ echo "== SDK ${SDK_VERSION} =="
 echo "== 编译 Swift 源码 =="
 # 必须显式指定部署目标：本机 CLT 默认 target 是 macosx28.0（比当前系统 macOS 27 新），
 # 缺省编译出的二进制 minos=28.0 会被 LaunchServices 拒绝（"不能与此版本 macOS 配合使用"）。
-swiftc -O -target arm64-apple-macos13.0 -o "$DIR/KimiUsage-bin" "$DIR/KimiUsage.swift"
+# 多文件编译：只有根目录 main.swift 允许 top-level 代码，入口已迁出 KimiUsage.swift；
+# 显式列出全部源文件，不用全目录通配符，保持 arm64 / macOS 13 部署目标。
+swiftc -O -target arm64-apple-macos13.0 -o "$DIR/KimiUsage-bin" \
+  "$DIR/Sources/QuotaCycleHistory.swift" \
+  "$DIR/Sources/QuotaCycleStore.swift" \
+  "$DIR/Sources/QuotaCycleCoordinator.swift" \
+  "$DIR/KimiUsage.swift" \
+  "$DIR/main.swift"
 
 echo "== 打包 .app =="
 rm -rf "$APP"

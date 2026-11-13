@@ -6166,7 +6166,7 @@ enum KimiOfflineRegression {
                 try expect(QuotaCycleChartCanvas.usedBarStyle(for: closedItem) == .filled,
                            "closed cycle must use a filled bar")
             }
-            try expect(QuotaCycleVisualMetrics.canvasHeight == 61
+            try expect(QuotaCycleVisualMetrics.canvasHeight == 76
                        && QuotaCycleVisualMetrics.barAreaHeight == 46
                        && QuotaCycleVisualMetrics.barWidth == 6
                        && QuotaCycleVisualMetrics.barCornerRadius == 1,
@@ -6259,6 +6259,18 @@ enum KimiOfflineRegression {
                            && abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1
                            && abs(strip.frame.height - QuotaCycleVisualMetrics.stripHeight) < 1,
                            "Codex-style row heights changed at \(width)pt")
+                let labelFrames = canvas.labelFramesForTest
+                try expect(labelFrames.count == groups.count,
+                           "every cycle must have its own date and percentage label")
+                for label in labelFrames {
+                    try expect(label.percent.minY >= label.date.maxY + 1,
+                               "percentage must sit directly below its date")
+                    try expect(abs(label.date.midX - label.percent.midX) < 0.01,
+                               "date and percentage must share the cycle center")
+                    try expect(canvas.bounds.contains(label.date)
+                               && canvas.bounds.contains(label.percent),
+                               "date/percentage label exceeds the canvas")
+                }
                 let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
                 if let latest = previewItems.last {
                     try expect(!visibleTexts.contains(latest.detailTitle)
@@ -6281,9 +6293,8 @@ enum KimiOfflineRegression {
             try expect(shortGroups.count == 4, "short history must render only four actual records")
             try expect(abs(shortGroups[0].slot.width - fullSlotWidth) < 0.01,
                        "short history must keep the six-column slot width")
-            let shortContentMidX = (shortGroups[0].slot.minX + shortGroups[3].slot.maxX) / 2
-            try expect(abs(shortContentMidX - shortCanvas.bounds.midX) < 0.5,
-                       "four actual groups must be centered without phantom columns")
+            try expect(abs(shortGroups[3].slot.maxX - shortCanvas.bounds.maxX) < 0.5,
+                       "short history must stay right-aligned with the current cycle")
             historyController.update(model: makeHistoryPanelModel(history: .previewOneFixture))
             let oneCard = try historyCard(in: historyController.rebuildContentForTest(width: 330))
             guard let oneCanvas = descendants(oneCard).compactMap({ $0 as? QuotaCycleChartCanvas }).first else {
@@ -6292,8 +6303,12 @@ enum KimiOfflineRegression {
             let oneGroups = oneCanvas.groupFramesForTest
             try expect(oneGroups.count == 1,
                        "single history must render one actual record")
-            try expect(abs(oneGroups[0].slot.midX - oneCanvas.bounds.midX) < 0.5,
-                       "single actual group must be centered")
+            try expect(abs(oneGroups[0].slot.maxX - oneCanvas.bounds.maxX) < 0.5,
+                       "single current cycle must be right-aligned")
+            let onePagerButtons = descendants(oneCard).compactMap { $0 as? NSButton }
+                .filter { ["更早 6 个周期", "更新 6 个周期"].contains($0.accessibilityLabel()) }
+            try expect(onePagerButtons.isEmpty,
+                       "single-page history must not render disabled pager buttons")
             // 状态文案：pending 详情、空态、写失败提示
             historyController.update(model: makeHistoryPanelModel(history: .previewPendingFixture))
             let pendingRows = historyController.rebuildContentForTest(width: 330)

@@ -9,7 +9,7 @@ import Foundation
 
 enum QuotaCycleVisualMetrics {
     static let summaryHeight: CGFloat = 28
-    static let canvasHeight: CGFloat = 61
+    static let canvasHeight: CGFloat = 76
     static let barAreaHeight: CGFloat = 46
     static let barWidth: CGFloat = 6
     static let barGap: CGFloat = 3
@@ -251,6 +251,13 @@ final class QuotaCycleChartCanvas: NSView {
         var cap: CGRect     // 灰色上限柱（恒为 100% 高度）
         var used: CGRect    // 蓝色已用柱（0–100%）
     }
+    struct LabelFrame: Equatable {
+        var date: CGRect
+        var percent: CGRect
+    }
+
+    private static let dateFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular)
+    private static let percentFont = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
 
     var items: [QuotaCycleItem] = []
     /// 固定选择（控制器持久状态）；高亮与详情按「悬停 ?? 固定 ?? 本屏最新」显示。
@@ -306,12 +313,28 @@ final class QuotaCycleChartCanvas: NSView {
     }
 
     var groupFramesForTest: [GroupFrame] { groupFrames(in: bounds) }
+    var labelFramesForTest: [LabelFrame] { labelFrames(in: bounds) }
+
+    private func labelFrames(in rect: CGRect) -> [LabelFrame] {
+        zip(items, groupFrames(in: rect)).map { item, group in
+            func textFrame(_ text: String, font: NSFont, y: CGFloat) -> CGRect {
+                let size = (text as NSString).size(withAttributes: [.font: font])
+                let slotX = min(max(group.slot.midX - size.width / 2, group.slot.minX),
+                                group.slot.maxX - size.width)
+                let x = min(max(rect.minX, slotX), max(rect.minX, rect.maxX - size.width))
+                return CGRect(x: x, y: y, width: size.width, height: size.height)
+            }
+            let date = textFrame(item.startLabel, font: Self.dateFont, y: 49)
+            let percent = textFrame(item.usedText, font: Self.percentFont, y: date.maxY + 2)
+            return LabelFrame(date: date, percent: percent)
+        }
+    }
 
     private func groupFrames(in rect: CGRect) -> [GroupFrame] {
         guard !items.isEmpty else { return [] }
         let slotWidth = rect.width / CGFloat(QuotaCyclePresentation.pageSize)
         let contentWidth = slotWidth * CGFloat(items.count)
-        let originX = rect.minX + (rect.width - contentWidth) / 2
+        let originX = rect.maxX - contentWidth
         let pairWidth = QuotaCycleVisualMetrics.barWidth * 2 + QuotaCycleVisualMetrics.barGap
         return items.enumerated().map { index, item in
             let slot = CGRect(x: originX + CGFloat(index) * slotWidth, y: 0,
@@ -338,7 +361,7 @@ final class QuotaCycleChartCanvas: NSView {
         let frames = groupFrames(in: bounds)
         let effective = effectiveID
         guard !frames.isEmpty else { return }
-        for (frame, item) in zip(frames, items) {
+        for (index, (frame, item)) in zip(frames, items).enumerated() {
             if item.id == effective {
                 NSColor.labelColor.withAlphaComponent(QuotaCycleVisualMetrics.selectionFillAlpha).setFill()
                 NSRect(x: frame.slot.minX, y: 0, width: frame.slot.width,
@@ -361,16 +384,16 @@ final class QuotaCycleChartCanvas: NSView {
                 usedPath.lineWidth = 1
                 usedPath.stroke()
             }
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
+            let labels = labelFrames(in: bounds)[index]
+            (item.startLabel as NSString).draw(at: labels.date.origin, withAttributes: [
+                .font: Self.dateFont,
                 .foregroundColor: item.id == effective ? NSColor.labelColor : NSColor.secondaryLabelColor
-            ]
-            let text = item.startLabel as NSString
-            let textWidth = text.size(withAttributes: attributes).width
-            let slotX = min(max(frame.slot.midX - textWidth / 2, frame.slot.minX),
-                            frame.slot.maxX - textWidth)
-            let x = min(max(bounds.minX, slotX), max(bounds.minX, bounds.maxX - textWidth))
-            text.draw(at: NSPoint(x: x, y: 49), withAttributes: attributes)
+            ])
+            (item.usedText as NSString).draw(at: labels.percent.origin, withAttributes: [
+                .font: Self.percentFont,
+                .foregroundColor: item.id == effective
+                    ? PanelAccent.codex.color : NSColor.labelColor
+            ])
         }
     }
 
@@ -622,7 +645,7 @@ final class QuotaCycleHistorySectionView: NSView {
         let toggle = QuotaCycleWidget.disclosureToggle(expanded: expanded, section: "额度周期回顾",
                                                        target: target, action: action)
         var headerTrailing: [NSView] = []
-        if expanded && model.loaded && !state.visibleItems.isEmpty {
+        if expanded && model.loaded && state.pageCount > 1 && !state.visibleItems.isEmpty {
             pagerStack.addArrangedSubview(back)
             pagerStack.addArrangedSubview(pageLabel)
             pagerStack.addArrangedSubview(forward)

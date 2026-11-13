@@ -202,8 +202,13 @@ final class QuotaCycleChartCanvas: NSView {
     var onStep: ((Int) -> Void)?
     private var trackingArea: NSTrackingArea?
 
-    private let barGap: CGFloat = 2
-    private let maxBarWidth: CGFloat = 13
+    enum UsedBarStyle: Equatable { case filled, outlined }
+
+    static func usedBarStyle(for item: QuotaCycleItem) -> UsedBarStyle {
+        item.isCurrent ? .outlined : .filled
+    }
+
+    override var isFlipped: Bool { true }
 
     /// 当前实际高亮的轮次（悬停优先）。
     var effectiveID: UUID? { hoveredID ?? fallbackID }
@@ -226,48 +231,68 @@ final class QuotaCycleChartCanvas: NSView {
 
     private func groupFrames(in rect: CGRect) -> [GroupFrame] {
         guard !items.isEmpty else { return [] }
-        let count = CGFloat(items.count)
-        let slotWidth = rect.width / count
-        let barTop: CGFloat = 1
-        let barHeight = max(2, rect.height - barTop)
-        let barWidth = min(maxBarWidth, max(3, (slotWidth - 8) / 2 - barGap / 2))
-        let pairWidth = barWidth * 2 + barGap
+        let slotWidth = rect.width / CGFloat(QuotaCyclePresentation.pageSize)
+        let contentWidth = slotWidth * CGFloat(items.count)
+        let originX = rect.minX + (rect.width - contentWidth) / 2
+        let pairWidth = QuotaCycleVisualMetrics.barWidth * 2 + QuotaCycleVisualMetrics.barGap
         return items.enumerated().map { index, item in
-            let slot = CGRect(x: rect.minX + CGFloat(index) * slotWidth, y: 0,
-                              width: slotWidth, height: rect.height)
+            let slot = CGRect(x: originX + CGFloat(index) * slotWidth, y: 0,
+                              width: slotWidth, height: QuotaCycleVisualMetrics.canvasHeight)
             let pairX = slot.midX - pairWidth / 2
-            let usedHeight = item.usedPercent <= 0
-                ? 2                                   // 有记录的零用量 = 低基线，不当缺失
-                : max(2, barHeight * CGFloat(item.usedPercent / 100))
+            let minimum: CGFloat = item.isCurrent ? 3 : 2
+            let usedHeight = max(minimum,
+                QuotaCycleVisualMetrics.barAreaHeight * CGFloat(item.usedPercent / 100))
             return GroupFrame(
                 slot: slot,
-                cap: CGRect(x: pairX, y: barTop, width: barWidth, height: barHeight),
-                used: CGRect(x: pairX + barWidth + barGap, y: barTop,
-                             width: barWidth, height: min(barHeight, usedHeight)))
+                cap: CGRect(x: pairX, y: 0,
+                            width: QuotaCycleVisualMetrics.barWidth,
+                            height: QuotaCycleVisualMetrics.barAreaHeight),
+                used: CGRect(x: pairX + QuotaCycleVisualMetrics.barWidth
+                                 + QuotaCycleVisualMetrics.barGap,
+                             y: QuotaCycleVisualMetrics.barAreaHeight
+                                 - min(QuotaCycleVisualMetrics.barAreaHeight, usedHeight),
+                             width: QuotaCycleVisualMetrics.barWidth,
+                             height: min(QuotaCycleVisualMetrics.barAreaHeight, usedHeight)))
         }
     }
 
     override func draw(_ dirtyRect: NSRect) {
         let frames = groupFrames(in: bounds)
         let effective = effectiveID
-        // 基线：1pt 全宽发丝线（与日图同款）
-        NSColor.labelColor.withAlphaComponent(0.15).setFill()
-        NSRect(x: 0, y: 0, width: bounds.width, height: 1).fill()
         guard !frames.isEmpty else { return }
         for (frame, item) in zip(frames, items) {
             if item.id == effective {
-                // 选中组浅色高亮：整列圆角底，深浅色/三种背景下都可辨
-                NSColor.labelColor.withAlphaComponent(0.07).setFill()
-                NSBezierPath(roundedRect: frame.slot.insetBy(dx: 1, dy: 0),
-                             xRadius: 5, yRadius: 5).fill()
+                NSColor.labelColor.withAlphaComponent(QuotaCycleVisualMetrics.selectionFillAlpha).setFill()
+                NSRect(x: frame.slot.minX, y: 0, width: frame.slot.width,
+                       height: QuotaCycleVisualMetrics.barAreaHeight).fill()
             }
-            // 灰柱 = 额度上限 100%（secondaryLabelColor 动态色，读感弱化）
-            NSColor.secondaryLabelColor.withAlphaComponent(item.id == effective ? 0.4 : 0.28).setFill()
-            frame.cap.fill()
-            // 蓝柱 = 已用比例（Kimi 动态深蓝，复用 PanelAccent.codex）
-            PanelAccent.codex.color
-                .withAlphaComponent(item.id == effective ? 1 : 0.78).setFill()
-            frame.used.fill()
+            let capPath = NSBezierPath(roundedRect: frame.cap,
+                xRadius: QuotaCycleVisualMetrics.barCornerRadius,
+                yRadius: QuotaCycleVisualMetrics.barCornerRadius)
+            NSColor.secondaryLabelColor.withAlphaComponent(QuotaCycleVisualMetrics.capFillAlpha).setFill()
+            capPath.fill()
+            let usedPath = NSBezierPath(roundedRect: frame.used,
+                xRadius: QuotaCycleVisualMetrics.barCornerRadius,
+                yRadius: QuotaCycleVisualMetrics.barCornerRadius)
+            switch Self.usedBarStyle(for: item) {
+            case .filled:
+                PanelAccent.codex.color.setFill()
+                usedPath.fill()
+            case .outlined:
+                PanelAccent.codex.color.setStroke()
+                usedPath.lineWidth = 1
+                usedPath.stroke()
+            }
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .regular),
+                .foregroundColor: item.id == effective ? NSColor.labelColor : NSColor.secondaryLabelColor
+            ]
+            let text = item.startLabel as NSString
+            let textWidth = text.size(withAttributes: attributes).width
+            let slotX = min(max(frame.slot.midX - textWidth / 2, frame.slot.minX),
+                            frame.slot.maxX - textWidth)
+            let x = min(max(bounds.minX, slotX), max(bounds.minX, bounds.maxX - textWidth))
+            text.draw(at: NSPoint(x: x, y: 49), withAttributes: attributes)
         }
     }
 

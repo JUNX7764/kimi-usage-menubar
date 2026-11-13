@@ -6130,6 +6130,12 @@ enum KimiOfflineRegression {
             try expect(currentItem.usedText == "36%", "current primary value must use observed percent")
             try expect(currentItem.statusText == "进行中", "current status must be concise")
             try expect(currentItem.remainingText == "当前剩余 64%", "current remaining semantics changed")
+            try expect(QuotaCycleChartCanvas.usedBarStyle(for: currentItem) == .outlined,
+                       "current cycle must use an outlined bar")
+            if let closedItem = previewItems.first(where: { !$0.isCurrent }) {
+                try expect(QuotaCycleChartCanvas.usedBarStyle(for: closedItem) == .filled,
+                           "closed cycle must use a filled bar")
+            }
             try expect(QuotaCycleVisualMetrics.canvasHeight == 61
                        && QuotaCycleVisualMetrics.barAreaHeight == 46
                        && QuotaCycleVisualMetrics.barWidth == 6
@@ -6179,6 +6185,7 @@ enum KimiOfflineRegression {
             }
             historyController.update(model: makeHistoryPanelModel(history: .previewFixture))
             var fullHeight: CGFloat = 0
+            var fullSlotWidth: CGFloat = 0
             for width in [CGFloat(330), CGFloat(300)] {
                 let rows = historyController.rebuildContentForTest(width: width)
                 let order = cardTitles(rows)
@@ -6202,6 +6209,13 @@ enum KimiOfflineRegression {
                                "group \(index) must have two distinct bars at \(width)pt")
                     try expect(group.used.maxY <= group.cap.maxY + 0.5,
                                "group \(index) used bar exceeds 100% cap at \(width)pt")
+                    try expect(abs(group.cap.width - QuotaCycleVisualMetrics.barWidth) < 0.01
+                               && abs(group.used.width - QuotaCycleVisualMetrics.barWidth) < 0.01,
+                               "bars must stay 6pt at every panel width")
+                    try expect(abs(group.cap.height - QuotaCycleVisualMetrics.barAreaHeight) < 0.01,
+                               "cap must represent the full 46pt 100% range")
+                    try expect(abs(group.used.minX - group.cap.maxX - QuotaCycleVisualMetrics.barGap) < 0.01,
+                               "paired bars must have a stable 3pt gap")
                     if index > 0 {
                         try expect(groups[index - 1].slot.maxX <= group.slot.minX + 0.5,
                                    "group \(index) overlaps previous at \(width)pt")
@@ -6222,6 +6236,7 @@ enum KimiOfflineRegression {
                                "legacy two-line detail text still rendered at \(width)pt")
                 }
                 fullHeight = card.frame.height
+                if width == 330 { fullSlotWidth = groups[0].slot.width }
             }
             // 短历史（4 轮 < 6 轮）保持同一卡片高度：不伪造历史、不塌缩图区
             historyController.update(model: makeHistoryPanelModel(history: .previewShortFixture))
@@ -6229,6 +6244,26 @@ enum KimiOfflineRegression {
             let shortCard = try historyCard(in: shortRows)
             try expect(abs(shortCard.frame.height - fullHeight) < 0.5,
                        "short history must keep full card height: \(shortCard.frame.height) vs \(fullHeight)")
+            guard let shortCanvas = descendants(shortCard).compactMap({ $0 as? QuotaCycleChartCanvas }).first else {
+                throw Failure(description: "short quota chart canvas missing")
+            }
+            let shortGroups = shortCanvas.groupFramesForTest
+            try expect(shortGroups.count == 4, "short history must render only four actual records")
+            try expect(abs(shortGroups[0].slot.width - fullSlotWidth) < 0.01,
+                       "short history must keep the six-column slot width")
+            let shortContentMidX = (shortGroups[0].slot.minX + shortGroups[3].slot.maxX) / 2
+            try expect(abs(shortContentMidX - shortCanvas.bounds.midX) < 0.5,
+                       "four actual groups must be centered without phantom columns")
+            historyController.update(model: makeHistoryPanelModel(history: .previewOneFixture))
+            let oneCard = try historyCard(in: historyController.rebuildContentForTest(width: 330))
+            guard let oneCanvas = descendants(oneCard).compactMap({ $0 as? QuotaCycleChartCanvas }).first else {
+                throw Failure(description: "single quota chart canvas missing")
+            }
+            let oneGroups = oneCanvas.groupFramesForTest
+            try expect(oneGroups.count == 1,
+                       "single history must render one actual record")
+            try expect(abs(oneGroups[0].slot.midX - oneCanvas.bounds.midX) < 0.5,
+                       "single actual group must be centered")
             // 状态文案：pending 详情、空态、写失败提示
             historyController.update(model: makeHistoryPanelModel(history: .previewPendingFixture))
             let pendingRows = historyController.rebuildContentForTest(width: 330)

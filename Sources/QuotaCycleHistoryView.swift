@@ -15,8 +15,8 @@ enum QuotaCycleVisualMetrics {
     static let barGap: CGFloat = 3
     static let barCornerRadius: CGFloat = 1
     static let capFillAlpha: CGFloat = 0.16
-    /// 选中列柱组底部基线强调的厚度。
-    static let selectionAccentHeight: CGFloat = 2
+    /// 当前轮使用较轻的实心柱；低用量时不与任何选中装饰重叠。
+    static let currentFillAlpha: CGFloat = 0.65
 }
 
 /// 一根双柱组对应的一个可展示轮次。
@@ -201,10 +201,10 @@ final class QuotaCycleChartCanvas: NSView {
     /// 预览断言：点击固定后画布可键盘逐组，但不绘制整幅系统焦点外框。
     var focusRingTypeForPreview: NSFocusRingType { focusRingType }
 
-    enum UsedBarStyle: Equatable { case filled, outlined }
+    enum UsedBarStyle: Equatable { case filled, current }
 
     static func usedBarStyle(for item: QuotaCycleItem) -> UsedBarStyle {
-        item.isCurrent ? .outlined : .filled
+        item.isCurrent ? .current : .filled
     }
 
     override var isFlipped: Bool { true }
@@ -213,7 +213,7 @@ final class QuotaCycleChartCanvas: NSView {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
         // 点击固定后画布是第一响应者（方向键逐组），但不绘制整幅焦点外框；
-        // 键盘当前列由列级高亮（品牌蓝日期/百分比 + 柱组基线强调）表达。
+        // 键盘当前列只由品牌蓝日期/百分比表达，不叠加底板或基线。
         focusRingType = .none
     }
 
@@ -297,22 +297,11 @@ final class QuotaCycleChartCanvas: NSView {
             switch Self.usedBarStyle(for: item) {
             case .filled:
                 PanelAccent.codex.color.setFill()
-                usedPath.fill()
-            case .outlined:
-                PanelAccent.codex.color.setStroke()
-                usedPath.lineWidth = 1
-                usedPath.stroke()
+            case .current:
+                PanelAccent.codex.color.withAlphaComponent(QuotaCycleVisualMetrics.currentFillAlpha).setFill()
             }
-            if selected {
-                // 选中列的轻量柱体强调：柱组底部 2pt 品牌蓝基线（无整列底板、无整幅外框）
-                let pairX = frame.cap.minX
-                let pairWidth = frame.used.maxX - pairX
-                PanelAccent.codex.color.setFill()
-                NSRect(x: pairX,
-                       y: QuotaCycleVisualMetrics.barAreaHeight - QuotaCycleVisualMetrics.selectionAccentHeight,
-                       width: pairWidth,
-                       height: QuotaCycleVisualMetrics.selectionAccentHeight).fill()
-            }
+            usedPath.fill()
+            // 选中只强化日期和百分比；不叠加基线，避免低用量当前柱与装饰线重叠。
             let labels = labelFrames(in: bounds)[index]
             (item.startLabel as NSString).draw(at: labels.date.origin, withAttributes: [
                 .font: Self.dateFont,

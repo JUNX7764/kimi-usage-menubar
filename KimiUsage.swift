@@ -6195,8 +6195,8 @@ enum KimiOfflineRegression {
             try expect(currentItem.detailTitle.contains("当前轮次")
                        && currentItem.detailValue.contains("当前剩余 64%"),
                        "current status and remaining must remain in hover details")
-            try expect(QuotaCycleChartCanvas.usedBarStyle(for: currentItem) == .outlined,
-                       "current cycle must use an outlined bar")
+            try expect(QuotaCycleChartCanvas.usedBarStyle(for: currentItem) == .current,
+                       "current cycle must use the lighter filled bar")
             if let closedItem = previewItems.first(where: { !$0.isCurrent }) {
                 try expect(QuotaCycleChartCanvas.usedBarStyle(for: closedItem) == .filled,
                            "closed cycle must use a filled bar")
@@ -6317,7 +6317,7 @@ enum KimiOfflineRegression {
                                && (canvas.toolTip ?? "").contains(latest.detailValue),
                                "canvas tooltip must carry the selected cycle details at \(width)pt")
                 }
-                // 选中视觉：无图内浮层子视图、无整幅焦点外框（列级品牌蓝高亮 + 柱组基线强调）
+                // 选中视觉：无图内浮层子视图、无整幅焦点外框（仅列级品牌蓝日期/百分比）
                 try expect(canvas.subviews.isEmpty,
                            "in-canvas hover overlay must be removed at \(width)pt")
                 try expect(canvas.focusRingTypeForPreview == .none,

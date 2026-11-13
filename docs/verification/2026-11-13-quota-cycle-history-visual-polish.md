@@ -65,7 +65,9 @@ Cua `list_windows` 确认预览 PID 65906、CGWindowID 25585，窗口尺寸 356�
 
 首次 `launchctl bootstrap` 返回 Input/output error，退出恢复路径随后成功加载同一 LaunchAgent；复核确认新进程 PID 69964 从目标路径稳定运行，安装包 `CUBuildVersion` 为 `59bcf1a`，没有回滚成旧包。
 
-通过真实菜单栏项的 `AXPress` 打开生产 Popover，Cua 截图 `deployed-panel.png` 已人工检查。首次部署时当前账号 7 天额度剩余 30%，历史当前轮显示已用 70%、剩余 30%，与额度区一致；空心当前柱和状态条正常。用户随后指出当前轮应靠右并补逐轮百分比，反馈修订结果在后续部署中补记。
+通过真实菜单栏项的 `AXPress` 打开生产 Popover，Cua 截图 `deployed-panel.png` 已人工检查。首次部署时当前账号 7 天额度剩余 30%，历史当前轮显示已用 70%、剩余 30%，与额度区一致；空心当前柱和状态条正常。用户随后指出当前轮应靠右并补逐轮百分比。
+
+反馈版最终构建为 `v1.7.8-27-gd6e5ead`。一次替换后的驻留检测早于 LaunchAgent 实际启动，自动恢复上一版；改用 `kickstart` 并延长检查后成功运行新包，PID 78451。旧包保留在会话工作台 `deployment/KimiUsage-pre-feedback-retry-59bcf1a.app`。生产 Popover 截图 `deployed-feedback-panel.png` 确认当前轮靠右、日期正下方显示 73%、顶部已用 73% 与底部剩余 27% 一致，单页翻页控件已隐藏；面板保持打开供用户查看。
 
 ## 未验证边界
 

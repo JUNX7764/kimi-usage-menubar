@@ -3296,6 +3296,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func canvas(_ section: QuotaCycleHistorySectionView) -> QuotaCycleChartCanvas? {
             descendants(section).compactMap { $0 as? QuotaCycleChartCanvas }.first
         }
+        func summary(_ section: QuotaCycleHistorySectionView) -> QuotaCycleSummaryView? {
+            descendants(section).compactMap { $0 as? QuotaCycleSummaryView }.first
+        }
+        func strip(_ section: QuotaCycleHistorySectionView) -> QuotaCycleStatusStrip? {
+            descendants(section).compactMap { $0 as? QuotaCycleStatusStrip }.first
+        }
         func hasLabel(_ text: String, in section: QuotaCycleHistorySectionView) -> Bool {
             descendants(section).compactMap { $0 as? NSTextField }
                 .contains { $0.stringValue == text }
@@ -3368,9 +3374,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               canvasValue.contains("最后观测时间"), canvasValue.contains("已用") else {
             return fail("canvas VoiceOver value incomplete: \(String(describing: initialCanvas.accessibilityValue()))")
         }
-        guard let detailLabel = descendants(initial).compactMap({ $0 as? QuotaCycleDetailView }).first?.accessibilityLabel() as? String,
-              detailLabel.contains("已用"), detailLabel.contains("最后观测时间") else {
-            return fail("detail VoiceOver label incomplete")
+        guard let initialSummary = summary(initial), let initialStrip = strip(initial),
+              initialSummary.displayedUsedTextForPreview == items[12].usedText,
+              initialStrip.statusTextForPreview == items[12].statusText,
+              initialStrip.remainingTextForPreview == items[12].remainingText,
+              let stripLabel = initialStrip.accessibilityLabel(),
+              stripLabel.contains("已用"), stripLabel.contains("最后观测时间") else {
+            return fail("summary/status strip or VoiceOver label incomplete")
         }
 
         // B. 整列悬停临时详情：固定选择不动，移出后恢复。
@@ -3382,15 +3392,26 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("hover column 0 must temporarily show item 7, got \(String(describing: initial.displayedItem?.id))")
         }
         guard quotaBrowser.selectedCycleID == nil else { return fail("hover must not pin a selection") }
-        guard let detailView = descendants(initial).compactMap({ $0 as? QuotaCycleDetailView }).first,
-              let exitPoint = Optional(detailView.convert(
-                  CGPoint(x: detailView.bounds.midX, y: detailView.bounds.midY), to: nil)) else {
-            return fail("detail view frame")
+        guard initialCanvas.hoverVisibleForPreview,
+              initialCanvas.hoverWithinBoundsForPreview,
+              initialCanvas.hoverHitTestsForPreview == false,
+              initialCanvas.hoverTextForPreview.contains(items[7].detailTitle),
+              initialCanvas.hoverTextForPreview.contains(items[7].detailValue),
+              summary(initial)?.displayedUsedTextForPreview == items[7].usedText,
+              strip(initial)?.statusTextForPreview == items[7].statusText else {
+            return fail("hover bubble must be complete, inside canvas and hit-transparent")
         }
+        guard let statusView = strip(initial) else { return fail("status strip frame") }
+        let exitPoint = statusView.convert(
+            CGPoint(x: statusView.bounds.midX, y: statusView.bounds.midY), to: nil)
         guard postEnterExit(.mouseExited, at: exitPoint, in: initialCanvas) else {
             return fail("post hover exit event")
         }
-        guard initial.displayedItem?.id == newestID else { return fail("mouse exit must restore the default display") }
+        guard initial.displayedItem?.id == newestID,
+              !initialCanvas.hoverVisibleForPreview,
+              summary(initial)?.displayedUsedTextForPreview == items[12].usedText else {
+            return fail("mouse exit must hide hover and restore the default display")
+        }
 
         // C. 点击固定：真实 mouseDown 落在第 4 列（本屏第 4 个 = 全量下标 10）。
         guard let clickPoint = slotCenter(initial, 3) else { return fail("slot 3 frame") }
@@ -3398,6 +3419,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               postMouse(.leftMouseUp, at: clickPoint, clickCount: 1) else { return fail("post click events") }
         guard quotaBrowser.selectedCycleID == chronologicalIDs[10] else {
             return fail("click must pin item 10, got \(String(describing: quotaBrowser.selectedCycleID))")
+        }
+        guard !initialCanvas.hoverVisibleForPreview,
+              summary(initial)?.displayedUsedTextForPreview == items[10].usedText,
+              strip(initial)?.remainingTextForPreview == items[10].remainingText else {
+            return fail("click must pin summary/status without leaving a hover bubble")
         }
         guard window.firstResponder === initialCanvas else { return fail("click must focus canvas for arrow keys") }
         // 焦点进出回归：画布可成为第一响应者，主动退出后焦点真正离开
@@ -3428,7 +3454,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("left arrow must cross to the older page keeping adjacency")
         }
         guard let paged = section(), hasLabel("第 2/2 页", in: paged) else { return fail("page 2 label") }
-        guard paged.displayedItem?.id == chronologicalIDs[6] else { return fail("page 2 selection display") }
+        guard paged.displayedItem?.id == chronologicalIDs[6],
+              summary(paged)?.displayedUsedTextForPreview == items[6].usedText,
+              strip(paged)?.statusTextForPreview == items[6].statusText else {
+            return fail("page 2 selection display")
+        }
         guard postKey(124, "\u{2192}") else { return fail("post right arrow") }
         guard quotaBrowser.olderPage == 0, quotaBrowser.selectedCycleID == chronologicalIDs[7] else {
             return fail("right arrow must cross back to the newest page")

@@ -59,8 +59,16 @@ codesign --verify --deep --strict KimiUsage.app
 
 Cua `list_windows` 确认预览 PID 65906、CGWindowID 25585，窗口尺寸 356×867pt；`get_window_state` 的截图有效且已人工查看。Popover 没有可关联的 AXWindow，Driver 明确拒绝后台鼠标和键盘输入，因此未执行物理连续悬停、点击和键盘操作。本轮没有请求前台焦点切换授权。
 
+## 本机部署
+
+用户明确要求完成后部署本机。最终构建为 `v1.7.8-24-g59bcf1a`，暂存包自检和签名通过后替换 `/Users/Chester/Applications/KimiUsage.app`，旧包保留于会话工作台 `deployment/KimiUsage-pre-8fa1fd1.app`。
+
+首次 `launchctl bootstrap` 返回 Input/output error，退出恢复路径随后成功加载同一 LaunchAgent；复核确认新进程 PID 69964 从目标路径稳定运行，安装包 `CUBuildVersion` 为 `59bcf1a`，没有回滚成旧包。
+
+通过真实菜单栏项的 `AXPress` 打开生产 Popover，Cua 截图 `deployed-panel.png` 已人工检查。当前账号 7 天额度剩余 30%，历史当前轮显示已用 70%、剩余 30%，与额度区一致；单轮居中、空心当前柱、标题翻页和状态条均正常。真实面板保持打开供用户查看。
+
 ## 未验证边界
 
-- 真实 Kimi 账号长期跨周期观测仍沿用原功能验收的未验证边界；本轮未运行 `--once`，未读取真实凭据。
-- 真实物理输入、VoiceOver 朗读、最低系统版本、TCC、LaunchAgent 和线上更新不在本轮通过范围内。
-- 本记录不表示已经合并、推送、发布或替换用户运行中的 App；本机部署结果在获得用户授权后单独补充。
+- 真实 Kimi 账号长期跨周期观测仍沿用原功能验收的未验证边界；本轮未单独运行 `--once`，生产 App 按既有正常刷新链更新。
+- 真实物理连续悬停、键盘输入和 VoiceOver 朗读仍未验收；最低系统版本、额外 TCC 场景和线上更新不在本轮通过范围内。
+- 本记录不表示已经合并、推送或发布；仅完成用户明确授权的本机部署。

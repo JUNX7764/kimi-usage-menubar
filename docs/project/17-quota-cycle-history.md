@@ -1,6 +1,6 @@
 # 额度周期回顾
 
-> 当前功能口径。最后核对：2026-11-12。实现以 `Sources/QuotaCycle*.swift` 与测试为准。
+> 当前功能口径。最后核对：2026-11-13。实现以 `Sources/QuotaCycle*.swift` 与测试为准。
 
 ## 用户可见行为
 
@@ -13,6 +13,15 @@
 - 详情使用百分比，不显示推算 Token 上限、跨周期浪费总量或平均利用率。
 
 历史从首次成功读取 7 天额度后开始，不回填安装前记录。没有充值卡、主动用卡或被动重置原因分类。
+
+## 视觉结构
+
+- 卡片采用与 CodexUsage 用量简析同构的层级：标题行、主数值、柱图、状态条。翻页按钮与页码位于标题行，折叠箭头保持最右。
+- 主数值为当前展示轮次的已用百分比，19pt semibold 等宽数字配 10pt「已用」；右侧仅保留灰色「上限 100%」图例，不设置额外纵轴或「当前」图例。
+- 图布固定 61pt，柱区 46pt；每根灰柱/已用柱宽 6pt，同组间隙 3pt，圆角 1pt。当前轮的已用柱为描边空心，已结束轮为实心；零用量保留低基线。
+- 选中只增加 `labelColor@0.07` 的列底并强化日期字色，柱体透明度不随选择改变。日期以 9pt 等宽数字直接绘制在图布内。
+- 不足 6 轮时仍按六列计算固定槽宽，实际分组整体居中；不绘制假柱、占位日期或额外空组。
+- 完整双行详情在图内浮层展示，浮层不拦截命中、不增加卡片高度。图下 32pt 状态条仅显示简洁状态与既有剩余语义；完整文案保留在 tooltip 与 VoiceOver。
 
 ## 观测与结束语义
 
@@ -56,7 +65,7 @@
 | `Sources/QuotaCycleHistory.swift` | 观测模型、状态机、快照、浏览器与固定预览数据 |
 | `Sources/QuotaCycleStore.swift` | 加盐作用域、权限、版本校验、原子保存与保存节奏 |
 | `Sources/QuotaCycleCoordinator.swift` | 串行读写、作用域代际、失败回退与快照交付 |
-| `Sources/QuotaCycleHistoryView.swift` | AppKit 双柱、详情、分页、选择、键盘和 VoiceOver |
+| `Sources/QuotaCycleHistoryView.swift` | AppKit 双柱、图内浮层、状态条、分页、选择、键盘和 VoiceOver |
 | `KimiUsage.swift` / `AppDelegate` | 现有刷新样本 gate、生产协调器和面板状态接入 |
 | `main.swift` | 唯一 Swift 顶层可执行入口 |
 
@@ -81,4 +90,4 @@ python3 -m unittest discover -s tests -p '*_test.py' -v
 
 固定形态旗标：`--visual-preview-quota-one`、`--visual-preview-quota-six`、`--visual-preview-quota-long`、`--visual-preview-quota-short`、`--visual-preview-quota-empty`、`--visual-preview-quota-pending`、`--visual-preview-quota-save-failed`、`--visual-preview-quota-load-failed`、`--visual-preview-quota-cross-year`。均可与 `--visual-preview-dark`、`--visual-preview-narrow` 或现有输出/背景旗标组合。所有预览只用内存假数据，不创建真实历史目录。
 
-实际证据和未验证边界见 `docs/verification/2026-11-12-quota-cycle-history.md`。离线测试与假数据原生预览不等于真实账号长期跨周期观测；Cua 前台实际输入仍需明确授权后补验。
+原始功能证据见 `docs/verification/2026-11-12-quota-cycle-history.md`，本轮视觉重构见 `docs/verification/2026-11-13-quota-cycle-history-visual-polish.md`。离线测试与假数据原生预览不等于真实账号长期跨周期观测；Cua 前台实际输入仍需明确授权后补验。

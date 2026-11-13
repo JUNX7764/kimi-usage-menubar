@@ -3255,11 +3255,22 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 return fail("group \(index) overlaps previous group: \(group.slot) vs \(groups[index - 1].slot)")
             }
         }
-        guard let detail = descendants(card).compactMap({ $0 as? QuotaCycleDetailView }).first else {
-            return fail("history detail view missing")
+        guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first,
+              let strip = descendants(card).compactMap({ $0 as? QuotaCycleStatusStrip }).first else {
+            return fail("summary or status strip missing")
         }
-        guard abs(detail.frame.height - QuotaCycleDetailView.fixedHeight) < 1 else {
-            return fail("detail height \(detail.frame.height) != fixed \(QuotaCycleDetailView.fixedHeight)")
+        guard abs(summary.frame.height - QuotaCycleVisualMetrics.summaryHeight) < 1,
+              abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1,
+              abs(strip.frame.height - QuotaCycleVisualMetrics.stripHeight) < 1 else {
+            return fail("Codex-style row heights changed: summary=\(summary.frame.height) "
+                + "canvas=\(canvas.frame.height) strip=\(strip.frame.height)")
+        }
+        let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
+        if let latest = expectedItems.last {
+            guard !visibleTexts.contains(latest.detailTitle),
+                  !visibleTexts.contains(latest.detailValue) else {
+                return fail("legacy two-line detail text still rendered")
+            }
         }
         return true
     }
@@ -6196,11 +6207,20 @@ enum KimiOfflineRegression {
                                    "group \(index) overlaps previous at \(width)pt")
                     }
                 }
-                guard let detail = descendants(card).compactMap({ $0 as? QuotaCycleDetailView }).first else {
-                    throw Failure(description: "quota detail view missing at \(width)pt")
+                guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first,
+                      let strip = descendants(card).compactMap({ $0 as? QuotaCycleStatusStrip }).first else {
+                    throw Failure(description: "quota summary or status strip missing at \(width)pt")
                 }
-                try expect(abs(detail.frame.height - QuotaCycleDetailView.fixedHeight) < 1,
-                           "detail must keep fixed height at \(width)pt, got \(detail.frame.height)")
+                try expect(abs(summary.frame.height - QuotaCycleVisualMetrics.summaryHeight) < 1
+                           && abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1
+                           && abs(strip.frame.height - QuotaCycleVisualMetrics.stripHeight) < 1,
+                           "Codex-style row heights changed at \(width)pt")
+                let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
+                if let latest = previewItems.last {
+                    try expect(!visibleTexts.contains(latest.detailTitle)
+                               && !visibleTexts.contains(latest.detailValue),
+                               "legacy two-line detail text still rendered at \(width)pt")
+                }
                 fullHeight = card.frame.height
             }
             // 短历史（4 轮 < 6 轮）保持同一卡片高度：不伪造历史、不塌缩图区

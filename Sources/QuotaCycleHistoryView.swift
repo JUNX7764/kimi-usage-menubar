@@ -350,7 +350,104 @@ final class QuotaCycleChartCanvas: NSView {
     }
 }
 
-// MARK: - 固定详情（两行、固定高度）
+// MARK: - 主数值与状态条
+
+final class QuotaCycleSummaryView: NSView {
+    private let valueLabel: NSTextField
+    var displayedUsedTextForPreview: String { valueLabel.stringValue }
+
+    override init(frame frameRect: NSRect) {
+        valueLabel = QuotaCycleWidget.label("", size: 19, weight: .semibold,
+            color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true)
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        let row = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 7)
+        let valueStack = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .firstBaseline, spacing: 7)
+        valueStack.addArrangedSubview(valueLabel)
+        valueStack.addArrangedSubview(QuotaCycleWidget.label("已用", size: 10,
+            color: .secondaryLabelColor, wrapping: false))
+        row.addArrangedSubview(valueStack)
+        row.addArrangedSubview(QuotaCycleWidget.spacer())
+        let capLegend = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
+        capLegend.addArrangedSubview(QuotaCycleWidget.legendSwatch(
+            color: NSColor.secondaryLabelColor.withAlphaComponent(QuotaCycleVisualMetrics.capFillAlpha)))
+        capLegend.addArrangedSubview(QuotaCycleWidget.label("上限 100%", size: 10,
+            color: .secondaryLabelColor, wrapping: false))
+        row.addArrangedSubview(capLegend)
+        addSubview(row)
+        QuotaCycleWidget.pin(row, to: self)
+        heightAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.summaryHeight).isActive = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func configure(item: QuotaCycleItem) {
+        valueLabel.stringValue = item.usedText
+        toolTip = "最后观测已用 \(item.usedText)"
+        setAccessibilityLabel("已用 \(item.usedText)")
+    }
+}
+
+final class QuotaCycleStatusStrip: NSView {
+    private let statusLabel: NSTextField
+    private let remainingLabel: NSTextField
+    var statusTextForPreview: String { statusLabel.stringValue }
+    var remainingTextForPreview: String { remainingLabel.stringValue }
+
+    override init(frame frameRect: NSRect) {
+        statusLabel = QuotaCycleWidget.label("", size: 11, wrapping: false)
+        remainingLabel = QuotaCycleWidget.label("", size: 11, weight: .semibold,
+            wrapping: false, monospacedDigits: true)
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = QuotaCycleVisualMetrics.stripCornerRadius
+        for label in [statusLabel, remainingLabel] {
+            label.alignment = .center
+            label.setContentHuggingPriority(.init(1), for: .horizontal)
+        }
+        let row = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
+        row.addArrangedSubview(statusLabel)
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        row.addArrangedSubview(divider)
+        row.addArrangedSubview(remainingLabel)
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            row.heightAnchor.constraint(equalToConstant: 18),
+            statusLabel.widthAnchor.constraint(equalTo: remainingLabel.widthAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.heightAnchor.constraint(equalToConstant: 18),
+            heightAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.stripHeight)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    func configure(item: QuotaCycleItem) {
+        statusLabel.stringValue = item.statusText
+        remainingLabel.stringValue = item.remainingText
+        toolTip = "\(item.detailTitle)\n\(item.detailValue)"
+        setAccessibilityLabel(item.accessibilityText)
+    }
+}
+
+// MARK: - 固定详情（旧交互守门暂用；浮层迁移后删除）
 
 final class QuotaCycleDetailView: NSView {
     /// 两行固定详情（计划 §Task6：详情两行 32–36pt）；高度固定，窄屏/短历史下不变。
@@ -419,12 +516,12 @@ struct QuotaCycleViewState: Equatable {
     var pinnedID: UUID?
 }
 
-/// 额度周期回顾：header（图标+标题+折叠箭头）+ 图例/翻页 + 双柱图 + 日期行 + 固定详情 + 提示。
-/// 展开目标高度约 190pt；交互整列命中：悬停临时详情、点击固定、方向键逐组跨页。
+/// 额度周期回顾：标题行翻页 + 主数值 + 双柱图 + 状态条 + 提示。
+/// 交互整列命中：悬停临时详情、点击固定、方向键逐组跨页。
 final class QuotaCycleHistorySectionView: NSView {
     private let canvas = QuotaCycleChartCanvas()
-    private let detail = QuotaCycleDetailView()
-    private let datesRow = QuotaCycleWidget.stack(orientation: .horizontal, spacing: 0)
+    private let summary = QuotaCycleSummaryView()
+    private let statusStrip = QuotaCycleStatusStrip()
     private let pagerStack = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
     private let pageLabel = QuotaCycleWidget.label("", size: 10, color: .secondaryLabelColor,
                                                    wrapping: false, monospacedDigits: true)
@@ -453,12 +550,21 @@ final class QuotaCycleHistorySectionView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        let root = QuotaCycleWidget.stack(spacing: 4)
+        let root = QuotaCycleWidget.stack(spacing: 6)
         let toggle = QuotaCycleWidget.disclosureToggle(expanded: expanded, section: "额度周期回顾",
                                                        target: target, action: action)
+        var headerTrailing: [NSView] = []
+        if expanded && model.loaded && !state.visibleItems.isEmpty {
+            pagerStack.addArrangedSubview(back)
+            pagerStack.addArrangedSubview(pageLabel)
+            pagerStack.addArrangedSubview(forward)
+            pageLabel.alignment = .center
+            headerTrailing.append(pagerStack)
+        }
+        headerTrailing.append(toggle)
         QuotaCycleWidget.addFullWidth(
-            QuotaCycleWidget.cardHeader(icon: "clock.arrow.circlepath", title: "额度周期回顾",
-                                        trailing: [toggle]), to: root)
+            QuotaCycleWidget.cardHeader(icon: "chart.bar.fill", title: "额度周期回顾",
+                                        trailing: headerTrailing), to: root)
 
         if expanded {
             if !model.loaded {
@@ -472,33 +578,14 @@ final class QuotaCycleHistorySectionView: NSView {
                     "从首次成功读取 7 天额度后开始记录", size: 11, color: .secondaryLabelColor)
                 QuotaCycleWidget.addFullWidth(placeholder, to: root)
             } else {
-                // 图例（上限/已用）居左，翻页控件居右
-                let legend = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
-                legend.addArrangedSubview(QuotaCycleWidget.legendSwatch(
-                    color: NSColor.secondaryLabelColor.withAlphaComponent(0.4)))
-                legend.addArrangedSubview(QuotaCycleWidget.label("上限 100%", size: 10,
-                                                                 color: .secondaryLabelColor, wrapping: false))
-                legend.addArrangedSubview(QuotaCycleWidget.legendSwatch(color: PanelAccent.codex.color))
-                legend.addArrangedSubview(QuotaCycleWidget.label("已用", size: 10,
-                                                                 color: .secondaryLabelColor, wrapping: false))
-                pagerStack.addArrangedSubview(back)
-                pagerStack.addArrangedSubview(pageLabel)
-                pagerStack.addArrangedSubview(forward)
-                pageLabel.alignment = .center
-                let controls = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-                controls.addArrangedSubview(legend)
-                controls.addArrangedSubview(QuotaCycleWidget.spacer())
-                controls.addArrangedSubview(pagerStack)
-                QuotaCycleWidget.addFullWidth(controls, to: root)
-
-                canvas.heightAnchor.constraint(equalToConstant: 72).isActive = true
+                QuotaCycleWidget.addFullWidth(summary, to: root)
+                canvas.heightAnchor.constraint(
+                    equalToConstant: QuotaCycleVisualMetrics.canvasHeight).isActive = true
                 canvas.setAccessibilityLabel("额度周期回顾柱状图，每根灰色柱为额度上限 100%，蓝色柱为已用比例")
                 QuotaCycleWidget.addFullWidth(canvas, to: root)
-                datesRow.distribution = .fillEqually
-                QuotaCycleWidget.addFullWidth(datesRow, to: root)
-                QuotaCycleWidget.addFullWidth(detail, to: root)
+                QuotaCycleWidget.addFullWidth(statusStrip, to: root)
 
-                // 「更早记录」位于详情之下、卡片内：只在已载入的最旧一页且窗口外
+                // 「更早记录」位于状态条之下、卡片内：只在已载入的最旧一页且窗口外
                 // 还有未载入记录时出现（隐藏会让卡片高度漂移，故用 isHidden）。
                 earlierButton.isHidden = true
                 earlierButton.translatesAutoresizingMaskIntoConstraints = false
@@ -525,7 +612,6 @@ final class QuotaCycleHistorySectionView: NSView {
                 earlierButton.target = self
                 earlierButton.action = #selector(extendWindow)
 
-                rebuildDates()
                 pageLabel.stringValue = Self.pageLabelText(state)
                 backButton.isEnabled = state.pageCount > 1 && state.pageOffset < state.pageCount - 1
                 forwardButton.isEnabled = state.pageCount > 1 && state.pageOffset > 0
@@ -568,7 +654,7 @@ final class QuotaCycleHistorySectionView: NSView {
 
     @objc private func extendWindow() { onExtendCallback?() }
 
-    /// 详情/高亮/日期行统一跟随「悬停 ?? 固定 ?? 本屏最新」。悬停为 nil 时恢复固定选择。
+    /// 主数值、状态条与高亮统一跟随「悬停 ?? 固定 ?? 本屏最新」。
     private func updateSelectionDisplay(hovering hoveredID: UUID?,
                                         pinnedOverride: UUID? = nil) {
         let pinned = pinnedOverride ?? viewState.pinnedID
@@ -579,23 +665,11 @@ final class QuotaCycleHistorySectionView: NSView {
         displayedItem = viewState.visibleItems.first { $0.id == effectiveID }
             ?? viewState.visibleItems.last
         if let item = displayedItem {
-            detail.configure(item: item)
+            summary.configure(item: item)
+            statusStrip.configure(item: item)
             canvas.setAccessibilityValue(item.accessibilityText)
         }
-        for (view, item) in zip(datesRow.arrangedSubviews, viewState.visibleItems) {
-            (view as? NSTextField)?.textColor = item.id == effectiveID ? .labelColor : .secondaryLabelColor
-        }
-    }
-
-    private func rebuildDates() {
-        for view in datesRow.arrangedSubviews { datesRow.removeArrangedSubview(view); view.removeFromSuperview() }
-        for item in viewState.visibleItems {
-            let label = QuotaCycleWidget.label(item.startLabel, size: 10,
-                                               color: .secondaryLabelColor, wrapping: false,
-                                               monospacedDigits: true)
-            label.alignment = .center
-            datesRow.addArrangedSubview(label)
-        }
+        canvas.needsDisplay = true
     }
 }
 
@@ -712,8 +786,8 @@ private enum QuotaCycleWidget {
         let swatch = QuotaCycleSwatch(frame: .zero)
         swatch.swatchColor = color
         swatch.translatesAutoresizingMaskIntoConstraints = false
-        swatch.widthAnchor.constraint(equalToConstant: 8).isActive = true
-        swatch.heightAnchor.constraint(equalToConstant: 8).isActive = true
+        swatch.widthAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.barWidth).isActive = true
+        swatch.heightAnchor.constraint(equalToConstant: 10).isActive = true
         return swatch
     }
 }
@@ -724,7 +798,7 @@ private final class QuotaCycleSwatch: NSView {
     override func updateLayer() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = swatchColor.cgColor
-            layer?.cornerRadius = 2
+            layer?.cornerRadius = QuotaCycleVisualMetrics.barCornerRadius
         }
     }
     override func viewDidChangeEffectiveAppearance() {

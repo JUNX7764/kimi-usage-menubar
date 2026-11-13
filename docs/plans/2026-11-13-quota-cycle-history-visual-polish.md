@@ -10,6 +10,8 @@
 
 ---
 
+> **2026-11-13 本机验收修订：** 用户明确要求当前轮始终靠右，并在每轮日期正下方直接显示该轮已用百分比。最终图布由 61pt 调整为 76pt，短历史由居中改为固定六列槽宽右对齐；只有一页时隐藏翻页按钮和页码。下文原计划的 61pt/居中描述由本修订覆盖，其他设计不变。
+
 ## 0. 执行边界与证据
 
 - 执行 Worktree：`/Users/Chester/.proma/agent-workspaces/kimi-usage-menubar/6dbc7f17-5d58-4e45-9d80-7b4ae5326d99/plan-worktree`；分支 `plan/quota-cycle-history-20261112`；本计划基线 `1fd046d`。

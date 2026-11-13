@@ -4,11 +4,11 @@
 
 分支：`plan/quota-cycle-history-20261112`
 
-计划基线：`1fd046d`；视觉实现提交：`1ed2f2e`、`3a1c7af`、`10b12f8`、`42b5caf`。
+计划基线：`1fd046d`；视觉实现提交：`1ed2f2e`、`3a1c7af`、`10b12f8`、`42b5caf`；本机反馈修订：`316d5f3`。
 
 ## 结论
 
-「额度周期回顾」已在不改变历史模型、状态机、存储和浏览逻辑的前提下，重构为 CodexUsage 用量简析同构的标题/主数值/柱图/状态条布局。立柱采用 6pt 宽、46pt 柱区、3pt 组内间隙和 1pt 圆角；当前轮已用柱为空心，短历史按固定六列槽宽居中，完整详情迁入不拦截命中的图内浮层。
+「额度周期回顾」已在不改变历史模型、状态机、存储和浏览逻辑的前提下，重构为 CodexUsage 用量简析同构的标题/主数值/柱图/状态条布局。立柱采用 6pt 宽、46pt 柱区、3pt 组内间隙和 1pt 圆角；当前轮已用柱为空心，短历史按固定六列槽宽右对齐，每轮日期下显示已用百分比，完整详情迁入不拦截命中的图内浮层。
 
 构建、离线自检、78 项 Python 回归、330/300pt 几何、AppKit 合成事件、九张背景矩阵和 Cua 真实 Popover 截图检查通过。Cua 因 Popover AX/CGWindow 关联未解析而拒绝后台输入；真实物理悬停和键盘输入未验收，不以合成事件冒充该项通过。
 
@@ -30,7 +30,7 @@ codesign --verify --deep --strict KimiUsage.app
 结果：
 
 - arm64 / macOS 13 构建通过，SDK 27.2，无编译 warning；ad-hoc 签名验证通过。
-- `--self-test` PASS。新增覆盖展示文案、当前/已结束柱样式、6pt 柱宽、46pt 上限、3pt 间隙、28/61/32pt 行高，以及 1/4 轮固定槽宽和居中。
+- `--self-test` PASS。新增覆盖展示文案、当前/已结束柱样式、6pt 柱宽、46pt 上限、3pt 间隙、28/76/32pt 行高、逐轮日期与百分比标签，以及 1/4 轮固定槽宽和右对齐。
 - 330/300pt 几何均 PASS；六组双柱不重叠、不越界，已用不超过上限，旧双行详情不再作为可见文本渲染。
 - 额度历史交互 PASS：图内浮层内容、完整边界、hit-transparent、移出隐藏、点击固定、顶部/底部同步、方向键跨页、翻页、12→24 扩展、刷新保持、折叠重开、作用域重置和 VoiceOver。
 - 通用面板交互与键盘事件均 PASS。
@@ -46,7 +46,7 @@ codesign --verify --deep --strict KimiUsage.app
 ```
 
 - `full-light.png` / `full-dark.png`：六轮默认页，检查主数值、图例、柱形、日期和状态条。
-- `one-light.png` / `short-light.png`：一轮居中、四轮固定槽宽，无假柱或假日期。
+- `one-light.png` / `short-light.png`：第一轮视觉验收的一轮居中、四轮固定槽宽；后续 `feedback-one-light.png` / `feedback-full-light.png` 按用户反馈改为右对齐并逐轮显示百分比。
 - `pending-narrow.png`：300pt 下「窗口变化待确认」与剩余完整可读。
 - `cross-year.png`：12 月与 01/01 标签保持正确。
 - `backgrounds/`：纯色、经典毛玻璃、液态玻璃 × 浅色/深色/降低透明度共 9 张，全部生成；已检查柱体、文字和选中底色可辨。
@@ -65,7 +65,7 @@ Cua `list_windows` 确认预览 PID 65906、CGWindowID 25585，窗口尺寸 356�
 
 首次 `launchctl bootstrap` 返回 Input/output error，退出恢复路径随后成功加载同一 LaunchAgent；复核确认新进程 PID 69964 从目标路径稳定运行，安装包 `CUBuildVersion` 为 `59bcf1a`，没有回滚成旧包。
 
-通过真实菜单栏项的 `AXPress` 打开生产 Popover，Cua 截图 `deployed-panel.png` 已人工检查。当前账号 7 天额度剩余 30%，历史当前轮显示已用 70%、剩余 30%，与额度区一致；单轮居中、空心当前柱、标题翻页和状态条均正常。真实面板保持打开供用户查看。
+通过真实菜单栏项的 `AXPress` 打开生产 Popover，Cua 截图 `deployed-panel.png` 已人工检查。首次部署时当前账号 7 天额度剩余 30%，历史当前轮显示已用 70%、剩余 30%，与额度区一致；空心当前柱和状态条正常。用户随后指出当前轮应靠右并补逐轮百分比，反馈修订结果在后续部署中补记。
 
 ## 未验证边界
 

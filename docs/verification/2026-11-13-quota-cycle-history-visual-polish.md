@@ -70,6 +70,8 @@ Cua `list_windows` 确认预览 PID 65906、CGWindowID 25585，窗口尺寸 356�
 
 反馈版最终构建为 `v1.7.8-27-gd6e5ead`。一次替换后的驻留检测早于 LaunchAgent 实际启动，自动恢复上一版；改用 `kickstart` 并延长检查后成功运行新包，PID 78451。旧包保留在会话工作台 `deployment/KimiUsage-pre-feedback-retry-59bcf1a.app`。生产 Popover 截图 `deployed-feedback-panel.png` 确认当前轮靠右、日期正下方显示 73%、顶部已用 73% 与底部剩余 27% 一致，单页翻页控件已隐藏；面板保持打开供用户查看。
 
+二次反馈版最终构建为 `v1.7.8-30-g02e76af`。一次 LaunchAgent 驻留时序失败已自动恢复；随后以 `open` 启动新包并确认 LaunchAgent 正在运行，最终 PID 90849。旧包保留在 `deployment/KimiUsage-pre-feedback2-open-d6e5ead.app`。本轮 AXPress/前台激活后均未能发现生产 Popover 窗口，因此未获得最终真实面板截图；最终视觉检查基于上述固定数据原生预览，生产实例版本与驻留已核实。
+
 ## 未验证边界
 
 - 真实 Kimi 账号长期跨周期观测仍沿用原功能验收的未验证边界；本轮未单独运行 `--once`，生产 App 按既有正常刷新链更新。

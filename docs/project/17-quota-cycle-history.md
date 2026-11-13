@@ -19,9 +19,9 @@
 - 卡片采用与 CodexUsage 用量简析同构的层级：标题行、主数值、柱图。翻页按钮与页码位于标题行，折叠箭头保持最右；不设置底部状态/余量栏。
 - 主数值为当前展示轮次的已用百分比，19pt semibold 等宽数字配 10pt「已用」；右侧仅保留灰色「上限 100%」图例，不设置额外纵轴或「当前」图例。
 - 图布固定 96pt，柱区 66pt；每根灰柱/已用柱宽 6pt，同组间隙 3pt，圆角 1pt。当前轮的已用柱为描边空心，已结束轮为实心；零用量保留低基线。
-- 选中只增加 `PanelAccent.codex.color@0.10` 的浅蓝列底并强化日期字色，柱体透明度不随选择改变。日期以 9pt 等宽数字绘制，每轮已用百分比以 10pt semibold 等宽数字紧跟在对应日期正下方。
+- 选中以列级强调表达：日期与百分比使用品牌蓝，柱组底部加 2pt 品牌蓝基线；无整列底板、无整幅焦点外框（点击固定后画布仍是第一响应者，可方向键逐组），柱体透明度不随选择改变。日期以 9pt 等宽数字绘制，每轮已用百分比以 10pt semibold 等宽数字紧跟在对应日期正下方。
 - 不足 6 轮时仍按六列计算固定槽宽，实际分组整体靠右，当前轮始终位于最右；不绘制假柱、占位日期或额外空组。只有一页时隐藏无效翻页按钮和页码。
-- 完整双行详情在图内浮层展示，浮层不拦截命中、不增加卡片高度。结束状态、当前剩余或到期未用只保留在浮层、tooltip 与 VoiceOver，不占用图下常驻区域。
+- 完整双行详情在画布原生延迟 tooltip 展示（tooltip 设在画布自身，真实命中区域有效），不再有图内即时浮层、不增加卡片高度。结束状态、当前剩余或到期未用只保留在 tooltip 与 VoiceOver，不占用图下常驻区域。
 
 ## 观测与结束语义
 
@@ -65,7 +65,7 @@
 | `Sources/QuotaCycleHistory.swift` | 观测模型、状态机、快照、浏览器与固定预览数据 |
 | `Sources/QuotaCycleStore.swift` | 加盐作用域、权限、版本校验、原子保存与保存节奏 |
 | `Sources/QuotaCycleCoordinator.swift` | 串行读写、作用域代际、失败回退与快照交付 |
-| `Sources/QuotaCycleHistoryView.swift` | AppKit 双柱、图内浮层、分页、选择、键盘和 VoiceOver |
+| `Sources/QuotaCycleHistoryView.swift` | AppKit 双柱、画布 tooltip、分页、选择、键盘和 VoiceOver |
 | `KimiUsage.swift` / `AppDelegate` | 现有刷新样本 gate、生产协调器和面板状态接入 |
 | `main.swift` | 唯一 Swift 顶层可执行入口 |
 

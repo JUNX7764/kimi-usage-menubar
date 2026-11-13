@@ -107,11 +107,14 @@ enum DataFreshness {
     }
 }
 
-/// 日图覆盖口径：有记录的日期恒为已覆盖；缺键日只有在首轮扫描完成且本轮无失败来源时
-/// 才可证为真实 0，否则缺失占位（数据不足），绝不补零伪装趋势。
+/// 日图覆盖口径：有记录的日期恒为已覆盖；缺键日只有在首轮扫描完成、本轮无失败来源
+/// 且无个别文件失败时才可证为真实 0，否则缺失占位（数据不足），绝不补零伪装趋势。
+/// 单文件失败不置错误、推进成功时间，但统计可能偏少，覆盖仍不完全。
 enum DailyCoverage {
-    static func missingDayCovered(scanCompleted: Bool, workError: String?, cliError: String?) -> Bool {
+    static func missingDayCovered(scanCompleted: Bool, workError: String?, cliError: String?,
+                                  workFailedFiles: Int = 0, cliFailedFiles: Int = 0) -> Bool {
         scanCompleted && workError == nil && cliError == nil
+            && workFailedFiles == 0 && cliFailedFiles == 0
     }
 }
 
@@ -247,6 +250,9 @@ struct UsageData {
     var monthError: String?
     var workTokensError: String?   // Work 会话目录已安装但不可读（保留旧值、不推进成功时间）
     var cliTokensError: String?    // API 客户端来源全部不可读（同上）
+    /// 个别会话文件读取失败数：不置错误、推进成功时间，但覆盖不完全（缺键日不证零、比较数据不足）
+    var workTokensFailedFiles: Int = 0
+    var cliTokensFailedFiles: Int = 0
     // v1.5 用量洞察：合并视图（Work + API 客户端）、逐日序列与逐工具贡献，同一扫描快照派生
     var mergedTokens: (today: TokenStat, week: TokenStat, month: TokenStat)?
     var daily: [String: [Double]] = [:]
@@ -419,6 +425,10 @@ enum TokenAggregator {
         var cli: (TokenStat, TokenStat, TokenStat)
         var workError: String?
         var cliError: String?
+        /// 个别会话文件读取失败数（>0 = 该来源覆盖不完全：不报错、推进成功时间，
+        /// 但缺键日不证零、比较条显示数据不足）
+        var workFailedFiles: Int
+        var cliFailedFiles: Int
         var merged: (today: TokenStat, week: TokenStat, month: TokenStat)
         var daily: [String: [Double]]
         var tools: [ToolStats]
@@ -473,10 +483,11 @@ enum TokenAggregator {
         for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
-            workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil,
-                                   failedFiles: workScan.failedFiles),
+            workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
             cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
-                                  hermesOK: hermesOK, zcodeOK: zcodeOK, failedFiles: cliScan.failedFiles),
+                                  hermesOK: hermesOK, zcodeOK: zcodeOK),
+            workFailedFiles: workScan.failedFiles,
+            cliFailedFiles: cliScan.failedFiles,
             merged: statWindows(mergedDays),
             daily: dailyTotals(mergedDays),
             tools: tools)
@@ -501,14 +512,14 @@ enum TokenAggregator {
     /// 失败面判定：有已安装来源（目录 / sqlite 库存在）但无一可读 → 错误；
     /// 全部未安装（路径不存在）返回 nil——没装对应工具时该来源自然为 0，不算失败；
     /// 部分来源失败时返回提示，并保留失败来源最近一次贡献。
-    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil,
-                            failedFiles: Int = 0) -> String? {
+    /// 个别文件打不开（权限/损坏）不产生错误：其余文件仍统计出数，该来源视为本轮扫描
+    /// 成功、成功时间正常推进；覆盖不完全由 failedFiles 计数单独表达（见 BothStats / UsageData），
+    /// 缺键日不证零、比较条显示数据不足，避免把不确定数据包装成精确比较。
+    static func sourceError(installed: Int, enumerated: Int, hermesOK: Bool?, zcodeOK: Bool? = nil) -> String? {
         let anySource = installed > 0 || hermesOK != nil || zcodeOK != nil
         let anySuccess = enumerated > 0 || hermesOK == true || zcodeOK == true
         if anySource && !anySuccess { return "会话目录 / 客户端用量数据库均不可读" }
         if enumerated < installed || hermesOK == false || zcodeOK == false { return "部分来源读取失败，显示上次数据" }
-        // 个别文件打不开（权限/损坏）时数值会安静变小，必须显式提示而不是静默缩水
-        if failedFiles > 0 { return "\(failedFiles) 个会话文件读取失败，统计可能偏少" }
         return nil
     }
 
@@ -537,7 +548,8 @@ enum TokenAggregator {
 
     /// 增量扫描 roots 下的 jsonl：未变化文件只 stat，追加文件只读新增字节；
     /// 已被删除的文件从状态中剔除（旧全量逻辑下删除即不再计入，保持一致）。
-    /// 返回 (已安装 root 数, 成功枚举 root 数, 单文件读取失败数)：目录不存在 = 未安装，不计入失败面
+    /// 返回 (已安装 root 数, 成功枚举 root 数, 单文件读取失败数)：目录不存在 = 未安装；
+    /// 单文件失败只计入 failedFiles 表达覆盖不完全，不置来源错误
     static func scan(roots: [String], kimiOnly: Bool,
                      into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int, okRoots: [String], failedFiles: Int) {
         let now = Date()
@@ -3273,6 +3285,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                   !visibleTexts.contains(latest.detailValue) else {
                 return fail("legacy two-line detail text still rendered")
             }
+            // 完整详情经画布原生延迟 tooltip（真实命中区域），内容随默认选中项
+            guard canvas.toolTipForPreview?.contains(latest.detailTitle) == true,
+                  canvas.toolTipForPreview?.contains(latest.detailValue) == true else {
+                return fail("canvas tooltip must carry the selected cycle details")
+            }
+        }
+        guard canvas.canvasSubviewCountForPreview == 0 else {
+            return fail("in-canvas hover overlay view must be removed")
+        }
+        guard canvas.focusRingTypeForPreview == .none else {
+            return fail("canvas must not draw a full-canvas focus ring outline")
         }
         return true
     }
@@ -3325,7 +3348,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         /// NSWindow 派发给跟踪区，AppKit 限制，故悬停断言以 enter/exit 为准）。
         func postEnterExit(_ type: NSEvent.EventType, at point: CGPoint,
                            in canvas: QuotaCycleChartCanvas) -> Bool {
-            guard let area = canvas.trackingAreas.first,
+            // 画布设置 toolTip 后 AppKit 会附加一条 NSToolTipManager 跟踪区，
+            // 必须选画布自己的跟踪区（owner === canvas），否则合成事件会派发给 tooltip 管理器。
+            guard let area = canvas.trackingAreas.first(where: { $0.owner === canvas }),
                   let event = NSEvent.enterExitEvent(with: type, location: point, modifierFlags: [],
                       timestamp: timestamp, windowNumber: window.windowNumber, context: nil,
                       eventNumber: 0, trackingNumber: area.hash,
@@ -3378,7 +3403,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("summary does not match the default current cycle")
         }
 
-        // B. 整列悬停临时详情：固定选择不动，移出后恢复。
+        // B. 整列悬停临时联动：固定选择不动，tooltip/主数值跟随悬停项，移出后恢复。
+        // 新视觉约束：无图内浮层子视图、无整幅焦点外框。
+        guard initialCanvas.canvasSubviewCountForPreview == 0 else {
+            return fail("chart must not render any in-canvas overlay view")
+        }
+        guard initialCanvas.focusRingTypeForPreview == .none else {
+            return fail("chart must not draw a full-canvas focus ring")
+        }
         guard let hoverPoint = slotCenter(initial, 0) else { return fail("slot 0 frame") }
         guard postEnterExit(.mouseEntered, at: hoverPoint, in: initialCanvas) else {
             return fail("post hover enter event")
@@ -3387,13 +3419,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("hover column 0 must temporarily show item 7, got \(String(describing: initial.displayedItem?.id))")
         }
         guard quotaBrowser.selectedCycleID == nil else { return fail("hover must not pin a selection") }
-        guard initialCanvas.hoverVisibleForPreview,
-              initialCanvas.hoverWithinBoundsForPreview,
-              initialCanvas.hoverHitTestsForPreview == false,
-              initialCanvas.hoverTextForPreview.contains(items[7].detailTitle),
-              initialCanvas.hoverTextForPreview.contains(items[7].detailValue),
+        guard initialCanvas.toolTipForPreview?.contains(items[7].detailTitle) == true,
+              initialCanvas.toolTipForPreview?.contains(items[7].detailValue) == true,
               summary(initial)?.displayedUsedTextForPreview == items[7].usedText else {
-            return fail("hover bubble must be complete, inside canvas and hit-transparent")
+            return fail("hover must link the canvas tooltip and top value to the hovered cycle")
         }
         guard let summaryView = summary(initial) else { return fail("summary frame") }
         let exitPoint = summaryView.convert(
@@ -3402,9 +3431,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("post hover exit event")
         }
         guard initial.displayedItem?.id == newestID,
-              !initialCanvas.hoverVisibleForPreview,
+              initialCanvas.hoveredID == nil,
+              initialCanvas.toolTipForPreview?.contains(items[12].detailTitle) == true,
               summary(initial)?.displayedUsedTextForPreview == items[12].usedText else {
-            return fail("mouse exit must hide hover and restore the default display")
+            return fail("mouse exit must restore the default display and tooltip")
         }
 
         // C. 点击固定：真实 mouseDown 落在第 4 列（本屏第 4 个 = 全量下标 10）。
@@ -3414,9 +3444,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard quotaBrowser.selectedCycleID == chronologicalIDs[10] else {
             return fail("click must pin item 10, got \(String(describing: quotaBrowser.selectedCycleID))")
         }
-        guard !initialCanvas.hoverVisibleForPreview,
+        guard initialCanvas.hoveredID == nil,
+              initialCanvas.toolTipForPreview?.contains(items[10].detailTitle) == true,
+              initialCanvas.toolTipForPreview?.contains(items[10].detailValue) == true,
               summary(initial)?.displayedUsedTextForPreview == items[10].usedText else {
-            return fail("click must pin summary without leaving a hover bubble")
+            return fail("click must pin summary and tooltip to the clicked cycle without leaving a hover")
         }
         guard window.firstResponder === initialCanvas else { return fail("click must focus canvas for arrow keys") }
         // 焦点进出回归：画布可成为第一响应者，主动退出后焦点真正离开
@@ -4818,6 +4850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.cliTokensToday = d.cli.0; $0.cliTokens7d = d.cli.1; $0.cliTokens30d = d.cli.2
                     $0.workTokensError = d.workError
                     $0.cliTokensError = d.cliError
+                    $0.workTokensFailedFiles = d.workFailedFiles
+                    $0.cliTokensFailedFiles = d.cliFailedFiles
                     $0.mergedTokens = d.merged
                     $0.daily = d.daily
                     $0.tools = d.tools
@@ -4861,6 +4895,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.tokensToday = old.tokensToday; merged.tokens7d = old.tokens7d; merged.tokens30d = old.tokens30d
                 merged.cliTokensToday = old.cliTokensToday; merged.cliTokens7d = old.cliTokens7d; merged.cliTokens30d = old.cliTokens30d
                 merged.workTokensError = old.workTokensError; merged.cliTokensError = old.cliTokensError
+                merged.workTokensFailedFiles = old.workTokensFailedFiles
+                merged.cliTokensFailedFiles = old.cliTokensFailedFiles
                 merged.mergedTokens = old.mergedTokens; merged.daily = old.daily
                 merged.tools = old.tools; merged.staleTokensInWindow = old.staleTokensInWindow
                 // 快轮不触发扫描：首轮完成状态沿旧值保留，扫描完成后不会退回未知态
@@ -5027,6 +5063,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "workTokens": usage.workTokensError ?? "",
                 "cliTokens": usage.cliTokensError ?? ""
             ],
+            "failedFiles": [
+                "workTokens": usage.workTokensFailedFiles,
+                "cliTokens": usage.cliTokensFailedFiles
+            ],
             "fiveHourStale": fiveHourStale,
             "sevenDayStale": sevenDayStale,
             "monthStale": monthStale,
@@ -5119,7 +5159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 覆盖口径：首轮扫描未完成时一切缺失日都不可证实，日图显示缺口、比较显示数据不足
         let coverageOK = DailyCoverage.missingDayCovered(scanCompleted: usage.scanCompleted,
                                                          workError: usage.workTokensError,
-                                                         cliError: usage.cliTokensError)
+                                                         cliError: usage.cliTokensError,
+                                                         workFailedFiles: usage.workTokensFailedFiles,
+                                                         cliFailedFiles: usage.cliTokensFailedFiles)
         let comparison = TokenAggregator.comparisons(daily: usage.daily,
                                                      staleTokensInWindow: usage.staleTokensInWindow,
                                                      coverageProven: coverageOK)
@@ -6270,7 +6312,16 @@ enum KimiOfflineRegression {
                     try expect(!visibleTexts.contains(latest.detailTitle)
                                && !visibleTexts.contains(latest.detailValue),
                                "legacy two-line detail text still rendered at \(width)pt")
+                    // 完整详情只经画布原生延迟 tooltip：内容正确且随默认选中项联动
+                    try expect((canvas.toolTip ?? "").contains(latest.detailTitle)
+                               && (canvas.toolTip ?? "").contains(latest.detailValue),
+                               "canvas tooltip must carry the selected cycle details at \(width)pt")
                 }
+                // 选中视觉：无图内浮层子视图、无整幅焦点外框（列级品牌蓝高亮 + 柱组基线强调）
+                try expect(canvas.subviews.isEmpty,
+                           "in-canvas hover overlay must be removed at \(width)pt")
+                try expect(canvas.focusRingTypeForPreview == .none,
+                           "canvas must not draw a full-canvas focus ring outline at \(width)pt")
                 fullHeight = card.frame.height
                 if width == 330 { fullSlotWidth = groups[0].slot.width }
             }
@@ -6507,6 +6558,17 @@ enum KimiOfflineRegression {
                        "partial failure was not reported")
             try expect(TokenAggregator.sourceError(installed: 0, enumerated: 0, hermesOK: nil, zcodeOK: nil) == nil,
                        "not-installed sqlite sources were reported as failure")
+            // 覆盖口径（计数语义）：个别文件失败时覆盖不完全——缺键日不证零、比较数据不足；
+            // 干净扫描才可证零。真实损坏文件的 scan 级证据见下方「partial-scan」用例。
+            try expect(!DailyCoverage.missingDayCovered(scanCompleted: true, workError: nil, cliError: nil,
+                                                      workFailedFiles: 2),
+                       "partial file failure still proved missing days as real zero")
+            try expect(DailyCoverage.missingDayCovered(scanCompleted: true, workError: nil, cliError: nil),
+                       "clean scan did not prove missing days as real zero")
+            let partialMark = Date(timeIntervalSince1970: 1_000)
+            try expect(DataFreshness.updated(partialMark, succeeded: false,
+                                             at: partialMark.addingTimeInterval(60)) == partialMark,
+                       "real source failure must not advance the tokens success timestamp")
             // 窗口口径：含今天共 7/30 个日历日（Calendar 运算；固定 86400 秒在 DST 日界会漂移一天）
             let cutNow = Date(timeIntervalSince1970: 1_800_000_000)
             let cuts = TokenAggregator.windowCutoffs(now: cutNow)
@@ -6810,6 +6872,44 @@ enum KimiOfflineRegression {
                        "work format upgrade lost or doubled contributions")
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &workFiles)
             try expect(workFiles.values.first.map(totals) == [35, 2], "work record-only rescan is wrong")
+
+            // 个别文件失败（真实损坏文件）：目录里一个健康 jsonl + 一个含换行的非法 UTF-8
+            // jsonl（字节可读、String 解码失败，不依赖权限位）。scan 必须 installed/enumerated
+            // 成功且 failedFiles==1；该来源不置错误、成功时间照常推进，但覆盖不完全。
+            let partialRoot = root.appendingPathComponent("partial-scan").path
+            try FileManager.default.createDirectory(atPath: partialRoot, withIntermediateDirectories: true)
+            try (try jsonLine(loopMirror) + "\n")
+                .write(toFile: partialRoot + "/ok.jsonl", atomically: true, encoding: .utf8)
+            var broken = Data([0xFF, 0xFE, 0x0A, 0x41])   // 非法 UTF-8 序列 + 换行
+            broken.append(Data("\n".utf8))
+            try broken.write(to: URL(fileURLWithPath: partialRoot + "/broken.jsonl"))
+            var partialFiles: [String: TokenAggregator.FileScanState] = [:]
+            let partialScan = TokenAggregator.scan(roots: [partialRoot], kimiOnly: false, into: &partialFiles)
+            try expect(partialScan.installed == 1 && partialScan.enumerated == 1
+                       && partialScan.failedFiles == 1,
+                       "single corrupt file was not reported exactly once as a partial failure")
+            try expect(partialFiles.values.first.map(totals) == [35, 2],
+                       "healthy file contribution lost next to a corrupt file")
+            let partialError = TokenAggregator.sourceError(installed: partialScan.installed,
+                                                          enumerated: partialScan.enumerated,
+                                                          hermesOK: nil)
+            try expect(partialError == nil,
+                       "partial file failure surfaced as a source error")
+            try expect(!DailyCoverage.missingDayCovered(scanCompleted: true, workError: partialError,
+                                                      cliError: nil, workFailedFiles: partialScan.failedFiles),
+                       "partial scan proved missing days as real zero")
+            let partialBefore = Date(timeIntervalSince1970: 1_000)
+            try expect(DataFreshness.updated(partialBefore, succeeded: partialError == nil,
+                                             at: partialBefore.addingTimeInterval(60)) != partialBefore,
+                       "partial file failure must advance the tokens success timestamp")
+            // 对照：同目录整来源不可读时仍置错误、不推进成功时间（提示保留）
+            let deadError = TokenAggregator.sourceError(installed: 1, enumerated: 0, hermesOK: nil)
+            try expect(deadError != nil && DataFreshness.updated(partialBefore, succeeded: deadError == nil,
+                                                                 at: partialBefore.addingTimeInterval(60)) == partialBefore,
+                       "unreadable source lost its error or advanced the success timestamp")
+            // 损坏文件持续失败但不再重复膨胀计数（offset 未推进，每轮只计一次）
+            let rescan = TokenAggregator.scan(roots: [partialRoot], kimiOnly: false, into: &partialFiles)
+            try expect(rescan.failedFiles == 1, "corrupt file failure count changed on rescan")
 
             // 同一文件中的历史独有 loop 保留，镜像只计一次。
             let uniqueLoop: [String: Any] = ["type": "context.append_loop_event", "time": eventMS,

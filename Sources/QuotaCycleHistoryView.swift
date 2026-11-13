@@ -14,8 +14,9 @@ enum QuotaCycleVisualMetrics {
     static let barWidth: CGFloat = 6
     static let barGap: CGFloat = 3
     static let barCornerRadius: CGFloat = 1
-    static let selectionFillAlpha: CGFloat = 0.10
     static let capFillAlpha: CGFloat = 0.16
+    /// 选中列柱组底部基线强调的厚度。
+    static let selectionAccentHeight: CGFloat = 2
 }
 
 /// 一根双柱组对应的一个可展示轮次。
@@ -164,70 +165,8 @@ enum QuotaCyclePresentation {
     }
 }
 
-// MARK: - 图内详情浮层
-
-private final class QuotaCycleHoverLabel: NSView {
-    private let horizontalInset: CGFloat = 8
-    private let verticalInset: CGFloat = 6
-    private let lineSpacing: CGFloat = 2
-    private let dateFont = NSFont.systemFont(ofSize: 10)
-    private let valueFont = NSFont.systemFont(ofSize: 10, weight: .medium)
-    private var date = ""
-    private var value = ""
-    var stringValue: String { "\(date)\n\(value)" }
-    override var isFlipped: Bool { true }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    func setText(date: String, value: String) {
-        self.date = date
-        self.value = value
-        toolTip = stringValue
-        needsDisplay = true
-    }
-
-    private func size(of text: String, font: NSFont) -> NSSize {
-        (text as NSString).size(withAttributes: [.font: font])
-    }
-
-    func fitToContent() {
-        let dateSize = size(of: date, font: dateFont)
-        let valueSize = size(of: value, font: valueFont)
-        frame.size = NSSize(
-            width: ceil(max(dateSize.width, valueSize.width)) + horizontalInset * 2,
-            height: ceil(dateSize.height + valueSize.height + lineSpacing) + verticalInset * 2)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        let background = NSColor(name: nil) { appearance in
-            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            return NSColor(calibratedWhite: dark ? 0.20 : 0.92, alpha: 0.96)
-        }
-        let bubble = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.25, dy: 0.25), xRadius: 6, yRadius: 6)
-        background.setFill()
-        bubble.fill()
-        NSColor.labelColor.withAlphaComponent(0.10).setStroke()
-        bubble.lineWidth = 0.5
-        bubble.stroke()
-        let dateSize = size(of: date, font: dateFont)
-        let valueSize = size(of: value, font: valueFont)
-        let width = max(0, bounds.width - horizontalInset * 2)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineBreakMode = .byTruncatingTail
-        (date as NSString).draw(
-            with: NSRect(x: horizontalInset, y: verticalInset, width: width, height: dateSize.height),
-            options: [.usesLineFragmentOrigin],
-            attributes: [.font: dateFont, .foregroundColor: NSColor.secondaryLabelColor,
-                         .paragraphStyle: paragraph])
-        (value as NSString).draw(
-            with: NSRect(x: horizontalInset, y: verticalInset + dateSize.height + lineSpacing,
-                         width: width, height: valueSize.height),
-            options: [.usesLineFragmentOrigin],
-            attributes: [.font: valueFont, .foregroundColor: NSColor.labelColor,
-                         .paragraphStyle: paragraph])
-    }
-}
-
 // MARK: - 图表画布（双柱：灰 = 上限 100%，Kimi 动态蓝 = 已用比例）
+// 完整详情只经画布原生延迟 tooltip 呈现（真实命中区域有效），不再有图内即时浮层。
 
 final class QuotaCycleChartCanvas: NSView {
     struct GroupFrame: Equatable {
@@ -255,12 +194,12 @@ final class QuotaCycleChartCanvas: NSView {
     /// 左右方向键逐组（可能跨页/触发扩展，由控制器裁决）。
     var onStep: ((Int) -> Void)?
     private var trackingArea: NSTrackingArea?
-    private let hover = QuotaCycleHoverLabel()
 
-    var hoverVisibleForPreview: Bool { !hover.isHidden }
-    var hoverTextForPreview: String { hover.stringValue }
-    var hoverWithinBoundsForPreview: Bool { bounds.contains(hover.frame) }
-    var hoverHitTestsForPreview: Bool { hover.hitTest(.zero) != nil }
+    /// 预览断言：完整详情经画布原生延迟 tooltip 承载（真实命中区域有效），无图内浮层子视图。
+    var toolTipForPreview: String? { toolTip }
+    var canvasSubviewCountForPreview: Int { subviews.count }
+    /// 预览断言：点击固定后画布可键盘逐组，但不绘制整幅系统焦点外框。
+    var focusRingTypeForPreview: NSFocusRingType { focusRingType }
 
     enum UsedBarStyle: Equatable { case filled, outlined }
 
@@ -273,8 +212,9 @@ final class QuotaCycleChartCanvas: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         translatesAutoresizingMaskIntoConstraints = false
-        hover.isHidden = true
-        addSubview(hover)
+        // 点击固定后画布是第一响应者（方向键逐组），但不绘制整幅焦点外框；
+        // 键盘当前列由列级高亮（品牌蓝日期/百分比 + 柱组基线强调）表达。
+        focusRingType = .none
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -282,19 +222,17 @@ final class QuotaCycleChartCanvas: NSView {
     /// 当前实际高亮的轮次（悬停优先）。
     var effectiveID: UUID? { hoveredID ?? fallbackID }
 
+    private func effectiveItem() -> QuotaCycleItem? {
+        items.first { $0.id == effectiveID } ?? items.last
+    }
+
+    /// 完整详情只经画布原生延迟 tooltip 呈现；tooltip 设在画布自身，命中区域真实有效，
+    /// 并随「悬停 ?? 固定 ?? 本屏最新」联动。
+    private func syncTooltip(to item: QuotaCycleItem?) {
+        toolTip = item.map { "\($0.detailTitle)\n\($0.detailValue)" }
+    }
+
     override var acceptsFirstResponder: Bool { true }
-    override var focusRingMaskBounds: NSRect { bounds }
-    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 3, yRadius: 3).fill() }
-    override func becomeFirstResponder() -> Bool {
-        let accepted = super.becomeFirstResponder()
-        if accepted { noteFocusRingMaskChanged() }
-        return accepted
-    }
-    override func resignFirstResponder() -> Bool {
-        let accepted = super.resignFirstResponder()
-        if accepted { noteFocusRingMaskChanged() }
-        return accepted
-    }
 
     var groupFramesForTest: [GroupFrame] { groupFrames(in: bounds) }
     var labelFramesForTest: [LabelFrame] { labelFrames(in: bounds) }
@@ -347,11 +285,7 @@ final class QuotaCycleChartCanvas: NSView {
         let effective = effectiveID
         guard !frames.isEmpty else { return }
         for (index, (frame, item)) in zip(frames, items).enumerated() {
-            if item.id == effective {
-                PanelAccent.codex.color.withAlphaComponent(QuotaCycleVisualMetrics.selectionFillAlpha).setFill()
-                NSRect(x: frame.slot.minX, y: 0, width: frame.slot.width,
-                       height: QuotaCycleVisualMetrics.barAreaHeight).fill()
-            }
+            let selected = item.id == effective
             let capPath = NSBezierPath(roundedRect: frame.cap,
                 xRadius: QuotaCycleVisualMetrics.barCornerRadius,
                 yRadius: QuotaCycleVisualMetrics.barCornerRadius)
@@ -369,14 +303,24 @@ final class QuotaCycleChartCanvas: NSView {
                 usedPath.lineWidth = 1
                 usedPath.stroke()
             }
+            if selected {
+                // 选中列的轻量柱体强调：柱组底部 2pt 品牌蓝基线（无整列底板、无整幅外框）
+                let pairX = frame.cap.minX
+                let pairWidth = frame.used.maxX - pairX
+                PanelAccent.codex.color.setFill()
+                NSRect(x: pairX,
+                       y: QuotaCycleVisualMetrics.barAreaHeight - QuotaCycleVisualMetrics.selectionAccentHeight,
+                       width: pairWidth,
+                       height: QuotaCycleVisualMetrics.selectionAccentHeight).fill()
+            }
             let labels = labelFrames(in: bounds)[index]
             (item.startLabel as NSString).draw(at: labels.date.origin, withAttributes: [
                 .font: Self.dateFont,
-                .foregroundColor: item.id == effective ? NSColor.labelColor : NSColor.secondaryLabelColor
+                .foregroundColor: selected ? PanelAccent.codex.color : NSColor.secondaryLabelColor
             ])
             (item.usedText as NSString).draw(at: labels.percent.origin, withAttributes: [
                 .font: Self.percentFont,
-                .foregroundColor: item.id == effective
+                .foregroundColor: selected
                     ? PanelAccent.codex.color : NSColor.labelColor
             ])
         }
@@ -393,10 +337,8 @@ final class QuotaCycleChartCanvas: NSView {
     // 面板重建、Popover 关开切换：不依赖 AppKit 时机，入窗/布局时主动重挂
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window == nil {
-            hoveredID = nil
-            hover.isHidden = true
-        }
+        // 面板重建、Popover 关开切换：不依赖 AppKit 时机，入窗/布局时主动重挂
+        if window == nil { hoveredID = nil }
         installTrackingArea()
     }
     override func layout() {
@@ -428,34 +370,27 @@ final class QuotaCycleChartCanvas: NSView {
         hoveredID = id
         onHover?(id)
         let item = items[index]
-        let frame = groupFrames(in: bounds)[index]
-        hover.setText(date: item.detailTitle, value: item.detailValue)
-        hover.fitToContent()
-        hover.frame.size.width = min(hover.frame.width, bounds.width)
-        let selectedX = frame.slot.midX
-        hover.frame.origin = NSPoint(
-            x: selectedX < bounds.midX ? bounds.width - hover.frame.width : 0,
-            y: 0)
-        hover.isHidden = false
+        // 完整详情经画布原生延迟 tooltip 呈现（真实命中区域有效），不再弹图内大浮层
+        syncTooltip(to: item)
         setAccessibilityValue(item.accessibilityText)
         needsDisplay = true
     }
     override func mouseExited(with event: NSEvent) {
-        // 移出图表：隐藏浮层并恢复固定选择展示。
-        hover.isHidden = true
+        // 移出图表：tooltip 与顶部主数值恢复固定选择（默认本屏最新一轮）。
         guard hoveredID != nil else { return }
         hoveredID = nil
         onHover?(nil)
+        syncTooltip(to: effectiveItem())
         needsDisplay = true
     }
     override func mouseDown(with event: NSEvent) {
         let x = convert(event.locationInWindow, from: nil).x
         guard let index = itemIndex(atX: x) else { return }
         hoveredID = nil
-        hover.isHidden = true
         onHover?(nil)
-        window?.makeFirstResponder(self)   // 点击后即可用方向键继续逐组
+        window?.makeFirstResponder(self)   // 点击后即可用方向键继续逐组（无外框，仅列级高亮）
         onPin?(items[index].id)
+        syncTooltip(to: items[index])      // 点击固定后 tooltip/详情对应固定项
         needsDisplay = true
     }
     override func keyDown(with event: NSEvent) {
@@ -466,10 +401,11 @@ final class QuotaCycleChartCanvas: NSView {
         }
     }
 
-    /// 重建后由上层注入固定选择（nil = 本屏最新一轮为默认）。
+    /// 重建后由上层注入固定选择（nil = 本屏最新一轮为默认）；tooltip 跟随固定项。
     func setFallback(_ id: UUID?) {
         fallbackID = id ?? items.last?.id
         setAccessibilityValue(fallbackItem()?.accessibilityText ?? "")
+        if hoveredID == nil { syncTooltip(to: fallbackItem()) }
         needsDisplay = true
     }
 

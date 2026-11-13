@@ -6112,6 +6112,28 @@ enum KimiOfflineRegression {
             try expect(QuotaCycleSnapshot.previewEmptyFixture.loaded
                        && QuotaCycleSnapshot.previewEmptyFixture.recordCount == 0,
                        "empty fixture must be loaded with zero cycles")
+            let previewItems = QuotaCyclePresentation.items(from: .previewFixture)
+            guard let currentItem = previewItems.last else {
+                throw Failure(description: "preview fixture must include a current cycle")
+            }
+            try expect(currentItem.usedText == "36%", "current primary value must use observed percent")
+            try expect(currentItem.statusText == "进行中", "current status must be concise")
+            try expect(currentItem.remainingText == "当前剩余 64%", "current remaining semantics changed")
+            try expect(QuotaCycleVisualMetrics.canvasHeight == 61
+                       && QuotaCycleVisualMetrics.barAreaHeight == 46
+                       && QuotaCycleVisualMetrics.barWidth == 6
+                       && QuotaCycleVisualMetrics.barCornerRadius == 1,
+                       "quota chart must use CodexUsage chart metrics")
+            let pendingItems = QuotaCyclePresentation.items(from: .previewPendingFixture)
+            try expect(pendingItems.last?.statusText == "窗口变化待确认",
+                       "pending status must remain explicit")
+            try expect(previewItems.contains { $0.statusText == "正常到期" },
+                       "natural cycle must have a concise status")
+            try expect(previewItems.contains { $0.statusText == "窗口变化" },
+                       "changed cycle must have a concise status")
+            let gapItem = previewItems.first { $0.statusText == "观测缺口" }
+            try expect(gapItem?.remainingText == "剩余无法判定",
+                       "gap must not present a determinate remaining percentage")
             func makeHistoryPanelModel(history: QuotaCycleSnapshot) -> UsagePanelModel {
                 UsagePanelModel(
                     updateItem: nil, title: "Kimi 用量", planName: nil, accountLine: nil, quotas: [],

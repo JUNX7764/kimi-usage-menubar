@@ -7,11 +7,27 @@ import Foundation
 
 // MARK: - 展示模型（纯函数，可离线断言）
 
+enum QuotaCycleVisualMetrics {
+    static let summaryHeight: CGFloat = 28
+    static let canvasHeight: CGFloat = 61
+    static let barAreaHeight: CGFloat = 46
+    static let barWidth: CGFloat = 6
+    static let barGap: CGFloat = 3
+    static let barCornerRadius: CGFloat = 1
+    static let stripHeight: CGFloat = 32
+    static let stripCornerRadius: CGFloat = 6
+    static let selectionFillAlpha: CGFloat = 0.07
+    static let capFillAlpha: CGFloat = 0.16
+}
+
 /// 一根双柱组对应的一个可展示轮次。
 struct QuotaCycleItem: Equatable {
     let id: UUID
     let startLabel: String     // 精简开始日期 MM/DD
     let usedPercent: Double    // 0...100 原始观测值（非四舍五入）
+    let usedText: String       // 顶部主数值
+    let statusText: String     // 底部状态条左栏
+    let remainingText: String  // 底部状态条右栏
     let isCurrent: Bool
     let detailTitle: String    // 第一行：日期区间 · 结束/进行状态
     let detailValue: String    // 第二行：已用与剩余（百分比，非 Token）
@@ -96,6 +112,8 @@ enum QuotaCyclePresentation {
         let title: String
         let value: String
         let spokenEnd: String
+        let statusText: String
+        let remainingText: String
         switch record.end {
         case .natural:
             // 正常到期：到期时刻 = 接口 reset，非约值。
@@ -104,26 +122,35 @@ enum QuotaCyclePresentation {
                 ? "最后观测已用 100% · 已用满"
                 : "最后观测已用 \(percent(used)) · 到期未用约 \(percent(remaining))"
             spokenEnd = "正常到期"
+            statusText = "正常到期"
+            remainingText = record.wasObservedFull ? "已用满" : "到期未用约 \(percent(remaining))"
         case .windowChanged:
             // 异常窗口变化：边界只有观测区间，标（约）；原因未知，不归因。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 窗口变化（原因未知）"
             value = "最后观测已用 \(percent(used)) · 窗口变化前剩余约 \(percent(remaining))"
             spokenEnd = "窗口变化，原因未知"
+            statusText = "窗口变化"
+            remainingText = "变化前剩余约 \(percent(remaining))"
         case .gap:
             // 观测缺口：不计算确定的到期未用百分比。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 观测缺口"
             value = "最后观测已用 \(percent(used)) · 观测缺口，剩余无法判定"
             spokenEnd = "观测缺口，剩余无法判定"
+            statusText = "观测缺口"
+            remainingText = "剩余无法判定"
         case .none:
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约）"
             value = "最后观测已用 \(percent(used))"
             spokenEnd = "结束状态未知"
+            statusText = "结束未知"
+            remainingText = "最后剩余约 \(percent(remaining))"
         }
         let accessibility = "\(startPrecision(record))，\(spokenEnd)，已用 \(percent(used))"
             + (record.end == .gap ? "" : "，剩余 \(percent(remaining))")
             + "，最后观测时间 \(fullLabel(record.lastObservedAt))"
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
+            usedText: percent(used), statusText: statusText, remainingText: remainingText,
             isCurrent: false, detailTitle: title, detailValue: value,
             lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }
@@ -145,6 +172,9 @@ enum QuotaCyclePresentation {
             + "，最后观测时间 \(fullLabel(record.lastObservedAt))"
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
+            usedText: percent(used),
+            statusText: pending ? "窗口变化待确认" : "进行中",
+            remainingText: "当前剩余 \(percent(remaining))",
             isCurrent: true, detailTitle: title, detailValue: value,
             lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }

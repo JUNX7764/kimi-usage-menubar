@@ -4,11 +4,11 @@
 
 分支：`plan/quota-cycle-history-20261112`
 
-计划基线：`1fd046d`；视觉实现提交：`1ed2f2e`、`3a1c7af`、`10b12f8`、`42b5caf`；本机反馈修订：`316d5f3`。
+计划基线：`1fd046d`；视觉实现提交：`1ed2f2e`、`3a1c7af`、`10b12f8`、`42b5caf`；本机反馈修订：`316d5f3`、`31aaa6e`。
 
 ## 结论
 
-「额度周期回顾」已在不改变历史模型、状态机、存储和浏览逻辑的前提下，重构为 CodexUsage 用量简析同构的标题/主数值/柱图/状态条布局。立柱采用 6pt 宽、46pt 柱区、3pt 组内间隙和 1pt 圆角；当前轮已用柱为空心，短历史按固定六列槽宽右对齐，每轮日期下显示已用百分比，完整详情迁入不拦截命中的图内浮层。
+「额度周期回顾」已在不改变历史模型、状态机、存储和浏览逻辑的前提下，重构为 CodexUsage 用量简析同构的标题/主数值/柱图布局。立柱采用 6pt 宽、66pt 柱区、3pt 组内间隙和 1pt 圆角；当前轮已用柱为空心，短历史按固定六列槽宽右对齐，每轮日期下显示已用百分比，完整详情迁入不拦截命中的图内浮层。底部状态/余量栏已移除，选中列使用产品蓝的浅蓝底色。
 
 构建、离线自检、78 项 Python 回归、330/300pt 几何、AppKit 合成事件、九张背景矩阵和 Cua 真实 Popover 截图检查通过。Cua 因 Popover AX/CGWindow 关联未解析而拒绝后台输入；真实物理悬停和键盘输入未验收，不以合成事件冒充该项通过。
 
@@ -30,9 +30,9 @@ codesign --verify --deep --strict KimiUsage.app
 结果：
 
 - arm64 / macOS 13 构建通过，SDK 27.2，无编译 warning；ad-hoc 签名验证通过。
-- `--self-test` PASS。新增覆盖展示文案、当前/已结束柱样式、6pt 柱宽、46pt 上限、3pt 间隙、28/76/32pt 行高、逐轮日期与百分比标签，以及 1/4 轮固定槽宽和右对齐。
+- `--self-test` PASS。新增覆盖展示文案、当前/已结束柱样式、6pt 柱宽、66pt 上限、3pt 间隙、28/96pt 主数值与图布高度、逐轮日期与百分比标签、底部栏移除，以及 1/4 轮固定槽宽和右对齐。
 - 330/300pt 几何均 PASS；六组双柱不重叠、不越界，已用不超过上限，旧双行详情不再作为可见文本渲染。
-- 额度历史交互 PASS：图内浮层内容、完整边界、hit-transparent、移出隐藏、点击固定、顶部/底部同步、方向键跨页、翻页、12→24 扩展、刷新保持、折叠重开、作用域重置和 VoiceOver。
+- 额度历史交互 PASS：图内浮层内容、完整边界、hit-transparent、移出隐藏、点击固定、主数值同步、方向键跨页、翻页、12→24 扩展、刷新保持、折叠重开、作用域重置和 VoiceOver；底部状态/余量栏不再存在。
 - 通用面板交互与键盘事件均 PASS。
 - Python 共 78 tests，全部 OK；三个 Shell 脚本语法检查通过。
 - 数据/持久化文件、`build.sh`、脚本协议和 `tests/script_test.py` 无差异。
@@ -47,9 +47,10 @@ codesign --verify --deep --strict KimiUsage.app
 
 - `full-light.png` / `full-dark.png`：六轮默认页，检查主数值、图例、柱形、日期和状态条。
 - `one-light.png` / `short-light.png`：第一轮视觉验收的一轮居中、四轮固定槽宽；后续 `feedback-one-light.png` / `feedback-full-light.png` 按用户反馈改为右对齐并逐轮显示百分比。
-- `pending-narrow.png`：300pt 下「窗口变化待确认」与剩余完整可读。
+- `pending-narrow.png`：第一轮 300pt 下「窗口变化待确认」与剩余完整可读；最终版将二者保留在浮层与无障碍详情。
+- `feedback2-full-light.png` / `feedback2-full-dark.png` / `feedback2-one-light.png`：最终无底部栏、66pt 柱体和浅蓝选中底色的固定数据截图。
 - `cross-year.png`：12 月与 01/01 标签保持正确。
-- `backgrounds/`：纯色、经典毛玻璃、液态玻璃 × 浅色/深色/降低透明度共 9 张，全部生成；已检查柱体、文字和选中底色可辨。
+- `backgrounds/`：第一轮纯色、经典毛玻璃、液态玻璃 × 浅色/深色/降低透明度共 9 张。最终 `feedback2-backgrounds/` 首轮液态玻璃 dark/reduce 子进程退出 1，按既有背板守门单独重跑后两张均生成有效截图；已检查柱体、文字和选中底色可辨。
 - `core-contact.png` / `background-contact.png`：仅供本轮集中审阅的裁剪联系表，不是生产资产。
 - `cua-preview.png`：本次构建真实 NSPopover 的 Cua 窗口截图，确认运行实例、卡片结构和实际合成像素。
 

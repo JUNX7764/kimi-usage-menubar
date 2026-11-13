@@ -3255,15 +3255,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 return fail("group \(index) overlaps previous group: \(group.slot) vs \(groups[index - 1].slot)")
             }
         }
-        guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first,
-              let strip = descendants(card).compactMap({ $0 as? QuotaCycleStatusStrip }).first else {
-            return fail("summary or status strip missing")
+        guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first else {
+            return fail("summary missing")
         }
         guard abs(summary.frame.height - QuotaCycleVisualMetrics.summaryHeight) < 1,
-              abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1,
-              abs(strip.frame.height - QuotaCycleVisualMetrics.stripHeight) < 1 else {
+              abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1 else {
             return fail("Codex-style row heights changed: summary=\(summary.frame.height) "
-                + "canvas=\(canvas.frame.height) strip=\(strip.frame.height)")
+                + "canvas=\(canvas.frame.height)")
+        }
+        let bottomTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
+        guard !bottomTexts.contains(where: { $0 == "进行中" || $0.contains("当前剩余") }) else {
+            return fail("bottom status/remaining strip must be removed")
         }
         let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
         if let latest = expectedItems.last {
@@ -3298,9 +3300,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         func summary(_ section: QuotaCycleHistorySectionView) -> QuotaCycleSummaryView? {
             descendants(section).compactMap { $0 as? QuotaCycleSummaryView }.first
-        }
-        func strip(_ section: QuotaCycleHistorySectionView) -> QuotaCycleStatusStrip? {
-            descendants(section).compactMap { $0 as? QuotaCycleStatusStrip }.first
         }
         func hasLabel(_ text: String, in section: QuotaCycleHistorySectionView) -> Bool {
             descendants(section).compactMap { $0 as? NSTextField }
@@ -3374,13 +3373,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               canvasValue.contains("最后观测时间"), canvasValue.contains("已用") else {
             return fail("canvas VoiceOver value incomplete: \(String(describing: initialCanvas.accessibilityValue()))")
         }
-        guard let initialSummary = summary(initial), let initialStrip = strip(initial),
-              initialSummary.displayedUsedTextForPreview == items[12].usedText,
-              initialStrip.statusTextForPreview == items[12].statusText,
-              initialStrip.remainingTextForPreview == items[12].remainingText,
-              let stripLabel = initialStrip.accessibilityLabel(),
-              stripLabel.contains("已用"), stripLabel.contains("最后观测时间") else {
-            return fail("summary/status strip or VoiceOver label incomplete")
+        guard let initialSummary = summary(initial),
+              initialSummary.displayedUsedTextForPreview == items[12].usedText else {
+            return fail("summary does not match the default current cycle")
         }
 
         // B. 整列悬停临时详情：固定选择不动，移出后恢复。
@@ -3397,13 +3392,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               initialCanvas.hoverHitTestsForPreview == false,
               initialCanvas.hoverTextForPreview.contains(items[7].detailTitle),
               initialCanvas.hoverTextForPreview.contains(items[7].detailValue),
-              summary(initial)?.displayedUsedTextForPreview == items[7].usedText,
-              strip(initial)?.statusTextForPreview == items[7].statusText else {
+              summary(initial)?.displayedUsedTextForPreview == items[7].usedText else {
             return fail("hover bubble must be complete, inside canvas and hit-transparent")
         }
-        guard let statusView = strip(initial) else { return fail("status strip frame") }
-        let exitPoint = statusView.convert(
-            CGPoint(x: statusView.bounds.midX, y: statusView.bounds.midY), to: nil)
+        guard let summaryView = summary(initial) else { return fail("summary frame") }
+        let exitPoint = summaryView.convert(
+            CGPoint(x: summaryView.bounds.midX, y: summaryView.bounds.midY), to: nil)
         guard postEnterExit(.mouseExited, at: exitPoint, in: initialCanvas) else {
             return fail("post hover exit event")
         }
@@ -3421,9 +3415,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("click must pin item 10, got \(String(describing: quotaBrowser.selectedCycleID))")
         }
         guard !initialCanvas.hoverVisibleForPreview,
-              summary(initial)?.displayedUsedTextForPreview == items[10].usedText,
-              strip(initial)?.remainingTextForPreview == items[10].remainingText else {
-            return fail("click must pin summary/status without leaving a hover bubble")
+              summary(initial)?.displayedUsedTextForPreview == items[10].usedText else {
+            return fail("click must pin summary without leaving a hover bubble")
         }
         guard window.firstResponder === initialCanvas else { return fail("click must focus canvas for arrow keys") }
         // 焦点进出回归：画布可成为第一响应者，主动退出后焦点真正离开
@@ -3455,8 +3448,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         guard let paged = section(), hasLabel("第 2/2 页", in: paged) else { return fail("page 2 label") }
         guard paged.displayedItem?.id == chronologicalIDs[6],
-              summary(paged)?.displayedUsedTextForPreview == items[6].usedText,
-              strip(paged)?.statusTextForPreview == items[6].statusText else {
+              summary(paged)?.displayedUsedTextForPreview == items[6].usedText else {
             return fail("page 2 selection display")
         }
         guard postKey(124, "\u{2192}") else { return fail("post right arrow") }
@@ -6158,28 +6150,29 @@ enum KimiOfflineRegression {
                 throw Failure(description: "preview fixture must include a current cycle")
             }
             try expect(currentItem.usedText == "36%", "current primary value must use observed percent")
-            try expect(currentItem.statusText == "进行中", "current status must be concise")
-            try expect(currentItem.remainingText == "当前剩余 64%", "current remaining semantics changed")
+            try expect(currentItem.detailTitle.contains("当前轮次")
+                       && currentItem.detailValue.contains("当前剩余 64%"),
+                       "current status and remaining must remain in hover details")
             try expect(QuotaCycleChartCanvas.usedBarStyle(for: currentItem) == .outlined,
                        "current cycle must use an outlined bar")
             if let closedItem = previewItems.first(where: { !$0.isCurrent }) {
                 try expect(QuotaCycleChartCanvas.usedBarStyle(for: closedItem) == .filled,
                            "closed cycle must use a filled bar")
             }
-            try expect(QuotaCycleVisualMetrics.canvasHeight == 76
-                       && QuotaCycleVisualMetrics.barAreaHeight == 46
+            try expect(QuotaCycleVisualMetrics.canvasHeight == 96
+                       && QuotaCycleVisualMetrics.barAreaHeight == 66
                        && QuotaCycleVisualMetrics.barWidth == 6
                        && QuotaCycleVisualMetrics.barCornerRadius == 1,
                        "quota chart must use CodexUsage chart metrics")
             let pendingItems = QuotaCyclePresentation.items(from: .previewPendingFixture)
-            try expect(pendingItems.last?.statusText == "窗口变化待确认",
+            try expect(pendingItems.last?.detailTitle.contains("窗口变化待确认") == true,
                        "pending status must remain explicit")
-            try expect(previewItems.contains { $0.statusText == "正常到期" },
-                       "natural cycle must have a concise status")
-            try expect(previewItems.contains { $0.statusText == "窗口变化" },
-                       "changed cycle must have a concise status")
-            let gapItem = previewItems.first { $0.statusText == "观测缺口" }
-            try expect(gapItem?.remainingText == "剩余无法判定",
+            try expect(previewItems.contains { $0.detailTitle.contains("正常到期") },
+                       "natural cycle status must remain in hover details")
+            try expect(previewItems.contains { $0.detailTitle.contains("窗口变化") },
+                       "changed cycle status must remain in hover details")
+            let gapItem = previewItems.first { $0.detailTitle.contains("观测缺口") }
+            try expect(gapItem?.detailValue.contains("剩余无法判定") == true,
                        "gap must not present a determinate remaining percentage")
             func makeHistoryPanelModel(history: QuotaCycleSnapshot) -> UsagePanelModel {
                 UsagePanelModel(
@@ -6251,14 +6244,15 @@ enum KimiOfflineRegression {
                                    "group \(index) overlaps previous at \(width)pt")
                     }
                 }
-                guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first,
-                      let strip = descendants(card).compactMap({ $0 as? QuotaCycleStatusStrip }).first else {
-                    throw Failure(description: "quota summary or status strip missing at \(width)pt")
+                guard let summary = descendants(card).compactMap({ $0 as? QuotaCycleSummaryView }).first else {
+                    throw Failure(description: "quota summary missing at \(width)pt")
                 }
                 try expect(abs(summary.frame.height - QuotaCycleVisualMetrics.summaryHeight) < 1
-                           && abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1
-                           && abs(strip.frame.height - QuotaCycleVisualMetrics.stripHeight) < 1,
+                           && abs(canvas.frame.height - QuotaCycleVisualMetrics.canvasHeight) < 1,
                            "Codex-style row heights changed at \(width)pt")
+                let bottomTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
+                try expect(!bottomTexts.contains { $0 == "进行中" || $0.contains("当前剩余") },
+                           "bottom status/remaining strip must be absent at \(width)pt")
                 let labelFrames = canvas.labelFramesForTest
                 try expect(labelFrames.count == groups.count,
                            "every cycle must have its own date and percentage label")
@@ -6312,10 +6306,11 @@ enum KimiOfflineRegression {
             // 状态文案：pending 详情、空态、写失败提示
             historyController.update(model: makeHistoryPanelModel(history: .previewPendingFixture))
             let pendingRows = historyController.rebuildContentForTest(width: 330)
-            let pendingTexts = descendants(try historyCard(in: pendingRows))
-                .compactMap { ($0 as? NSTextField)?.stringValue }
-            try expect(pendingTexts.contains { $0.contains("窗口变化待确认") },
-                       "pending detail must show 窗口变化待确认")
+            let pendingCard = try historyCard(in: pendingRows)
+            let pendingSummary = descendants(pendingCard)
+                .compactMap { $0 as? QuotaCycleSummaryView }.first
+            try expect(pendingSummary?.accessibilityLabel()?.contains("窗口变化待确认") == true,
+                       "pending detail must preserve 窗口变化待确认 in accessibility")
             historyController.update(model: makeHistoryPanelModel(history: .previewEmptyFixture))
             let emptyRows = historyController.rebuildContentForTest(width: 330)
             let emptyCard = try historyCard(in: emptyRows)

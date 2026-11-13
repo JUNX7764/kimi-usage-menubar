@@ -9,14 +9,12 @@ import Foundation
 
 enum QuotaCycleVisualMetrics {
     static let summaryHeight: CGFloat = 28
-    static let canvasHeight: CGFloat = 76
-    static let barAreaHeight: CGFloat = 46
+    static let canvasHeight: CGFloat = 96
+    static let barAreaHeight: CGFloat = 66
     static let barWidth: CGFloat = 6
     static let barGap: CGFloat = 3
     static let barCornerRadius: CGFloat = 1
-    static let stripHeight: CGFloat = 32
-    static let stripCornerRadius: CGFloat = 6
-    static let selectionFillAlpha: CGFloat = 0.07
+    static let selectionFillAlpha: CGFloat = 0.10
     static let capFillAlpha: CGFloat = 0.16
 }
 
@@ -25,9 +23,7 @@ struct QuotaCycleItem: Equatable {
     let id: UUID
     let startLabel: String     // 精简开始日期 MM/DD
     let usedPercent: Double    // 0...100 原始观测值（非四舍五入）
-    let usedText: String       // 顶部主数值
-    let statusText: String     // 底部状态条左栏
-    let remainingText: String  // 底部状态条右栏
+    let usedText: String       // 顶部主数值与逐轮百分比
     let isCurrent: Bool
     let detailTitle: String    // 第一行：日期区间 · 结束/进行状态
     let detailValue: String    // 第二行：已用与剩余（百分比，非 Token）
@@ -112,8 +108,6 @@ enum QuotaCyclePresentation {
         let title: String
         let value: String
         let spokenEnd: String
-        let statusText: String
-        let remainingText: String
         switch record.end {
         case .natural:
             // 正常到期：到期时刻 = 接口 reset，非约值。
@@ -122,35 +116,27 @@ enum QuotaCyclePresentation {
                 ? "最后观测已用 100% · 已用满"
                 : "最后观测已用 \(percent(used)) · 到期未用约 \(percent(remaining))"
             spokenEnd = "正常到期"
-            statusText = "正常到期"
-            remainingText = record.wasObservedFull ? "已用满" : "到期未用约 \(percent(remaining))"
         case .windowChanged:
             // 异常窗口变化：边界只有观测区间，标（约）；原因未知，不归因。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 窗口变化（原因未知）"
             value = "最后观测已用 \(percent(used)) · 窗口变化前剩余约 \(percent(remaining))"
             spokenEnd = "窗口变化，原因未知"
-            statusText = "窗口变化"
-            remainingText = "变化前剩余约 \(percent(remaining))"
         case .gap:
             // 观测缺口：不计算确定的到期未用百分比。
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约） · 观测缺口"
             value = "最后观测已用 \(percent(used)) · 观测缺口，剩余无法判定"
             spokenEnd = "观测缺口，剩余无法判定"
-            statusText = "观测缺口"
-            remainingText = "剩余无法判定"
         case .none:
             title = "\(start)–\(dayLabel(record.boundaryUpper))（约）"
             value = "最后观测已用 \(percent(used))"
             spokenEnd = "结束状态未知"
-            statusText = "结束未知"
-            remainingText = "最后剩余约 \(percent(remaining))"
         }
         let accessibility = "\(startPrecision(record))，\(spokenEnd)，已用 \(percent(used))"
             + (record.end == .gap ? "" : "，剩余 \(percent(remaining))")
             + "，最后观测时间 \(fullLabel(record.lastObservedAt))"
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
-            usedText: percent(used), statusText: statusText, remainingText: remainingText,
+            usedText: percent(used),
             isCurrent: false, detailTitle: title, detailValue: value,
             lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }
@@ -173,8 +159,6 @@ enum QuotaCyclePresentation {
         return QuotaCycleItem(
             id: record.id, startLabel: start, usedPercent: used,
             usedText: percent(used),
-            statusText: pending ? "窗口变化待确认" : "进行中",
-            remainingText: "当前剩余 \(percent(remaining))",
             isCurrent: true, detailTitle: title, detailValue: value,
             lastObservedAt: record.lastObservedAt, accessibilityText: accessibility)
     }
@@ -324,7 +308,8 @@ final class QuotaCycleChartCanvas: NSView {
                 let x = min(max(rect.minX, slotX), max(rect.minX, rect.maxX - size.width))
                 return CGRect(x: x, y: y, width: size.width, height: size.height)
             }
-            let date = textFrame(item.startLabel, font: Self.dateFont, y: 49)
+            let date = textFrame(item.startLabel, font: Self.dateFont,
+                                 y: QuotaCycleVisualMetrics.barAreaHeight + 3)
             let percent = textFrame(item.usedText, font: Self.percentFont, y: date.maxY + 2)
             return LabelFrame(date: date, percent: percent)
         }
@@ -363,7 +348,7 @@ final class QuotaCycleChartCanvas: NSView {
         guard !frames.isEmpty else { return }
         for (index, (frame, item)) in zip(frames, items).enumerated() {
             if item.id == effective {
-                NSColor.labelColor.withAlphaComponent(QuotaCycleVisualMetrics.selectionFillAlpha).setFill()
+                PanelAccent.codex.color.withAlphaComponent(QuotaCycleVisualMetrics.selectionFillAlpha).setFill()
                 NSRect(x: frame.slot.minX, y: 0, width: frame.slot.width,
                        height: QuotaCycleVisualMetrics.barAreaHeight).fill()
             }
@@ -526,65 +511,6 @@ final class QuotaCycleSummaryView: NSView {
 
     func configure(item: QuotaCycleItem) {
         valueLabel.stringValue = item.usedText
-        toolTip = "最后观测已用 \(item.usedText)"
-        setAccessibilityLabel("已用 \(item.usedText)")
-    }
-}
-
-final class QuotaCycleStatusStrip: NSView {
-    private let statusLabel: NSTextField
-    private let remainingLabel: NSTextField
-    var statusTextForPreview: String { statusLabel.stringValue }
-    var remainingTextForPreview: String { remainingLabel.stringValue }
-
-    override init(frame frameRect: NSRect) {
-        statusLabel = QuotaCycleWidget.label("", size: 11, wrapping: false)
-        remainingLabel = QuotaCycleWidget.label("", size: 11, weight: .semibold,
-            wrapping: false, monospacedDigits: true)
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = QuotaCycleVisualMetrics.stripCornerRadius
-        for label in [statusLabel, remainingLabel] {
-            label.alignment = .center
-            label.setContentHuggingPriority(.init(1), for: .horizontal)
-        }
-        let row = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
-        row.addArrangedSubview(statusLabel)
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        row.addArrangedSubview(divider)
-        row.addArrangedSubview(remainingLabel)
-        addSubview(row)
-        NSLayoutConstraint.activate([
-            row.centerYAnchor.constraint(equalTo: centerYAnchor),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            row.heightAnchor.constraint(equalToConstant: 18),
-            statusLabel.widthAnchor.constraint(equalTo: remainingLabel.widthAnchor),
-            divider.widthAnchor.constraint(equalToConstant: 1),
-            divider.heightAnchor.constraint(equalToConstant: 18),
-            heightAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.stripHeight)
-        ])
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override var wantsUpdateLayer: Bool { true }
-    override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.06).cgColor
-        }
-    }
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
-    }
-
-    func configure(item: QuotaCycleItem) {
-        statusLabel.stringValue = item.statusText
-        remainingLabel.stringValue = item.remainingText
         toolTip = "\(item.detailTitle)\n\(item.detailValue)"
         setAccessibilityLabel(item.accessibilityText)
     }
@@ -607,12 +533,11 @@ struct QuotaCycleViewState: Equatable {
     var pinnedID: UUID?
 }
 
-/// 额度周期回顾：标题行翻页 + 主数值 + 双柱图 + 状态条 + 提示。
+/// 额度周期回顾：标题行翻页 + 主数值 + 双柱图 + 提示。
 /// 交互整列命中：悬停临时详情、点击固定、方向键逐组跨页。
 final class QuotaCycleHistorySectionView: NSView {
     private let canvas = QuotaCycleChartCanvas()
     private let summary = QuotaCycleSummaryView()
-    private let statusStrip = QuotaCycleStatusStrip()
     private let pagerStack = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
     private let pageLabel = QuotaCycleWidget.label("", size: 10, color: .secondaryLabelColor,
                                                    wrapping: false, monospacedDigits: true)
@@ -674,9 +599,8 @@ final class QuotaCycleHistorySectionView: NSView {
                     equalToConstant: QuotaCycleVisualMetrics.canvasHeight).isActive = true
                 canvas.setAccessibilityLabel("额度周期回顾柱状图，每根灰色柱为额度上限 100%，蓝色柱为已用比例")
                 QuotaCycleWidget.addFullWidth(canvas, to: root)
-                QuotaCycleWidget.addFullWidth(statusStrip, to: root)
 
-                // 「更早记录」位于状态条之下、卡片内：只在已载入的最旧一页且窗口外
+                // 「更早记录」位于柱图之下、卡片内：只在已载入的最旧一页且窗口外
                 // 还有未载入记录时出现（隐藏会让卡片高度漂移，故用 isHidden）。
                 earlierButton.isHidden = true
                 earlierButton.translatesAutoresizingMaskIntoConstraints = false
@@ -757,7 +681,6 @@ final class QuotaCycleHistorySectionView: NSView {
             ?? viewState.visibleItems.last
         if let item = displayedItem {
             summary.configure(item: item)
-            statusStrip.configure(item: item)
             canvas.setAccessibilityValue(item.accessibilityText)
         }
         canvas.needsDisplay = true

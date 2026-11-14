@@ -460,7 +460,8 @@ enum TokenAggregator {
         if persist { saveState(st) }
         // 旧缓存没有模型维度时保留总量并归入未知模型；数据库恢复后会自动替换为真实模型。
         let zcodeModels = st.zcodeModelDays ?? (st.zcodeDays ?? [:]).mapValues { ["未知模型": $0] }
-        let extraModels = mergeSourceModelDays(st.hermes?.modelDays ?? [:], zcodeModels)
+        let hermesModelDays = st.hermes?.modelDays ?? [:]
+        let extraModels = mergeSourceModelDays(hermesModelDays, zcodeModels)
         // v1.5 用量洞察：逐工具贡献（Work + 5 类 API 客户端），与上方窗口同一扫描快照。
         var tools: [ToolStats] = [
             fileToolStats(id: .work, roots: [sessionsRoot], okRoots: workScan.okRoots, files: st.work),
@@ -469,9 +470,9 @@ enum TokenAggregator {
             fileToolStats(id: .claude, roots: [apiSessionsRoots[3]], okRoots: cliScan.okRoots, files: st.cli)
         ]
         if hermesOK != nil {
-            tools.append(ToolStats(id: .hermes, modelDays: st.hermes?.modelDays ?? [:],
+            tools.append(ToolStats(id: .hermes, modelDays: hermesModelDays,
                                    installed: true, ok: hermesOK == true))
-        } else if let cached = uninstalledCacheTool(id: .hermes, modelDays: st.hermes?.modelDays ?? [:]) {
+        } else if let cached = uninstalledCacheTool(id: .hermes, modelDays: hermesModelDays) {
             tools.append(cached)
         }
         if zcodeOK != nil {
@@ -529,6 +530,12 @@ enum TokenAggregator {
             ?? now.addingTimeInterval(Double(offset) * 86400)
         let c = calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    /// 日键（yyyy-MM-dd）的展示标签 MM/DD；异常键原样返回。比较条区间与日图刻度共用。
+    static func dayLabel(_ key: String) -> String {
+        let parts = key.split(separator: "-")
+        return parts.count == 3 ? "\(parts[1])/\(parts[2])" : key
     }
 
     /// 窗口起算日：含今天共 7 / 30 个日历日（Calendar 日历日运算，覆盖 DST 与跨月；
@@ -1029,10 +1036,6 @@ enum TokenAggregator {
                             now: Date = Date(), calendar: Calendar = .current,
                             coverageProven: Bool = true) -> Comparison {
         func key(_ offset: Int) -> String { dayKey(offset, from: now, calendar: calendar) }
-        func mmdd(_ key: String) -> String {
-            let parts = key.split(separator: "-")
-            return parts.count == 3 ? "\(parts[1])/\(parts[2])" : key
-        }
         func total(_ from: Int, _ to: Int) -> Double {
             var sum = 0.0
             for offset in from...to {
@@ -1058,8 +1061,8 @@ enum TokenAggregator {
             if abs(pct) < 0.05 { return .flat }   // GLM 同款：一位小数下防 ±0.0%
             return .percent(pct)
         }
-        let dayDetail = "比较区间 \(mmdd(key(-1)))–\(mmdd(key(0)))（今日未结束）· （最近1日总量−前1日总量）÷前1日总量"
-        let weekDetail = "比较区间 \(mmdd(key(-13)))–\(mmdd(key(-7))) 与 \(mmdd(key(-6)))–\(mmdd(key(0)))（今日未结束）· （最近7日总量−前7日总量）÷前7日总量"
+        let dayDetail = "比较区间 \(dayLabel(key(-1)))–\(dayLabel(key(0)))（今日未结束）· （最近1日总量−前1日总量）÷前1日总量"
+        let weekDetail = "比较区间 \(dayLabel(key(-13)))–\(dayLabel(key(-7))) 与 \(dayLabel(key(-6)))–\(dayLabel(key(0)))（今日未结束）· （最近7日总量−前7日总量）÷前7日总量"
         return Comparison(day: value(total(0, 0), total(-1, -1)),
                           week: value(total(-6, 0), total(-13, -7)),
                           dayDetail: dayDetail, weekDetail: weekDetail)
@@ -1127,11 +1130,11 @@ enum TokenAggregator {
     /// 从文件状态字典聚合单个工具的按日 × 模型贡献。
     static func toolModelDays(_ files: [String: FileScanState],
                               under roots: [String] = []) -> ModelDays {
+        let bases = roots.map { realPath($0) }   // realpath 提升到每根一次，不在逐文件循环内重复
         var days: ModelDays = [:]
         for (path, st) in files {
-            if !roots.isEmpty && !roots.contains(where: { root in
-                let base = realPath(root)
-                return path == base || path.hasPrefix(base + "/")
+            if !bases.isEmpty && !bases.contains(where: { base in
+                path == base || path.hasPrefix(base + "/")
             }) { continue }
             days = mergeSourceModelDays(days, st.modelDays)
         }
@@ -1875,8 +1878,8 @@ final class UpdateChecker {
                     (http?.statusCode == 200 && releases != nil)))
                 if http?.statusCode == 304 && !self.lastError {
                     // 内容未变：结论保持
-                } else if err == nil, let data = data, http?.statusCode == 200,
-                          let releases = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+                } else if err == nil, http?.statusCode == 200, let releases {
+                    // releases 已在上方解析一次，直接复用，不重复解码同一响应体
                     self.hasValidRelease = true
                     if let release = UpdateCheck.latestDownloadableRelease(in: releases) {
                         let tag = release.tag
@@ -3275,11 +3278,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("Codex-style row heights changed: summary=\(summary.frame.height) "
                 + "canvas=\(canvas.frame.height)")
         }
-        let bottomTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
-        guard !bottomTexts.contains(where: { $0 == "进行中" || $0.contains("当前剩余") }) else {
+        let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
+        guard !visibleTexts.contains(where: { $0 == "进行中" || $0.contains("当前剩余") }) else {
             return fail("bottom status/remaining strip must be removed")
         }
-        let visibleTexts = descendants(card).compactMap { ($0 as? NSTextField)?.stringValue }
         if let latest = expectedItems.last {
             guard !visibleTexts.contains(latest.detailTitle),
                   !visibleTexts.contains(latest.detailValue) else {
@@ -4194,7 +4196,8 @@ final class DailyBarChartCanvas: NSView {
         setAccessibilityValue("\(selectionDateText(day)) \(value)")
     }
 
-    private func selectionDateText(_ day: UsagePanelModel.BriefDay) -> String {
+    /// 选中日的展示文本「M月D日[（今日未结束）]」；选中行与 VoiceOver 读值共用。
+    func selectionDateText(_ day: UsagePanelModel.BriefDay) -> String {
         let parts = day.label.split(separator: "/")
         guard parts.count == 2 else { return day.label }
         let base = "\(Int(parts[0]) ?? 0)月\(Int(parts[1]) ?? 0)日"
@@ -4279,11 +4282,7 @@ private final class DailyBriefSectionView: NSView {
     private func syncSelection(_ index: Int) {
         guard days(indices: index) else { return }
         let day = canvas.dayList[index]
-        dateLabel.stringValue = {
-            let parts = day.label.split(separator: "/")
-            let base = parts.count == 2 ? "\(Int(parts[0]) ?? 0)月\(Int(parts[1]) ?? 0)日" : day.label
-            return day.isToday ? base + "（今日未结束）" : base
-        }()
+        dateLabel.stringValue = canvas.selectionDateText(day)
         if day.covered {
             valueLabel.stringValue = "\(Fmt.tokens(day.total)) Token"
             valueLabel.textColor = .labelColor
@@ -5167,8 +5166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                      coverageProven: coverageOK)
         func briefDay(_ offset: Int) -> UsagePanelModel.BriefDay {
             let key = TokenAggregator.dayKey(offset, from: Date())
-            let parts = key.split(separator: "-")
-            let label = parts.count == 3 ? "\(parts[1])/\(parts[2])" : key
+            let label = TokenAggregator.dayLabel(key)
             if let value = usage.daily[key] {
                 return UsagePanelModel.BriefDay(label: label, total: value[0] + value[1], input: value[0],
                                                 output: value[1], covered: true, isToday: offset == 0)

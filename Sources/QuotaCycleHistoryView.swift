@@ -78,22 +78,7 @@ enum QuotaCyclePresentation {
         return items
     }
 
-    /// 某一屏的轮次（旧→新）。pageOffset 0 = 最新一屏。
-    static func page(_ items: [QuotaCycleItem], pageOffset: Int) -> [QuotaCycleItem] {
-        guard !items.isEmpty else { return [] }
-        let maxPage = max(0, (items.count - 1) / pageSize)
-        let page = min(max(0, pageOffset), maxPage)
-        let upper = max(0, items.count - page * pageSize)
-        let lower = max(0, upper - pageSize)
-        return Array(items[lower..<upper])
-    }
-
     // 窗口化浏览的范围/条数计算在 QuotaCycleBrowser 上（纯整数，可离线断言）。
-
-    static func pageCount(_ items: [QuotaCycleItem]) -> Int {
-        guard !items.isEmpty else { return 0 }
-        return (items.count - 1) / pageSize + 1
-    }
 
     private static func startPrecision(_ record: QuotaCycleRecord) -> String {
         switch record.startKind {

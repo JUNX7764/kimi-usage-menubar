@@ -38,6 +38,8 @@ swiftc -O -target arm64-apple-macos13.0 -o "$DIR/KimiUsage-bin" \
   "$DIR/Sources/QuotaCycleStore.swift" \
   "$DIR/Sources/QuotaCycleCoordinator.swift" \
   "$DIR/Sources/QuotaCycleHistoryView.swift" \
+  "$DIR/Sources/PanelCustomization.swift" \
+  "$DIR/Sources/KimiPanelVisuals.swift" \
   "$DIR/KimiUsage.swift" \
   "$DIR/main.swift"
 

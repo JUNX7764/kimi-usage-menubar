@@ -8,15 +8,16 @@ import Foundation
 // MARK: - 展示模型（纯函数，可离线断言）
 
 enum QuotaCycleVisualMetrics {
-    static let summaryHeight: CGFloat = 28
     static let canvasHeight: CGFloat = 96
     static let barAreaHeight: CGFloat = 66
-    static let barWidth: CGFloat = 6
-    static let barGap: CGFloat = 3
-    static let barCornerRadius: CGFloat = 1
-    static let capFillAlpha: CGFloat = 0.16
-    /// 当前轮使用较轻的实心柱；低用量时不与任何选中装饰重叠。
-    static let currentFillAlpha: CGFloat = 0.65
+    /// 单根额度槽（对齐 GLMUsage v1.5.3，仅色系不同）：灰槽 + 底部已用填充。
+    static let trackFillAlpha: CGFloat = 0.25
+    static let fillAlpha: CGFloat = 0.72
+    static let fillAlphaHighlighted: CGFloat = 1.0
+    /// 柔和列底层级（对齐 GLM：悬停 0.11 / 固定选中 0.08 / 当前轮 0.05）。
+    static let hoverTintAlpha: CGFloat = 0.11
+    static let selectedTintAlpha: CGFloat = 0.08
+    static let currentTintAlpha: CGFloat = 0.05
 }
 
 /// 一根双柱组对应的一个可展示轮次。
@@ -170,9 +171,9 @@ enum QuotaCyclePresentation {
 
 final class QuotaCycleChartCanvas: NSView {
     struct GroupFrame: Equatable {
-        var slot: CGRect    // 整列命中区（选择高亮、翻页对齐都按列）
-        var cap: CGRect     // 灰色上限柱（恒为 100% 高度）
-        var used: CGRect    // 蓝色已用柱（0–100%）
+        var slot: CGRect    // 整列命中区（翻页对齐、日期/百分比都按列）
+        var track: CGRect   // 灰色上限槽（恒为 100% 高度，居中 12pt）
+        var fill: CGRect?   // 蓝色已用填充（0–100%，从槽底生长）；0% 不画（不伪造面积）
     }
     struct LabelFrame: Equatable {
         var date: CGRect
@@ -200,12 +201,6 @@ final class QuotaCycleChartCanvas: NSView {
     var canvasSubviewCountForPreview: Int { subviews.count }
     /// 预览断言：点击固定后画布可键盘逐组，但不绘制整幅系统焦点外框。
     var focusRingTypeForPreview: NSFocusRingType { focusRingType }
-
-    enum UsedBarStyle: Equatable { case filled, current }
-
-    static func usedBarStyle(for item: QuotaCycleItem) -> UsedBarStyle {
-        item.isCurrent ? .current : .filled
-    }
 
     override var isFlipped: Bool { true }
 
@@ -258,25 +253,14 @@ final class QuotaCycleChartCanvas: NSView {
         let slotWidth = rect.width / CGFloat(QuotaCyclePresentation.pageSize)
         let contentWidth = slotWidth * CGFloat(items.count)
         let originX = rect.maxX - contentWidth
-        let pairWidth = QuotaCycleVisualMetrics.barWidth * 2 + QuotaCycleVisualMetrics.barGap
         return items.enumerated().map { index, item in
             let slot = CGRect(x: originX + CGFloat(index) * slotWidth, y: 0,
                               width: slotWidth, height: QuotaCycleVisualMetrics.canvasHeight)
-            let pairX = slot.midX - pairWidth / 2
-            let minimum: CGFloat = item.isCurrent ? 3 : 2
-            let usedHeight = max(minimum,
-                QuotaCycleVisualMetrics.barAreaHeight * CGFloat(item.usedPercent / 100))
-            return GroupFrame(
-                slot: slot,
-                cap: CGRect(x: pairX, y: 0,
-                            width: QuotaCycleVisualMetrics.barWidth,
-                            height: QuotaCycleVisualMetrics.barAreaHeight),
-                used: CGRect(x: pairX + QuotaCycleVisualMetrics.barWidth
-                                 + QuotaCycleVisualMetrics.barGap,
-                             y: QuotaCycleVisualMetrics.barAreaHeight
-                                 - min(QuotaCycleVisualMetrics.barAreaHeight, usedHeight),
-                             width: QuotaCycleVisualMetrics.barWidth,
-                             height: min(QuotaCycleVisualMetrics.barAreaHeight, usedHeight)))
+            // 单根额度槽：绘图区 = 列内 barArea 高度；填充按该轮自身上限归一化，从槽底（视觉底边）生长
+            let plotArea = NSRect(x: slot.minX, y: 0, width: slot.width,
+                                  height: QuotaCycleVisualMetrics.barAreaHeight)
+            let geometry = KimiPanelVisuals.slotBar(in: plotArea, usedPercent: item.usedPercent)
+            return GroupFrame(slot: slot, track: geometry.track, fill: geometry.fill)
         }
     }
 
@@ -284,32 +268,52 @@ final class QuotaCycleChartCanvas: NSView {
         let frames = groupFrames(in: bounds)
         let effective = effectiveID
         guard !frames.isEmpty else { return }
+        // 100% 刻度（对齐 GLM v1.5.3：图区左上角，9pt secondary；先画，槽体绘制在其上）
+        ("100%" as NSString).draw(at: NSPoint(x: 0, y: 0), withAttributes: [
+            .font: Self.dateFont, .foregroundColor: NSColor.secondaryLabelColor
+        ])
         for (index, (frame, item)) in zip(frames, items).enumerated() {
-            let selected = item.id == effective
-            let capPath = NSBezierPath(roundedRect: frame.cap,
-                xRadius: QuotaCycleVisualMetrics.barCornerRadius,
-                yRadius: QuotaCycleVisualMetrics.barCornerRadius)
-            NSColor.secondaryLabelColor.withAlphaComponent(QuotaCycleVisualMetrics.capFillAlpha).setFill()
-            capPath.fill()
-            let usedPath = NSBezierPath(roundedRect: frame.used,
-                xRadius: QuotaCycleVisualMetrics.barCornerRadius,
-                yRadius: QuotaCycleVisualMetrics.barCornerRadius)
-            switch Self.usedBarStyle(for: item) {
-            case .filled:
-                PanelAccent.codex.color.setFill()
-            case .current:
-                PanelAccent.codex.color.withAlphaComponent(QuotaCycleVisualMetrics.currentFillAlpha).setFill()
+            let hovered = item.id == hoveredID
+            let pinned = item.id == fallbackID && hoveredID == nil
+            // 柔和列底层级（GLM v1.5.3 同款）：悬停 0.11 / 固定选中 0.08 / 当前轮 0.05；
+            // 圆角底只铺柱区（含 2pt 下探），日期/百分比行不铺。
+            if hovered || pinned || item.isCurrent {
+                let tint: CGFloat = hovered ? QuotaCycleVisualMetrics.hoverTintAlpha
+                    : pinned ? QuotaCycleVisualMetrics.selectedTintAlpha
+                    : QuotaCycleVisualMetrics.currentTintAlpha
+                PanelAccent.codex.color.withAlphaComponent(tint).setFill()
+                NSBezierPath(roundedRect: NSRect(x: frame.slot.minX + 1, y: 0,
+                    width: max(0, frame.slot.width - 2),
+                    height: QuotaCycleVisualMetrics.barAreaHeight + 2),
+                    xRadius: 4, yRadius: 4).fill()
             }
-            usedPath.fill()
-            // 选中只强化日期和百分比；不叠加基线，避免低用量当前柱与装饰线重叠。
+            let trackPath = NSBezierPath(roundedRect: frame.track,
+                xRadius: KimiPanelVisuals.slotCornerRadius,
+                yRadius: KimiPanelVisuals.slotCornerRadius)
+            NSColor.secondaryLabelColor.withAlphaComponent(QuotaCycleVisualMetrics.trackFillAlpha).setFill()
+            trackPath.fill()
+            if let fill = frame.fill {
+                // 填充与灰槽同位同宽，被槽路径裁剪成同一轮廓；视觉顶边微圆（isFlipped：顶边 = minY）。
+                // 填充透明度对齐 GLM：选中/悬停 1.0，其余 0.72。
+                NSGraphicsContext.saveGraphicsState()
+                trackPath.addClip()
+                PanelAccent.codex.color.withAlphaComponent(
+                    hovered || pinned ? QuotaCycleVisualMetrics.fillAlphaHighlighted
+                    : QuotaCycleVisualMetrics.fillAlpha).setFill()
+                // isFlipped 画布：底边圆角路径渲染为视觉顶边圆角（GLM v1.5.3 同款顶边微圆）
+                KimiPanelVisuals.bottomRoundedPath(
+                    in: fill, radius: KimiPanelVisuals.slotCornerRadius).fill()
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            // 选中强化日期和百分比字色（GLM 同款：品牌蓝仅用于选中/悬停）。
             let labels = labelFrames(in: bounds)[index]
             (item.startLabel as NSString).draw(at: labels.date.origin, withAttributes: [
                 .font: Self.dateFont,
-                .foregroundColor: selected ? PanelAccent.codex.color : NSColor.secondaryLabelColor
+                .foregroundColor: item.id == effective ? NSColor.labelColor : NSColor.secondaryLabelColor
             ])
             (item.usedText as NSString).draw(at: labels.percent.origin, withAttributes: [
                 .font: Self.percentFont,
-                .foregroundColor: selected
+                .foregroundColor: item.id == effective
                     ? PanelAccent.codex.color : NSColor.labelColor
             ])
         }
@@ -403,44 +407,6 @@ final class QuotaCycleChartCanvas: NSView {
     }
 }
 
-// MARK: - 主数值与状态条
-
-final class QuotaCycleSummaryView: NSView {
-    private let valueLabel: NSTextField
-    var displayedUsedTextForPreview: String { valueLabel.stringValue }
-
-    override init(frame frameRect: NSRect) {
-        valueLabel = QuotaCycleWidget.label("", size: 19, weight: .semibold,
-            color: PanelAccent.codex.color, wrapping: false, monospacedDigits: true)
-        super.init(frame: frameRect)
-        translatesAutoresizingMaskIntoConstraints = false
-        let row = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 7)
-        let valueStack = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .firstBaseline, spacing: 7)
-        valueStack.addArrangedSubview(valueLabel)
-        valueStack.addArrangedSubview(QuotaCycleWidget.label("已用", size: 10,
-            color: .secondaryLabelColor, wrapping: false))
-        row.addArrangedSubview(valueStack)
-        row.addArrangedSubview(QuotaCycleWidget.spacer())
-        let capLegend = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 5)
-        capLegend.addArrangedSubview(QuotaCycleWidget.legendSwatch(
-            color: NSColor.secondaryLabelColor.withAlphaComponent(QuotaCycleVisualMetrics.capFillAlpha)))
-        capLegend.addArrangedSubview(QuotaCycleWidget.label("上限 100%", size: 10,
-            color: .secondaryLabelColor, wrapping: false))
-        row.addArrangedSubview(capLegend)
-        addSubview(row)
-        QuotaCycleWidget.pin(row, to: self)
-        heightAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.summaryHeight).isActive = true
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    func configure(item: QuotaCycleItem) {
-        valueLabel.stringValue = item.usedText
-        toolTip = "\(item.detailTitle)\n\(item.detailValue)"
-        setAccessibilityLabel(item.accessibilityText)
-    }
-}
-
 // MARK: - 板块视图
 
 /// 板块渲染状态：全部由控制器按 QuotaCycleBrowser 计算后注入；视图只持有悬停这类
@@ -458,11 +424,14 @@ struct QuotaCycleViewState: Equatable {
     var pinnedID: UUID?
 }
 
-/// 额度周期回顾：标题行翻页 + 主数值 + 双柱图 + 提示。
+/// 额度周期回顾：标题行 + 图例行（图例/更早/翻页）+ 双柱图 + 选中状态行。
+/// 结构对齐 CodexUsage/GLMUsage（除色系）：无大主数值，图例与翻页在图上方一行，
+/// 图下仅一行选中轮次窗口/状态；完整已用/剩余只在 tooltip 与 VoiceOver。
 /// 交互整列命中：悬停临时详情、点击固定、方向键逐组跨页。
 final class QuotaCycleHistorySectionView: NSView {
     private let canvas = QuotaCycleChartCanvas()
-    private let summary = QuotaCycleSummaryView()
+    private let statusLabel = QuotaCycleWidget.label("", size: 11, color: .secondaryLabelColor,
+                                                    wrapping: false)
     private let pagerStack = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 4)
     private let pageLabel = QuotaCycleWidget.label("", size: 10, color: .secondaryLabelColor,
                                                    wrapping: false, monospacedDigits: true)
@@ -474,6 +443,10 @@ final class QuotaCycleHistorySectionView: NSView {
     let viewState: QuotaCycleViewState
     /// 测试断言用：当前展示详情对应的轮次（悬停 ?? 固定 ?? 本屏最新）。
     private(set) var displayedItem: QuotaCycleItem?
+    /// 预览断言用：图下状态行文本（与选中联动）。
+    var statusTextForPreview: String? {
+        statusLabel.stringValue.isEmpty ? nil : statusLabel.stringValue
+    }
 
     init(model: QuotaCycleSnapshot, state: QuotaCycleViewState, expanded: Bool,
          target: AnyObject, action: Selector,
@@ -494,18 +467,10 @@ final class QuotaCycleHistorySectionView: NSView {
         let root = QuotaCycleWidget.stack(spacing: 6)
         let toggle = QuotaCycleWidget.disclosureToggle(expanded: expanded, section: "额度周期回顾",
                                                        target: target, action: action)
-        var headerTrailing: [NSView] = []
-        if expanded && model.loaded && state.pageCount > 1 && !state.visibleItems.isEmpty {
-            pagerStack.addArrangedSubview(back)
-            pagerStack.addArrangedSubview(pageLabel)
-            pagerStack.addArrangedSubview(forward)
-            pageLabel.alignment = .center
-            headerTrailing.append(pagerStack)
-        }
-        headerTrailing.append(toggle)
+        // 标题行只留折叠箭头；翻页/更早下沉到图例行（对齐 CodexUsage/GLMUsage）
         QuotaCycleWidget.addFullWidth(
-            QuotaCycleWidget.cardHeader(icon: "chart.bar.fill", title: "额度周期回顾",
-                                        trailing: headerTrailing), to: root)
+            QuotaCycleWidget.cardHeader(icon: "clock.arrow.circlepath", title: "额度周期回顾",
+                                        trailing: [toggle]), to: root)
 
         if expanded {
             if !model.loaded {
@@ -519,23 +484,34 @@ final class QuotaCycleHistorySectionView: NSView {
                     "从首次成功读取 7 天额度后开始记录", size: 11, color: .secondaryLabelColor)
                 QuotaCycleWidget.addFullWidth(placeholder, to: root)
             } else {
-                QuotaCycleWidget.addFullWidth(summary, to: root)
+                // 图例行（对齐 GLM v1.5.3）：左=「已用 / 距上限」文字图例，右=更早+翻页
+                let legendRow = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 10)
+                legendRow.addArrangedSubview(QuotaCycleWidget.label("已用 / 距上限", size: 10,
+                    color: .secondaryLabelColor, wrapping: false))
+                legendRow.addArrangedSubview(QuotaCycleWidget.spacer())
+                // 行高固定：翻页/更早的单页隐藏不得改变卡片高度（短历史等高约束依赖）
+                legendRow.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+                // 「更早记录」只在已载入的最旧一页且窗口外还有记录时出现（隐藏避免高度漂移）；
+                // 翻页控件沿用单页隐藏规则（对齐部署版行为）
+                earlierButton.isHidden = true
+                earlierButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+                if state.pageCount > 1 {
+                    pagerStack.addArrangedSubview(back)
+                    pagerStack.addArrangedSubview(pageLabel)
+                    pagerStack.addArrangedSubview(forward)
+                    pageLabel.alignment = .center
+                    legendRow.addArrangedSubview(pagerStack)
+                }
+                legendRow.addArrangedSubview(earlierButton)
+                QuotaCycleWidget.addFullWidth(legendRow, to: root)
+
                 canvas.heightAnchor.constraint(
                     equalToConstant: QuotaCycleVisualMetrics.canvasHeight).isActive = true
-                canvas.setAccessibilityLabel("额度周期回顾柱状图，每根灰色柱为额度上限 100%，蓝色柱为已用比例")
+                canvas.setAccessibilityLabel("额度周期回顾柱状图，每根灰色额度槽为上限 100%，槽内蓝色填充为已用比例")
                 QuotaCycleWidget.addFullWidth(canvas, to: root)
-
-                // 「更早记录」位于柱图之下、卡片内：只在已载入的最旧一页且窗口外
-                // 还有未载入记录时出现（隐藏会让卡片高度漂移，故用 isHidden）。
-                earlierButton.isHidden = true
-                earlierButton.translatesAutoresizingMaskIntoConstraints = false
-                earlierButton.widthAnchor.constraint(equalToConstant: 64).isActive = true
-                earlierButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
-                let earlierRow = QuotaCycleWidget.stack(orientation: .horizontal, alignment: .centerY, spacing: 0)
-                earlierRow.addArrangedSubview(QuotaCycleWidget.spacer())
-                earlierRow.addArrangedSubview(earlierButton)
-                earlierRow.addArrangedSubview(QuotaCycleWidget.spacer())
-                QuotaCycleWidget.addFullWidth(earlierRow, to: root)
+                // 图下状态行（对齐兄弟 App）：显示「悬停 ?? 固定 ?? 本屏最新」轮次的窗口/状态一句话
+                QuotaCycleWidget.addFullWidth(statusLabel, to: root)
 
                 canvas.items = state.visibleItems
                 canvas.onHover = { [weak self] id in self?.updateSelectionDisplay(hovering: id) }
@@ -605,7 +581,8 @@ final class QuotaCycleHistorySectionView: NSView {
         displayedItem = viewState.visibleItems.first { $0.id == effectiveID }
             ?? viewState.visibleItems.last
         if let item = displayedItem {
-            summary.configure(item: item)
+            statusLabel.stringValue = item.detailTitle
+            statusLabel.toolTip = item.detailValue
             canvas.setAccessibilityValue(item.accessibilityText)
         }
         canvas.needsDisplay = true
@@ -697,16 +674,12 @@ private enum QuotaCycleWidget {
         return toggle
     }
 
-    /// 文字链接式小按钮（「更早记录」）：无边框、强调色文字，hover 手型由系统按钮行为给出。
+    /// 文字按钮（「更早记录」，对齐 GLM v1.5.3 同位置文字样式）。
     static func textLinkButton(_ title: String) -> NSButton {
         let button = NSButton(title: title, target: nil, action: nil)
         button.isBordered = false
-        button.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        button.contentTintColor = PanelAccent.codex.color
-        button.attributedTitle = NSAttributedString(string: title, attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: PanelAccent.codex.color
-        ])
+        button.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        button.contentTintColor = .secondaryLabelColor
         return button
     }
 
@@ -719,29 +692,5 @@ private enum QuotaCycleWidget {
         button.widthAnchor.constraint(equalToConstant: 18).isActive = true
         button.heightAnchor.constraint(equalToConstant: 16).isActive = true
         return button
-    }
-
-    static func legendSwatch(color: NSColor) -> NSView {
-        let swatch = QuotaCycleSwatch(frame: .zero)
-        swatch.swatchColor = color
-        swatch.translatesAutoresizingMaskIntoConstraints = false
-        swatch.widthAnchor.constraint(equalToConstant: QuotaCycleVisualMetrics.barWidth).isActive = true
-        swatch.heightAnchor.constraint(equalToConstant: 10).isActive = true
-        return swatch
-    }
-}
-
-private final class QuotaCycleSwatch: NSView {
-    var swatchColor: NSColor = .secondaryLabelColor { didSet { needsDisplay = true } }
-    override var wantsUpdateLayer: Bool { true }
-    override func updateLayer() {
-        effectiveAppearance.performAsCurrentDrawingAppearance {
-            layer?.backgroundColor = swatchColor.cgColor
-            layer?.cornerRadius = QuotaCycleVisualMetrics.barCornerRadius
-        }
-    }
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        needsDisplay = true
     }
 }

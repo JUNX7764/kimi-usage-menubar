@@ -22,11 +22,11 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 S
 | `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
-| `UsagePanelController` | 原生 Popover、额度与模型明细交互、周期浏览状态、面板背景样式（纯色/液态玻璃/经典毛玻璃） |
+| `UsagePanelController` | 原生 Popover、额度与模型明细交互、周期浏览状态、卡片布局（`KimiPanelLayout` 显隐/排序）与面板背景样式（纯色/液态玻璃/经典毛玻璃） |
 | `QuotaCycleHistory` | 7 天额度观测模型、候选/确认状态机、UI 快照与稳定分页 |
 | `QuotaCycleStore` | 加盐凭据作用域、0700/0600 权限、版本化 JSON 与保存节奏 |
 | `QuotaCycleCoordinator` | 串行 load → reduce → persist、作用域代际和失败回退 |
-| `QuotaCycleHistoryView` | 原生双柱、固定详情、翻页、选择、键盘与 VoiceOver |
+| `QuotaCycleHistoryView` | 原生单槽（GLM v1.5.3 同构：灰槽+底部填充）、图例行/状态行、翻页、选择、键盘与 VoiceOver |
 | `AppDelegate` | 生命周期、刷新调度、自启、历史样本 gate 和状态聚合 |
 | `KimiOfflineRegression` | 使用临时目录与假数据的离线自检 |
 
@@ -42,7 +42,7 @@ Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度�
 
 ### 额度周期历史
 
-本次有效 7 天额度响应 → 样本 gate → 凭据加盐作用域与代际 → 串行状态机/持久化 → typed 快照 → 原生双柱卡片。只复用现有 10 秒额度请求，不读取慢轮账号信息、不使用 merged 旧值、不从本地 Token 反推。完整口径见 `17-quota-cycle-history.md`。
+本次有效 7 天额度响应 → 样本 gate → 凭据加盐作用域与代际 → 串行状态机/持久化 → typed 快照 → 原生单槽卡片。只复用现有 10 秒额度请求，不读取慢轮账号信息、不使用 merged 旧值、不从本地 Token 反推。完整口径见 `17-quota-cycle-history.md`。
 
 ### 本地 Token
 
@@ -56,9 +56,9 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 更新器只处理当前应用路径和 `com.local.kimi-usage`，不得按名称模糊终止其他进程。
 
-### 面板背景样式
+### 面板设置入口与背景样式
 
-头部最右缘按钮 → 原生 NSMenu（纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
+头部最右缘「···」按钮 → 统一原生 NSMenu（`卡片显示与排序…` → 原位设置页，`KimiPanelLayout` 显隐/排序经单 key `panelCardLayout.v1` 持久化；`背景样式` 子菜单：纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
 
 - 缺省与非法值回退 solid；打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册）共用同一应用入口，切换不重建面板内容。
 - solid：`PanelSolidBackgroundView` opacity=1（无历史 0.9 混合）；classicMaterial：仅 `NSVisualEffectView(.popover)`；liquidGlass：两层自绘背景全部隐藏，露出 macOS 26+ 新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView / NSPanel。卡片底色为 `labelColor@0.035`，描边为 `labelColor@0.09`，无阴影。

@@ -3001,10 +3001,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         CATransaction.commit()
     }
 
-    private func containsView(_ root: NSView, _ target: NSView) -> Bool {
-        root === target || root.subviews.contains { containsView($0, target) }
-    }
-
     private func allDescendants(_ root: NSView) -> [NSView] {
         [root] + root.subviews.flatMap { allDescendants($0) }
     }
@@ -3013,7 +3009,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private func currentEditorFocusIdentifier() -> String? {
         guard showingCardSettings, let editor = currentCardSettingsEditor,
               let responder = contentController.view.window?.firstResponder as? NSView,
-              containsView(editor, responder) else { return nil }
+              allDescendants(editor).contains(responder) else { return nil }
         return responder.identifier?.rawValue
     }
 

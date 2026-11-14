@@ -268,6 +268,7 @@ final class QuotaCycleChartCanvas: NSView {
         let frames = groupFrames(in: bounds)
         let effective = effectiveID
         guard !frames.isEmpty else { return }
+        let allLabels = labelFrames(in: bounds)
         // 100% 刻度（对齐 GLM v1.5.3：图区左上角，9pt secondary；先画，槽体绘制在其上）
         ("100%" as NSString).draw(at: NSPoint(x: 0, y: 0), withAttributes: [
             .font: Self.dateFont, .foregroundColor: NSColor.secondaryLabelColor
@@ -306,7 +307,7 @@ final class QuotaCycleChartCanvas: NSView {
                 NSGraphicsContext.restoreGraphicsState()
             }
             // 选中强化日期和百分比字色（GLM 同款：品牌蓝仅用于选中/悬停）。
-            let labels = labelFrames(in: bounds)[index]
+            let labels = allLabels[index]
             (item.startLabel as NSString).draw(at: labels.date.origin, withAttributes: [
                 .font: Self.dateFont,
                 .foregroundColor: item.id == effective ? NSColor.labelColor : NSColor.secondaryLabelColor

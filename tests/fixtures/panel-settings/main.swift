@@ -16,21 +16,21 @@ case "layoutModel":
     var custom = KimiPanelLayout.default
     custom.setVisible(false, for: .tools)
     custom.move(.brief, direction: .up)
-    check(custom.order == [.quota, .brief, .usage, .history, .tools], "hide+move order")
-    check(custom.visibleOrder == [.quota, .brief, .usage, .history], "hidden card removed from visibleOrder")
-    check(!custom.isVisible(.tools) && custom.order.count == 5, "hidden card stays in editor order")
+    check(custom.order == [.quota, .brief, .usage, .history, .tools, .cache], "hide+move order")
+    check(custom.visibleOrder == [.quota, .brief, .usage, .history, .cache], "hidden card removed from visibleOrder")
+    check(!custom.isVisible(.tools) && custom.order.count == 6, "hidden card stays in editor order")
     let roundTrip = KimiPanelLayout.decode(try! custom.encoded())
     check(roundTrip == custom, "JSON round trip")
     check(KimiPanelLayout.decode(Data("bad".utf8)) == .default, "invalid JSON falls back")
-    // 旧配置迁移：未知 ID 丢弃；缺失的 history 卡按默认序相对位置插入（quota→usage→brief→history→tools）
+    // 旧配置迁移：未知 ID 丢弃；缺失卡按默认序相对位置插入（quota→usage→brief→history→tools→cache）
     let legacy = #"{"order":["usage","quota","brief","usage","futureCard"],"hidden":["tools","futureCard"]}"#.data(using: .utf8)!
     let migrated = KimiPanelLayout.decode(legacy)
     // GLM 同款：缺失卡插在默认序中「紧随其后的第一张已知卡」之前；无后继则追加末尾
-    check(migrated.order == [.usage, .quota, .brief, .history, .tools], "legacy order migration: \(migrated.order)")
+    check(migrated.order == [.usage, .quota, .brief, .history, .tools, .cache], "legacy order migration: \(migrated.order)")
     // insert 分支：缺 usage/brief/history 三张卡都按默认序插在已知后继 tools 之前
     let legacySparse = #"{"order":["quota","tools"],"hidden":[]}"#.data(using: .utf8)!
     let sparseMigrated = KimiPanelLayout.decode(legacySparse)
-    check(sparseMigrated.order == [.quota, .usage, .brief, .history, .tools],
+    check(sparseMigrated.order == [.quota, .usage, .brief, .history, .tools, .cache],
           "sparse legacy migration must insert before first known successor: \(sparseMigrated.order)")
     check(migrated.hidden == [.tools], "unknown hidden dropped")
     var allHidden = KimiPanelLayout.default
@@ -42,7 +42,7 @@ case "layoutModel":
     edge.move(.quota, to: -3)
     check(edge.order == KimiPanelCardID.allCases, "move below range clamps to first")
     edge.move(.quota, to: 99)
-    check(edge.order == [.usage, .brief, .history, .tools, .quota], "move above range clamps to last")
+    check(edge.order == [.usage, .brief, .history, .tools, .cache, .quota], "move above range clamps to last")
     // 内存 backend 往返（不写真实 UserDefaults）
     let restore = KimiPanelLayoutStore.beginMemoryOverride()
     defer { restore() }

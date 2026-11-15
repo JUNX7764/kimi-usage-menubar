@@ -6,7 +6,7 @@ import Foundation
 // 隐藏 ≠ 收起：隐藏卡数据照常获取与统计，折叠状态（usageExpanded 等）不受影响。
 
 enum KimiPanelCardID: String, CaseIterable, Codable {
-    case quota, usage, brief, history, tools
+    case quota, usage, brief, history, tools, cache
 
     var title: String {
         switch self {
@@ -15,6 +15,7 @@ enum KimiPanelCardID: String, CaseIterable, Codable {
         case .brief: return "用量简析"
         case .history: return "额度周期回顾"
         case .tools: return "工具明细"
+        case .cache: return "缓存命中"
         }
     }
 }

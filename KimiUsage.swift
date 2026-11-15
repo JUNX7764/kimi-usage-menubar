@@ -257,6 +257,8 @@ struct UsageData {
     var mergedTokens: (today: TokenStat, week: TokenStat, month: TokenStat)?
     var daily: [String: [Double]] = [:]
     var tools: [TokenAggregator.ToolStats] = []
+    /// 缓存命中卡装配快照（六源分子分母同源；nil = 慢轮未跑过）
+    var cache: TokenAggregator.CacheSnapshot?
     var staleTokensInWindow: Double = 0
     /// 首轮本地扫描是否已完成：完成前缺失日一律视为覆盖未证实（数据不足），不得显示全零/持平
     var scanCompleted: Bool = false
@@ -305,15 +307,35 @@ enum TokenAggregator {
     ]
 
     typealias ModelDays = [String: [String: [Double]]]  // day -> model -> [input, output]
+    /// 平行缓存明细（day -> model -> [cacheRead, cacheCreation]）：只增不改，
+    /// 绝不参与 days/modelDays 的既有 input/output 累加（用量数字零改动红线）。
+    typealias CacheDays = [String: [String: [Double]]]
 
     // days 保留用于兼容旧缓存与对账；modelDays 是窗口汇总和模型明细的共同数据源。
+    // cacheDays 是同名聚合趟内的平行缓存明细：旧 JSON 缺字段按空值起（revision bump 后自然重建）。
     struct FileScanState: Codable {
         var offset: UInt64 = 0
         var days: [String: [Double]] = [:]
         var modelDays: ModelDays = [:]
+        var cacheDays: CacheDays = [:]
         /// 已出现 usage.record 的 Work 文件，在追加后重扫以重新匹配镜像。
         var preferUsageRecord: Bool = false
         var scanRevision: Int? = nil
+
+        init() {}
+
+        // 旧缓存 JSON 没有 cacheDays 键：合成 Decodable 会因缺键抛错并连带丢弃整个 ScanState
+        // （Hermes/ZCode 历史快照随之丢失），因此显式解码并把缺字段按空值起。
+        private enum CodingKeys: String, CodingKey { case offset, days, modelDays, cacheDays, preferUsageRecord, scanRevision }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            offset = try c.decodeIfPresent(UInt64.self, forKey: .offset) ?? 0
+            days = try c.decodeIfPresent([String: [Double]].self, forKey: .days) ?? [:]
+            modelDays = try c.decodeIfPresent(ModelDays.self, forKey: .modelDays) ?? [:]
+            cacheDays = try c.decodeIfPresent(CacheDays.self, forKey: .cacheDays) ?? [:]
+            preferUsageRecord = try c.decodeIfPresent(Bool.self, forKey: .preferUsageRecord) ?? false
+            scanRevision = try c.decodeIfPresent(Int.self, forKey: .scanRevision) ?? nil
+        }
     }
     struct ScanState: Codable {
         var work: [String: FileScanState] = [:]   // Kimi Work 本地会话
@@ -328,6 +350,28 @@ enum TokenAggregator {
     struct HermesState: Codable {
         var rows: [String: [Double]] = [:]                 // rowKey -> [累计input, 累计output]
         var rowDays: [String: [String: [Double]]] = [:]    // rowKey -> dayKey -> [input, output]
+        /// 平行缓存明细（缓存命中卡）：rowKey -> [累计cacheRead, 累计cacheWrite] 与按日贡献。
+        /// 与 rows/rowDays 同一扫描趟、同一差分语义；旧 JSON 缺字段按空值起，input 快照不受影响。
+        var rowCache: [String: [Double]] = [:]
+        var rowCacheDays: [String: [String: [Double]]] = [:]
+
+        private enum CodingKeys: String, CodingKey { case rows, rowDays, rowCache, rowCacheDays }
+        init() {}
+        // 同 FileScanState：旧 JSON 缺缓存字段按空值起，不得让整份 ScanState 解码失败。
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            rows = try c.decodeIfPresent([String: [Double]].self, forKey: .rows) ?? [:]
+            rowDays = try c.decodeIfPresent([String: [String: [Double]]].self, forKey: .rowDays) ?? [:]
+            rowCache = try c.decodeIfPresent([String: [Double]].self, forKey: .rowCache) ?? [:]
+            rowCacheDays = try c.decodeIfPresent([String: [String: [Double]]].self, forKey: .rowCacheDays) ?? [:]
+        }
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(rows, forKey: .rows)
+            try c.encode(rowDays, forKey: .rowDays)
+            try c.encode(rowCache, forKey: .rowCache)
+            try c.encode(rowCacheDays, forKey: .rowCacheDays)
+        }
         var days: [String: [Double]] {
             var total: [String: [Double]] = [:]
             for days in rowDays.values {
@@ -342,6 +386,20 @@ enum TokenAggregator {
         var modelDays: ModelDays {
             var result: ModelDays = [:]
             for (key, days) in rowDays {
+                let fields = key.split(separator: "|", omittingEmptySubsequences: false)
+                let model = fields.count > 1 ? TokenAggregator.normalizedModel(String(fields[1])) : "未知模型"
+                for (day, value) in days {
+                    var current = result[day]?[model] ?? [0, 0]
+                    current[0] += value[0]; current[1] += value[1]
+                    result[day, default: [:]][model] = current
+                }
+            }
+            return result
+        }
+        /// 平行缓存明细的按日 × 模型视图（镜像 modelDays，同一套 key 解析与模型归一）。
+        var cacheModelDays: CacheDays {
+            var result: CacheDays = [:]
+            for (key, days) in rowCacheDays {
                 let fields = key.split(separator: "|", omittingEmptySubsequences: false)
                 let model = fields.count > 1 ? TokenAggregator.normalizedModel(String(fields[1])) : "未知模型"
                 for (day, value) in days {
@@ -432,6 +490,8 @@ enum TokenAggregator {
         var merged: (today: TokenStat, week: TokenStat, month: TokenStat)
         var daily: [String: [Double]]
         var tools: [ToolStats]
+        /// 缓存命中卡装配快照（六源；zcode 缓存读取失败 → 该源 (input, cache) 同退）
+        var cache: CacheSnapshot
     }
 
     static func aggregateBothDetailed(persist: Bool = true) -> BothStats {
@@ -447,6 +507,12 @@ enum TokenAggregator {
         var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
         if FileManager.default.fileExists(atPath: zcodeDBPath) {
             zcodeOK = updateZCode(into: &st, at: zcodeDBPath)
+        }
+        // 缓存命中卡 sibling reader：与 token 扫描同趟只读查询（不动 token SQL）；
+        // nil（失败/未安装）→ 装配层把该源 (input, cache) 同退，不静默造 0。
+        var zcodeCacheDays: CacheDays?
+        if FileManager.default.fileExists(atPath: zcodeDBPath) {
+            zcodeCacheDays = scanZCodeCacheDays(at: zcodeDBPath)
         }
         let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
         st.zcodeDays = st.zcodeDays?.filter { $0.key >= cutoffKey }
@@ -482,6 +548,15 @@ enum TokenAggregator {
         }
         var mergedDays: ModelDays = [:]
         for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
+        // 缓存命中卡（六源）：文件源分子分母来自同一 FileScanState，Hermes 来自同一段行快照，
+        // 天然同源；ZCode 缓存读取失败 → 该源 (input, cache) 同退（assembleCacheSnapshot）。
+        // 分母复用现有 modelDays 各模型 input（与「用量情况」同源），不重算。
+        let cacheFileModelDays = mergeSourceModelDays(modelDays(from: st.work), modelDays(from: st.cli))
+        let cacheFileCacheDays = mergeSourceCacheDays(cacheDays(from: st.work), cacheDays(from: st.cli))
+        let cacheSnapshot = assembleCacheSnapshot(
+            fileModelDays: cacheFileModelDays, fileCacheDays: cacheFileCacheDays,
+            hermesModelDays: hermesModelDays, hermesCacheDays: st.hermes?.cacheModelDays ?? [:],
+            zcodeModelDays: zcodeModels, zcodeCacheDays: zcodeCacheDays)
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
@@ -491,7 +566,8 @@ enum TokenAggregator {
             cliFailedFiles: cliScan.failedFiles,
             merged: statWindows(mergedDays),
             daily: dailyTotals(mergedDays),
-            tools: tools)
+            tools: tools,
+            cache: cacheSnapshot)
     }
 
     static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
@@ -507,6 +583,36 @@ enum TokenAggregator {
                 }
             }
         }
+        return result
+    }
+
+    /// 缓存明细合并（镜像 mergeSourceModelDays）：多来源同模型同日 cache 求和，模型名同边界归一。
+    static func mergeSourceCacheDays(_ first: CacheDays, _ second: CacheDays) -> CacheDays {
+        var result: CacheDays = [:]
+        for source in [first, second] {
+            for (day, models) in source {
+                for (rawModel, value) in models {
+                    let model = normalizedModel(rawModel)
+                    var total = result[day]?[model] ?? [0, 0]
+                    total[0] += value[0]; total[1] += value[1]
+                    result[day, default: [:]][model] = total
+                }
+            }
+        }
+        return result
+    }
+
+    /// 文件状态字典的按日 × 模型聚合（buckets 的模型维度拆分，供缓存卡分母复用同源 input）。
+    static func modelDays(from files: [String: FileScanState]) -> ModelDays {
+        var result: ModelDays = [:]
+        for (_, st) in files { result = mergeSourceModelDays(result, st.modelDays) }
+        return result
+    }
+
+    /// 文件状态字典的平行缓存明细聚合（与 modelDays(from:) 逐文件同源配对）。
+    static func cacheDays(from files: [String: FileScanState]) -> CacheDays {
+        var result: CacheDays = [:]
+        for (_, st) in files { result = mergeSourceCacheDays(result, st.cacheDays) }
         return result
     }
 
@@ -588,12 +694,13 @@ enum TokenAggregator {
                 else { failedFiles += 1; continue }
                 let sizeU = UInt64(size)
                 var st = files[path] ?? FileScanState()
-                // Work v4 按请求关联模型及双写；旧缓存即使文件未变也重建。
-                let revision = kimiOnly ? 2 : 4
+                // Work v5 / CLI v3：按请求关联模型及双写，并补齐平行缓存明细（cacheDays）；
+                // 旧缓存（无缓存明细）即使文件未变也全量重建，保证窗口内 cacheDays 无空洞。
+                let revision = kimiOnly ? 3 : 5
                 // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
                 if st.offset == sizeU && st.scanRevision == revision { files[path] = st; continue }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
-                if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty,
+                if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty, st.cacheDays.isEmpty,
                    let mtime = vals.contentModificationDate, mtime < cutoff {
                     st.offset = sizeU; st.scanRevision = revision; files[path] = st; continue
                 }
@@ -621,6 +728,7 @@ enum TokenAggregator {
                 st.scanRevision = revision
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 st.modelDays = st.modelDays.filter { $0.key >= cutoffKey }
+                st.cacheDays = st.cacheDays.filter { $0.key >= cutoffKey }
                 files[path] = st
             }
         }
@@ -680,11 +788,19 @@ enum TokenAggregator {
                 + Double(sqlite3_column_int64(stmt, 8))
                 + Double(sqlite3_column_int64(stmt, 9))
             let cumOut = Double(sqlite3_column_int64(stmt, 7))
+            // 平行缓存明细（缓存命中卡分子）：cache_read/cache_write 列与 input 同行读取，
+            // 同一差分趟、同一 rebase 语义（计数重置钳 0，不倒扣）；不影响 input/output 既有累加。
+            let cumCacheRead = Double(sqlite3_column_int64(stmt, 8))
+            let cumCacheWrite = Double(sqlite3_column_int64(stmt, 9))
             let lastSeen = sqlite3_column_double(stmt, 10)
             let old = hs.rows[key] ?? [0, 0]
             var dIn = cumIn - old[0], dOut = cumOut - old[1]
             if dIn < 0 || dOut < 0 { dIn = max(dIn, 0); dOut = max(dOut, 0) }  // 计数被重置：rebase，不倒扣
             hs.rows[key] = [cumIn, cumOut]
+            let oldCache = hs.rowCache[key] ?? [0, 0]
+            var dCacheRead = cumCacheRead - oldCache[0], dCacheWrite = cumCacheWrite - oldCache[1]
+            if dCacheRead < 0 || dCacheWrite < 0 { dCacheRead = max(dCacheRead, 0); dCacheWrite = max(dCacheWrite, 0) }
+            hs.rowCache[key] = [cumCacheRead, cumCacheWrite]
             var days = hs.rowDays[key] ?? [:]
             if (dIn > 0 || dOut > 0), lastSeen > 0 {
                 let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
@@ -695,10 +811,22 @@ enum TokenAggregator {
                 }
             }
             hs.rowDays[key] = days.filter { $0.key >= cutoffKey }
+            var cacheDays = hs.rowCacheDays[key] ?? [:]
+            if (dCacheRead > 0 || dCacheWrite > 0), lastSeen > 0 {
+                let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+                if dayKey >= cutoffKey {
+                    var day = cacheDays[dayKey] ?? [0, 0]
+                    day[0] += dCacheRead; day[1] += dCacheWrite
+                    cacheDays[dayKey] = day
+                }
+            }
+            hs.rowCacheDays[key] = cacheDays.filter { $0.key >= cutoffKey }
         }
         // 换 key / 删除行时，快照和按日贡献必须一起撤掉，不能只清快照。
         hs.rows = hs.rows.filter { alive.contains($0.key) }
         hs.rowDays = hs.rowDays.filter { alive.contains($0.key) }
+        hs.rowCache = hs.rowCache.filter { alive.contains($0.key) }
+        hs.rowCacheDays = hs.rowCacheDays.filter { alive.contains($0.key) }
         st.hermes = hs
         return true
     }
@@ -759,6 +887,78 @@ enum TokenAggregator {
             days[dayKey, default: [:]][model] = value
         }
         return days
+    }
+
+    /// 缓存命中卡的 ZCode 独立 sibling reader（红线：不动 scanZCodeModelDays 的 token 扫描 SQL，
+    /// 避免 ZCode 主线数字回归）。行集必须与 scanZCodeModelDays 完全一致：同 WHERE
+    /// （started_at >= 毫秒 cutoff，31 天余量）、同 isKimiModel 过滤、同日桶规则——error/running
+    /// 行若已有非零 token 同样计入（input 含 error 行的现状），保证分子分母行集一致。
+    /// 缺表 / 缺列（LIMIT 0 探针 schema 守卫）/ 库打不开 → 返回 nil（失败）：
+    /// 装配层将该源 (input, cache) 同退，不静默置零（见 assembleCacheSnapshot）。
+    /// input_tokens 一并 SELECT（token 路径同列），保持两 reader 的 schema 依赖一致。
+    static func scanZCodeCacheDays(at path: String = zcodeDBPath, now: Date = Date()) -> CacheDays? {
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        else {
+            // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
+            if db != nil { sqlite3_close(db) }
+            return nil
+        }
+        defer { sqlite3_close(db) }
+        sqlite3_busy_timeout(db, 1_000)
+        // LIMIT 0 探针 schema 守卫：no such table / no such column 都按失败返回 nil（装配层同退该源）
+        guard sqlite3_exec(db, "SELECT model_id, input_tokens, cache_read_input_tokens, "
+            + "cache_creation_input_tokens, started_at FROM model_usage LIMIT 0", nil, nil, nil) == SQLITE_OK
+        else { return nil }
+        let sql = """
+            SELECT model_id, input_tokens, cache_read_input_tokens, cache_creation_input_tokens, started_at
+            FROM model_usage
+            WHERE started_at >= ?
+            """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        let cutoff = now.addingTimeInterval(-retainSeconds)
+        sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
+        let cutoffKey = dayFmt.string(from: cutoff)
+        var days: CacheDays = [:]
+        while true {
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW else { return nil }
+            let model = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+            guard isKimiModel(model) else { continue }
+            let startedAt = sqlite3_column_double(stmt, 4)
+            guard startedAt > 0 else { continue }
+            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: startedAt / 1000))
+            guard dayKey >= cutoffKey else { continue }
+            var value = days[dayKey]?[model] ?? [0, 0]
+            value[0] += sqlite3_column_double(stmt, 2)
+            value[1] += sqlite3_column_double(stmt, 3)
+            days[dayKey, default: [:]][model] = value
+        }
+        return days
+    }
+
+    /// 缓存卡装配（纯函数，可离线断言）：分子与分母必须同源。
+    /// 文件源（Work + CLI）分子分母来自同一 FileScanState，Hermes 来自同一行快照，天然同源；
+    /// ZCode 两路独立读取——缓存 sibling reader 失败（nil）→ 该源 (input, cache) 同退
+    /// （防「新分子配旧分母」错位），其余来源照常渲染，不静默造 0。
+    struct CacheSnapshot {
+        var modelDays: ModelDays = [:]   // 分母：各模型窗口 input（复用现有聚合，不重算）
+        var cacheDays: CacheDays = [:]   // 分子：平行 cacheRead/cacheCreation 明细
+    }
+
+    static func assembleCacheSnapshot(fileModelDays: ModelDays, fileCacheDays: CacheDays,
+                                      hermesModelDays: ModelDays, hermesCacheDays: CacheDays,
+                                      zcodeModelDays: ModelDays, zcodeCacheDays: CacheDays?) -> CacheSnapshot {
+        var snapshot = CacheSnapshot()
+        snapshot.modelDays = mergeSourceModelDays(fileModelDays, hermesModelDays)
+        snapshot.cacheDays = mergeSourceCacheDays(fileCacheDays, hermesCacheDays)
+        guard let zcodeCacheDays else { return snapshot }
+        snapshot.modelDays = mergeSourceModelDays(snapshot.modelDays, zcodeModelDays)
+        snapshot.cacheDays = mergeSourceCacheDays(snapshot.cacheDays, zcodeCacheDays)
+        return snapshot
     }
 
     // 请求 ID / agent + turnStep 关联不依赖耗时，兼容工具执行导致延迟的双写。
@@ -956,6 +1156,19 @@ enum TokenAggregator {
             if let v = usage[k] as? Double { output += v }
             else if let v = usage[k] as? Int { output += Double(v) }
         }
+        // 平行缓存明细（缓存命中卡分子）：键集取自上方 input 键集中的缓存两键，与 input 同一
+        // 选择分支累加（Work 双写防双计由此天然继承）；原 input/output 累加零改动（红线）。
+        // 各源口径已统一为「input 含缓存总输入」，缓存明细仅作分子，不再加回 input。
+        var cacheRead: Double = 0
+        for k in ["inputCacheRead", "cache_read_input_tokens", "cacheRead"] {
+            if let v = usage[k] as? Double { cacheRead += v }
+            else if let v = usage[k] as? Int { cacheRead += Double(v) }
+        }
+        var cacheCreation: Double = 0
+        for k in ["inputCacheCreation", "cache_creation_input_tokens", "cacheWrite"] {
+            if let v = usage[k] as? Double { cacheCreation += v }
+            else if let v = usage[k] as? Int { cacheCreation += Double(v) }
+        }
 
         let dayKey = dayFmt.string(from: t)
         if dayKey >= cutoffKey {
@@ -967,6 +1180,12 @@ enum TokenAggregator {
             modelDay[0] += input
             modelDay[1] += output
             st.modelDays[dayKey, default: [:]][model] = modelDay
+            if cacheRead != 0 || cacheCreation != 0 {
+                var cache = st.cacheDays[dayKey]?[model] ?? [0, 0]
+                cache[0] += cacheRead
+                cache[1] += cacheCreation
+                st.cacheDays[dayKey, default: [:]][model] = cache
+            }
         }
     }
 
@@ -988,6 +1207,31 @@ enum TokenAggregator {
                 add(value, model: model, to: &month)
                 if day >= d7Key { add(value, model: model, to: &week) }
                 if day >= todayKey { add(value, model: model, to: &today) }
+            }
+        }
+        return (today, week, month)
+    }
+
+    /// 缓存明细的窗口汇总（镜像 statWindows 的日窗口边界与「今日 < 7 天 < 30 天」包含关系）：
+    /// day→model→[cacheRead, cacheCreation] 求和，模型键与 modelDays 同为已归一名。
+    static func cacheWindows(_ cacheDays: CacheDays, now: Date = Date())
+        -> (today: [String: [Double]], week: [String: [Double]], month: [String: [Double]]) {
+        let todayKey = dayFmt.string(from: now)
+        let (d7Key, d30Key) = windowCutoffs(now: now)
+        var today: [String: [Double]] = [:]
+        var week: [String: [Double]] = [:]
+        var month: [String: [Double]] = [:]
+        func add(_ model: String, _ value: [Double], to target: inout [String: [Double]]) {
+            var current = target[model] ?? [0, 0]
+            current[0] += value[0]
+            current[1] += value[1]
+            target[model] = current
+        }
+        for (day, models) in cacheDays where day >= d30Key {
+            for (model, value) in models {
+                add(model, value, to: &month)
+                if day >= d7Key { add(model, value, to: &week) }
+                if day >= todayKey { add(model, value, to: &today) }
             }
         }
         return (today, week, month)
@@ -2010,6 +2254,59 @@ struct UsagePanelModel {
         var periods: [[ToolRow]] // [今日, 近 7 天, 近 30 天]
         var notices: [Notice]
     }
+    struct CacheRow {
+        var name: String         // 模型显示名 /「整体」
+        var hitText: String      // "97% 命中" / "— 命中"（整数百分比；「—」= 窗口内无缓存读写证据）
+        var inputText: String    // "输入196M"（Fmt.tokens）
+        var isOverall: Bool      // 「整体」行恒置顶，不参与排序
+    }
+    struct CacheSection {
+        var periods: [[CacheRow]] // [今日, 近 7 天, 近 30 天]；每段「整体」行恒置顶
+        /// 由分母 modelDays（复用现有聚合的各模型窗口 input，与「用量情况」同源，不重算）与
+        /// 分子 cacheDays 预计算三窗口行。input ≤ 0 不进分母（除零守卫，也不出行）；
+        /// 窗口内 cache_read == 0 且 cache_creation == 0 → 「—」（区分「无缓存证据」与「0% 命中」）；
+        /// 「整体」行为全来源全模型合计比值，全部模型无证据 → 同「—」规则；排序按窗口 input 降序。
+        static func building(modelDays: TokenAggregator.ModelDays, cacheDays: TokenAggregator.CacheDays,
+                             now: Date = Date()) -> CacheSection {
+            func rows(_ stat: TokenStat, _ cache: [String: [Double]]) -> [CacheRow] {
+                let models = stat.models.filter { $0.value.input > 0 }
+                    .sorted { lhs, rhs in
+                        if lhs.value.input != rhs.value.input { return lhs.value.input > rhs.value.input }
+                        return lhs.key < rhs.key
+                    }
+                guard !models.isEmpty else { return [] }
+                var result: [CacheRow] = []
+                var totalInput = 0.0, totalRead = 0.0, totalCreation = 0.0
+                var anyEvidence = false
+                for (model, value) in models {
+                    let cacheValue = cache[model] ?? [0, 0]
+                    totalInput += value.input
+                    totalRead += cacheValue[0]
+                    totalCreation += cacheValue[1]
+                    anyEvidence = anyEvidence || cacheValue[0] > 0 || cacheValue[1] > 0
+                    // 「—」规则：窗口内 cache_read 与 cache_creation 均为 0 → 显示「—」，区分「无缓存数据」与「0% 命中」
+                    let modelHit = (cacheValue[0] > 0 || cacheValue[1] > 0)
+                        ? "\(Int((cacheValue[0] / value.input * 100).rounded()))% 命中" : "— 命中"
+                    result.append(CacheRow(
+                        name: TokenAggregator.modelDisplayName(model),
+                        hitText: modelHit,
+                        inputText: "输入\(Fmt.tokens(value.input))", isOverall: false))
+                }
+                let overallHit = anyEvidence
+                    ? "\(Int((totalRead / totalInput * 100).rounded()))% 命中" : "— 命中"
+                result.insert(CacheRow(name: "整体", hitText: overallHit,
+                                       inputText: "输入\(Fmt.tokens(totalInput))", isOverall: true), at: 0)
+                return result
+            }
+            let stats = TokenAggregator.statWindows(modelDays, now: now)
+            let caches = TokenAggregator.cacheWindows(cacheDays, now: now)
+            return CacheSection(periods: [
+                rows(stats.today, caches.today),
+                rows(stats.week, caches.week),
+                rows(stats.month, caches.month)
+            ])
+        }
+    }
 
     var updateItem: NSMenuItem?
     var title: String
@@ -2019,6 +2316,7 @@ struct UsagePanelModel {
     var usage: TokenSection      // 用量情况：合并本机全部来源，口径见 docs/DEVELOPMENT.md
     var brief: BriefSection      // 用量简析：近 30 天日图 + 较昨日/较前 7 天
     var tools: ToolsSection      // 工具明细：逐来源占比
+    var cache: CacheSection = CacheSection(periods: [])   // 缓存命中：三窗口预计算行（分子分母同源装配）
     var history: QuotaCycleSnapshot   // 额度周期回顾：typed 快照，视图不读磁盘/网络/凭据
     var notices: [Notice]
     var lastAttempt: String
@@ -2572,6 +2870,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     /// 上次渲染时的轮次 ID 序列：刷新带来新轮次时把页锚点跟到固定选择，不跳回最新页。
     private var quotaHistoryRecordIDs: [UUID] = []
     private var toolPeriodIndex = 1   // 工具明细默认「7 天」（板块折叠状态独立于周期选择）
+    private var cachePeriodIndex = 1  // 缓存命中默认「近 7 天」；in-memory 不落盘，对齐 toolPeriodIndex 现状
     private var briefSelectedIndex: Int?   // 用量简析选中日（重建保留；nil = 最新一日）
     private var expandedUsageBuckets: Set<Int> = []
     private var updateMessage: String?
@@ -2853,6 +3152,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                     let toolsView = ToolBreakdownView(model: model.tools, periodIndex: toolPeriodIndex, expanded: toolsExpanded,
                         target: self, periodAction: #selector(toggleToolPeriod(_:)), toggleAction: #selector(toggleTools))
                     addContentRow(PanelCardView(containing: toolsView))
+                case .cache:
+                    let cacheView = CacheSectionView(model: model.cache, periodIndex: cachePeriodIndex,
+                        target: self, periodAction: #selector(toggleCachePeriod(_:)))
+                    addContentRow(PanelCardView(containing: cacheView))
                 }
             }
         }
@@ -3149,6 +3452,12 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         toolPeriodIndex = sender.tag
         refreshPanelLayout()
     }
+    // 缓存命中周期行：与 toggleToolPeriod 同款语义（in-memory，不落盘）
+    @objc private func toggleCachePeriod(_ sender: NSButton) {
+        guard sender.tag != cachePeriodIndex else { return }
+        cachePeriodIndex = sender.tag
+        refreshPanelLayout()
+    }
     @objc private func toggleUsageBucket(_ sender: NSButton) {
         if expandedUsageBuckets.contains(sender.tag) { expandedUsageBuckets.remove(sender.tag) }
         else { expandedUsageBuckets.insert(sender.tag) }
@@ -3275,6 +3584,15 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard verifyTokenBucketInteractionsForPreview() else {
             fputs("KimiUsage visual test: model bucket interactions or alignment\n", stderr); return false
         }
+        // 缓存命中卡守门（fixture 固定）：卡片出现、「整体」置顶行、命中率与「—」规则文案齐备。
+        // 默认周期「近 7 天」= day 0 与 day -3 两天：k3.1-pro 98%、kimi-for-coding 无证据、整体 97%。
+        let cacheTexts = labels(stack)
+        for expected in ["缓存命中", "整体", "K3.1 Pro", "Kimi for Coding",
+                         "97% 命中 · 输入\(Fmt.tokens(129_400_000))",
+                         "98% 命中 · 输入\(Fmt.tokens(128_000_000))",
+                         "— 命中 · 输入\(Fmt.tokens(1_400_000))"] where !cacheTexts.contains(expected) {
+            fputs("KimiUsage visual test: cache hit card missing \(expected)\n", stderr); return false
+        }
         return true
     }
 
@@ -3307,7 +3625,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func cardTitleSequence() -> [String] {
             stack.arrangedSubviews.map { row in
                 descendants(row).compactMap { ($0 as? NSTextField)?.stringValue }
-                    .first { ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细"].contains($0) }
+                    .first { ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细", "缓存命中"].contains($0) }
             }.compactMap { $0 }
         }
         func editorButton(in view: NSView, _ identifier: String) -> NSButton? {
@@ -3331,7 +3649,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         toolsToggle.performClick(nil)
         guard editor.layout.isVisible(.tools) == false
-              && editor.layout.visibleOrder == [.quota, .usage, .brief, .history] else {
+              && editor.layout.visibleOrder == [.quota, .usage, .brief, .history, .cache] else {
             return fail("tools toggle changed other cards")
         }
         // 真实上移：额度周期回顾上移一格
@@ -3339,7 +3657,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("history move-up button missing")
         }
         historyUp.performClick(nil)
-        guard editor.layout.order == [.quota, .usage, .history, .brief, .tools] else {
+        guard editor.layout.order == [.quota, .usage, .history, .brief, .tools, .cache] else {
             return fail("history move-up changed order unexpectedly")
         }
         // 真实「完成」：退出设置页并应用布局
@@ -3349,7 +3667,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         }
         doneButton.performClick(nil)
         guard !showingCardSettings else { return fail("settings did not close") }
-        guard cardTitleSequence() == ["用量进度", "用量情况", "额度周期回顾", "用量简析"] else {
+        guard cardTitleSequence() == ["用量进度", "用量情况", "额度周期回顾", "用量简析", "缓存命中"] else {
             return fail("finished layout not applied: \(cardTitleSequence())")
         }
         // 重开：编辑器重建但布局与开关状态保留
@@ -3362,7 +3680,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               reopenedToolsToggle.state == .off else {
             return fail("toggle state lost on rebuild")
         }
-        // 逐个隐藏剩余四张卡（每次点击后行视图重建，按钮现取现用）
+        // 逐个隐藏剩余卡（每次点击后行视图重建，按钮现取现用）
         for id in KimiPanelCardID.allCases where id != .tools {
             guard let toggle = editorButton(in: reopened, "CardToggle.\(id.rawValue)") else {
                 return fail("toggle missing for \(id.rawValue)")
@@ -3385,7 +3703,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             return fail("all-hidden restore button missing")
         }
         restoreButton.performClick(nil)
-        guard panelLayout == .default, cardTitleSequence() == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细"] else {
+        guard panelLayout == .default, cardTitleSequence() == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细", "缓存命中"] else {
             return fail("restore default did not reinstall every card")
         }
         guard showingCardSettings == false else { return fail("settings page leaked after restore") }
@@ -4739,6 +5057,70 @@ private final class ToolPeriodButton: NSButton {
     }
 }
 
+/// 缓存命中卡：标题行内周期按钮（今日 / 近 7 天 / 近 30 天，默认近 7 天，in-memory），
+/// 无独立折叠态与刷新按钮（跟随面板全局刷新）；「整体」汇总行恒置顶，其余模型行按窗口
+/// input 降序；无独立读取失败态（失败来源无贡献即无行，见装配层同退语义）。
+private final class CacheSectionView: NSView {
+    init(model: UsagePanelModel.CacheSection, periodIndex: Int,
+         target: AnyObject, periodAction: Selector) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let root = PanelUI.stack(spacing: 5)
+        let periodNames = ["今日", "近 7 天", "近 30 天"]   // 命名对齐「用量情况」周期标签
+        let periods = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 2)
+        for (index, name) in periodNames.enumerated() {
+            let button = ToolPeriodButton(title: name)
+            button.tag = index
+            button.selected = index == periodIndex
+            button.target = target
+            button.action = periodAction
+            button.setAccessibilityLabel("缓存命中周期：\(name)")
+            periods.addArrangedSubview(button)
+        }
+        let header = PanelUI.cardHeader(icon: "arrow.triangle.2.circlepath", title: "缓存命中",
+                                        trailing: [periods])
+        PanelUI.addFullWidth(header, to: root)
+        let rows = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : []
+        if rows.isEmpty {
+            // 空态复用工具明细文案：窗口内没有任何 Kimi 用量
+            PanelUI.addFullWidth(PanelUI.label("本周期暂无用量", size: 11, color: .secondaryLabelColor), to: root)
+        }
+        for (index, row) in rows.enumerated() {
+            let view = CacheRowView(row: row)
+            PanelUI.addFullWidth(view, to: root)
+            if index == rows.count - 1 { root.setCustomSpacing(4, after: view) }
+        }
+        addSubview(root)
+        PanelUI.pin(root, to: self)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 缓存命中行：模型名（主文字）｜「97% 命中 · 输入196M」（次要文字右对齐）。
+private final class CacheRowView: NSView {
+    init(row: UsagePanelModel.CacheRow) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let main = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        let name = PanelUI.label(row.name, size: 11,
+                                 weight: row.isOverall ? .semibold : .medium, wrapping: false)
+        name.lineBreakMode = .byTruncatingTail
+        name.toolTip = row.name
+        main.addArrangedSubview(name)
+        main.addArrangedSubview(PanelUI.spacer())
+        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 11,
+            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
+        detail.alignment = .right
+        detail.setContentHuggingPriority(.required, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
+        main.addArrangedSubview(detail)
+        addSubview(main)
+        PanelUI.pin(main, to: self)
+        setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
 /// 细占比条：分母为同周期同一快照的合并总量。
 private final class ShareBarView: NSView {
     private let fill = CALayer()
@@ -5130,6 +5512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.mergedTokens = d.merged
                     $0.daily = d.daily
                     $0.tools = d.tools
+                    $0.cache = d.cache
                     $0.staleTokensInWindow = TokenAggregator.staleTokensInWindow(tools: d.tools)
                     // 首轮扫描跑完即置真：此后缺键日按覆盖规则解释为真实零（数据不足态结束）
                     $0.scanCompleted = true
@@ -5173,7 +5556,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 merged.workTokensFailedFiles = old.workTokensFailedFiles
                 merged.cliTokensFailedFiles = old.cliTokensFailedFiles
                 merged.mergedTokens = old.mergedTokens; merged.daily = old.daily
-                merged.tools = old.tools; merged.staleTokensInWindow = old.staleTokensInWindow
+                merged.tools = old.tools; merged.cache = old.cache
+                merged.staleTokensInWindow = old.staleTokensInWindow
                 // 快轮不触发扫描：首轮完成状态沿旧值保留，扫描完成后不会退回未知态
                 merged.scanCompleted = old.scanCompleted
             } else {
@@ -5515,6 +5899,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         let toolsSection = UsagePanelModel.ToolsSection(periods: [toolRows(0), toolRows(1), toolRows(2)], notices: [])
+        // 缓存命中卡：分母复用现有聚合的各模型窗口 input（与「用量情况」同源），分子为平行缓存明细；
+        // zcode 缓存读取失败 → 该源 (input, cache) 已在装配层同退，此处不再感知来源失败面。
+        let cacheSection = UsagePanelModel.CacheSection.building(
+            modelDays: usage.cache?.modelDays ?? [:], cacheDays: usage.cache?.cacheDays ?? [:])
         let usageSection = section("用量情况", .codex,
             [usage.mergedTokens?.today, usage.mergedTokens?.week, usage.mergedTokens?.month],
             usage.workTokensError ?? usage.cliTokensError,
@@ -5542,6 +5930,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage: usageSection,
             brief: brief,
             tools: toolsSection,
+            cache: cacheSection,
             history: historySnapshot,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
             refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
@@ -5674,6 +6063,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.daily = dailyTotals
             usage.mergedTokens = TokenAggregator.statWindows(allDays, now: chartNow)
             usage.staleTokensInWindow = 0
+            // 缓存命中卡固定 fixture（模式对齐上方 preview*Days，不读真实库/会话）：
+            // k3.1-pro 恒 98% 命中，kimi-for-coding 无缓存证据显示「—」；
+            // 样本日跨今日 / 近 7 天 / 近 30 天三窗口，默认「近 7 天」= day 0 与 day -3 两天。
+            var cacheFixture = TokenAggregator.CacheSnapshot()
+            for offset in [0, -3, -12] {
+                let key = TokenAggregator.dayKey(offset, from: chartNow)
+                cacheFixture.modelDays[key] = ["k3.1-pro": [64_000_000, 3_200_000],
+                                               "kimi-for-coding": [700_000, 90_000]]
+                cacheFixture.cacheDays[key] = ["k3.1-pro": [62_720_000, 640_000]]   // 98% 命中 + 写入证据
+            }
+            usage.cache = cacheFixture
             if args.contains("--visual-preview-states") || args.contains("--visual-preview-long") {
                 usage.staleTokensInWindow = 1   // 演示比较条「数据不足」分支
             }
@@ -6285,6 +6685,7 @@ enum KimiOfflineRegression {
                         direction: .flat, detail: ""),
                     notices: []),
                 tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                cache: UsagePanelModel.CacheSection(periods: []),
                 history: QuotaCycleSnapshot.inactive,
                 notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                 refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
@@ -6340,6 +6741,7 @@ enum KimiOfflineRegression {
                             direction: .flat, detail: ""),
                         notices: []),
                     tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    cache: UsagePanelModel.CacheSection(periods: []),
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
@@ -6523,6 +6925,7 @@ enum KimiOfflineRegression {
                             direction: .flat, detail: ""),
                         notices: []),
                     tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    cache: UsagePanelModel.CacheSection(periods: []),
                     history: history,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
@@ -6531,11 +6934,11 @@ enum KimiOfflineRegression {
             }
             let historyController = UsagePanelController()
             historyController.previewReduceTransparencyOverride = false
-            /// 各行 → 卡片标题（用量进度 / 用量情况 / 用量简析 / 额度周期回顾 / 工具明细）
+            /// 各行 → 卡片标题（用量进度 / 用量情况 / 用量简析 / 额度周期回顾 / 工具明细 / 缓存命中）
             func cardTitles(_ rows: [NSView]) -> [String] {
                 rows.map { row in
                     descendants(row).compactMap { ($0 as? NSTextField)?.stringValue }
-                        .first { ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细"].contains($0) }
+                        .first { ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细", "缓存命中"].contains($0) }
                 }.compactMap { $0 }
             }
             func historyCard(in rows: [NSView]) throws -> NSView {
@@ -6550,7 +6953,7 @@ enum KimiOfflineRegression {
             for width in [CGFloat(330), CGFloat(300)] {
                 let rows = historyController.rebuildContentForTest(width: width)
                 let order = cardTitles(rows)
-                try expect(order == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细"],
+                try expect(order == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细", "缓存命中"],
                            "card order wrong at \(width)pt: \(order)")
                 let card = try historyCard(in: rows)
                 try expect(abs(card.frame.width - (width - 32)) < 0.5,
@@ -6690,9 +7093,9 @@ enum KimiOfflineRegression {
             var customLayout = KimiPanelLayout.default
             customLayout.setVisible(false, for: .tools)
             customLayout.move(.brief, direction: .up)
-            try expect(customLayout.order == [.quota, .brief, .usage, .history, .tools]
-                       && customLayout.visibleOrder == [.quota, .brief, .usage, .history]
-                       && customLayout.order.count == 5,
+            try expect(customLayout.order == [.quota, .brief, .usage, .history, .tools, .cache]
+                       && customLayout.visibleOrder == [.quota, .brief, .usage, .history, .cache]
+                       && customLayout.order.count == 6,
                        "panel layout hide-or-move changed: \(customLayout)")
             let customLayoutJSON = try customLayout.encoded()
             try expect(KimiPanelLayout.decode(customLayoutJSON) == customLayout,
@@ -6703,7 +7106,7 @@ enum KimiOfflineRegression {
                 .data(using: .utf8)!
             let migratedLayout = KimiPanelLayout.decode(legacyLayoutJSON)
             // GLM 同款：缺失卡插在默认序中「紧随其后的第一张已知卡」之前；无后继则追加末尾
-            try expect(migratedLayout.order == [.usage, .quota, .brief, .history, .tools],
+            try expect(migratedLayout.order == [.usage, .quota, .brief, .history, .tools, .cache],
                        "legacy layout migration must insert new cards by default-relative position: \(migratedLayout.order)")
             try expect(migratedLayout.hidden == [.tools],
                        "unknown hidden IDs must be dropped, known ones kept")
@@ -6748,17 +7151,17 @@ enum KimiOfflineRegression {
             guard let quotaUp = editorButton(in: editor, "CardMoveUp.quota") else {
                 throw Failure(description: "first row move-up button missing")
             }
-            guard let toolsDown = editorButton(in: editor, "CardMoveDown.tools") else {
+            guard let cacheDown = editorButton(in: editor, "CardMoveDown.cache") else {
                 throw Failure(description: "last row move-down button missing")
             }
-            try expect(!quotaUp.isEnabled && !toolsDown.isEnabled,
+            try expect(!quotaUp.isEnabled && !cacheDown.isEnabled,
                        "edge rows must disable their out-of-range move button")
             // 真实上移按钮事件（普通按钮无状态翻转，无窗口环境可靠）：额度周期回顾上移一格
             guard let historyUp = editorButton(in: editor, "CardMoveUp.history") else {
                 throw Failure(description: "history move-up button missing")
             }
             historyUp.performClick(nil)
-            try expect(editor.layout.order == [.quota, .usage, .history, .brief, .tools],
+            try expect(editor.layout.order == [.quota, .usage, .history, .brief, .tools, .cache],
                        "history move-up changed order unexpectedly: \(editor.layout.order)")
             try expect(settingsController.panelLayout == editor.layout,
                        "editor change did not sync controller layout")
@@ -6768,7 +7171,7 @@ enum KimiOfflineRegression {
             settingsController.finishCardSettings()
             try expect(!settingsController.showingCardSettings, "card settings did not close")
             let appliedOrder = cardTitles(settingsController.rebuildContentForTest(width: 330))
-            try expect(appliedOrder == ["用量进度", "用量情况", "额度周期回顾", "用量简析", "工具明细"],
+            try expect(appliedOrder == ["用量进度", "用量情况", "额度周期回顾", "用量简析", "工具明细", "缓存命中"],
                        "finished layout must apply to content cards: \(appliedOrder)")
             settingsController.showCardSettings()
             guard let reopenedEditor = settingsController.cardSettingsEditorForTest else {
@@ -6794,9 +7197,50 @@ enum KimiOfflineRegression {
             settingsController.restoreDefaultCardLayout()
             try expect(settingsController.panelLayout == .default, "restore default changed other prefs")
             let restoredOrder = cardTitles(settingsController.rebuildContentForTest(width: 330))
-            try expect(restoredOrder == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细"],
+            try expect(restoredOrder == ["用量进度", "用量情况", "用量简析", "额度周期回顾", "工具明细", "缓存命中"],
                        "restore default must reinstall every card in default order: \(restoredOrder)")
             settingsController.finishCardSettings()
+
+            // ===== 缓存命中卡注册（断言 14-15）=====
+            // 断言 14：旧 5 卡配置经 normalized() 后 .cache 追加末尾（无后继卡 → append），
+            // 其余顺序与显隐原样保留。
+            let legacyFiveCards = #"{"order":["quota","usage","brief","history","tools"],"hidden":["tools"]}"#
+                .data(using: .utf8)!
+            let migratedFive = KimiPanelLayout.decode(legacyFiveCards)
+            try expect(migratedFive.order == [.quota, .usage, .brief, .history, .tools, .cache]
+                       && migratedFive.order.last == .cache && migratedFive.hidden == [.tools],
+                       "legacy five-card config must append .cache via normalized(): \(migratedFive)")
+            // 断言 15：设置列表 6 行完整——枚举序即默认序，「缓存命中」命名与末位默认可见。
+            try expect(KimiPanelCardID.allCases == [.quota, .usage, .brief, .history, .tools, .cache]
+                       && KimiPanelCardID.cache.title == "缓存命中"
+                       && KimiPanelLayout.default.visibleOrder == KimiPanelCardID.allCases
+                       && editor.layout.order.count == 6,
+                       "card settings must list all six cards with 缓存命中 last")
+            // 补充（缓存卡行装配）：命中率整数百分比、— 规则、整体置顶、input 降序、input≤0 不进分母。
+            let cardNow = Date(timeIntervalSince1970: 1_800_000_000)
+            var cardModelDays: TokenAggregator.ModelDays = [:]
+            cardModelDays[TokenAggregator.dayKey(0, from: cardNow)] =
+                ["k3.1-pro": [1_000, 0], "kimi-for-coding": [500, 0], "zero-model": [0, 0]]
+            cardModelDays[TokenAggregator.dayKey(-2, from: cardNow)] = ["k3.1-pro": [500, 0]]
+            var cardCacheDays: TokenAggregator.CacheDays = [:]
+            cardCacheDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [900, 50]]
+            let cardSection = UsagePanelModel.CacheSection.building(
+                modelDays: cardModelDays, cacheDays: cardCacheDays, now: cardNow)
+            try expect(cardSection.periods.count == 3, "cache section must precompute three periods")
+            try expect(cardSection.periods[0].map(\.name) == ["整体", "K3.1 Pro", "Kimi for Coding"]
+                       && cardSection.periods[0][0].hitText == "60% 命中"
+                       && cardSection.periods[0][0].inputText == "输入\(Fmt.tokens(1_500))"
+                       && cardSection.periods[0][1].hitText == "90% 命中"
+                       && cardSection.periods[0][2].hitText == "— 命中"
+                       && !cardSection.periods[0].contains { $0.name == "zero-model" },
+                       "cache card today rows drifted: \(cardSection.periods[0].map { "\($0.name)|\($0.hitText)|\($0.inputText)" })")
+            try expect(cardSection.periods[1].map(\.hitText) == ["45% 命中", "60% 命中", "— 命中"]
+                       && cardSection.periods[2].map(\.hitText) == cardSection.periods[1].map(\.hitText),
+                       "cache card week/month rows drifted")
+            let emptySection = UsagePanelModel.CacheSection.building(
+                modelDays: [:], cacheDays: [:], now: cardNow)
+            try expect(emptySection.periods.allSatisfy { $0.isEmpty },
+                       "empty cache fixture must yield the 本周期暂无用量 empty state")
 
             let absent = Fetcher.parseCodeUsagePayload([:])
             try expect(absent.fiveHourUsed == nil && absent.fiveHourError != nil, "missing 5H was not rejected")
@@ -7273,6 +7717,13 @@ enum KimiOfflineRegression {
                        && apiFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
                        && apiFile.modelDays[modelDayKey]?["k3-256k"] == [35, 2],
                        "model switching mixed or dropped token contributions")
+            // 断言 2（CLI wire）：usage.record 的 inputCacheRead/inputCacheCreation 平行累加精确；
+            // context.append_loop_event 双写沿 preferUsageRecord/kimiOnly 同一选择分支跳过，缓存不双计；
+            // 非 Kimi 模型（glm-5.3）不产生缓存贡献。
+            try expect(apiFile.cacheDays[modelDayKey]?["k3.1-pro"] == [20, 5]
+                       && apiFile.cacheDays[modelDayKey]?["k3-256k"] == [20, 5]
+                       && apiFile.cacheDays[modelDayKey]?["glm-5.3"] == nil,
+                       "CLI wire cache read/creation accumulation is wrong")
 
             // 增量格式升级：先只有 loop，追加 record 后同轮重扫，只留一份镜像。
             let workRoot = root.appendingPathComponent("work-scan").path
@@ -7372,6 +7823,17 @@ enum KimiOfflineRegression {
                        && delayedWork.modelDays[modelDayKey]?["k3d1-agent"] == [35, 2]
                        && delayedWork.modelDays[modelDayKey]?["未知模型"] == nil,
                        "request-scoped delayed mirror lost its model or was double-counted")
+            // 断言 3（Work 配对）：llm.request/usage.record 经 requestID/请求上下文配对后，
+            // 缓存随归属模型/日精确累加，且与 input 落同一选择分支（镜像 loop 不双计）。
+            try expect(delayedWork.cacheDays[modelDayKey]?["k3d1-agent"] == [20, 5]
+                       && delayedWork.cacheDays[modelDayKey]?["未知模型"] == nil,
+                       "Work request-scoped cache attribution is wrong")
+            let switchedCacheWork = try parseWork([
+                requestRow("k2d8-preview", "0.1", eventMS - 1000), stepRow(1, eventMS),
+                requestRow("k3d1-agent", "0.2", eventMS + 1000), stepRow(2, eventMS + 2000)])
+            try expect(switchedCacheWork.cacheDays[modelDayKey]?["k2d8-preview"] == [20, 5]
+                       && switchedCacheWork.cacheDays[modelDayKey]?["k3d1-agent"] == [20, 5],
+                       "Work per-request cache switching is wrong")
             let switchedWork = try parseWork([
                 requestRow("k2d8-preview", "0.1", eventMS - 1000), stepRow(1, eventMS),
                 requestRow("k3d1-agent", "0.2", eventMS + 1000), stepRow(2, eventMS + 2000)])
@@ -7474,6 +7936,22 @@ enum KimiOfflineRegression {
                        && TokenAggregator.modelDisplayName("kimi-for-coding") == "Kimi for Coding",
                        "canonical model names or display names are wrong")
 
+            // 断言 8（缓存合并）：多来源同模型同日 cache 求和、模型名边界归一；窗口外行不进。
+            let mergedCacheDays = TokenAggregator.mergeSourceCacheDays(
+                [offsetDay(0): ["k3.1-pro": [10, 1]]],
+                [offsetDay(0): ["k3.1-pro": [20, 2], "kimi-code/k3-256k": [5, 0]],
+                 offsetDay(-40): ["k3.1-pro": [999, 999]]])
+            try expect(mergedCacheDays[offsetDay(0)]?["k3.1-pro"] == [30, 3]
+                       && mergedCacheDays[offsetDay(0)]?["k3-256k"] == [5, 0],
+                       "multi-source cache merging or model normalization is wrong")
+            var outOfWindowFile = TokenAggregator.FileScanState()
+            let staleMS = Date().addingTimeInterval(-40 * 86400).timeIntervalSince1970 * 1000
+            try TokenAggregator.parseLines(
+                jsonLine(["type": "usage.record", "time": staleMS, "model": "k3.1-pro", "usage": kimiUsage]),
+                kimiOnly: true, cutoffKey: modelDayKey, into: &outOfWindowFile)
+            try expect(outOfWindowFile.cacheDays.isEmpty && totals(outOfWindowFile) == [0, 0],
+                       "out-of-window cache rows must not enter cacheDays")
+
             // 相同用量隔数小时是两次调用；午夜附近的镜像仍能配对。
             func workRow(_ kind: String, _ ms: Double, _ id: String? = nil) -> [String: Any] {
                 var row: [String: Any] = ["type": kind, "time": ms]
@@ -7501,9 +7979,61 @@ enum KimiOfflineRegression {
                 legacyWork[key]?.modelDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧模型": [999, 999]]]
             }
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &legacyWork)
-            try expect(legacyWork.values.first?.scanRevision == 4 && legacyWork.values.first.map(totals) == [35, 2]
+            try expect(legacyWork.values.first?.scanRevision == 5 && legacyWork.values.first.map(totals) == [35, 2]
                        && legacyWork.values.first?.modelDays.values.first?["旧模型"] == nil,
                        "v6 old revision was not rebuilt")
+
+            // 断言 6（scanRevision bump）：旧修订持久化状态（文件字节未变、offset == size）也必须
+            // 全量重建，cacheDays 无空洞；>31 天未修改的新见文件仍走老文件跳过路径。
+            var bumpWork = workFiles
+            for key in bumpWork.keys {
+                bumpWork[key]?.scanRevision = 4
+                bumpWork[key]?.cacheDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧缓存": [999, 999]]]
+            }
+            _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &bumpWork)
+            try expect(bumpWork.values.allSatisfy { $0.scanRevision == 5 && $0.cacheDays["旧缓存"] == nil }
+                       && bumpWork.values.contains { $0.cacheDays[modelDayKey]?["k3.1-pro"] == [20, 5] },
+                       "revision bump must rebuild unchanged files and rebuild cacheDays without holes")
+            var bumpCLI: [String: TokenAggregator.FileScanState] = [:]
+            let cliBumpRoot = root.appendingPathComponent("cli-bump-scan").path
+            try FileManager.default.createDirectory(atPath: cliBumpRoot, withIntermediateDirectories: true)
+            let cliBumpPath = cliBumpRoot + "/session.jsonl"
+            try (try jsonLine(usageRecord) + "\n").write(toFile: cliBumpPath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [cliBumpRoot], kimiOnly: true, into: &bumpCLI)
+            for key in bumpCLI.keys { bumpCLI[key]?.scanRevision = 2 }
+            _ = TokenAggregator.scan(roots: [cliBumpRoot], kimiOnly: true, into: &bumpCLI)
+            try expect(bumpCLI.values.first?.scanRevision == 3
+                       && bumpCLI.values.first?.cacheDays[modelDayKey]?["k3.1-pro"] == [20, 5],
+                       "CLI revision bump did not rebuild cacheDays")
+            var staleFiles: [String: TokenAggregator.FileScanState] = [:]
+            let staleRoot = root.appendingPathComponent("stale-scan").path
+            try FileManager.default.createDirectory(atPath: staleRoot, withIntermediateDirectories: true)
+            let stalePath = staleRoot + "/old.jsonl"
+            try (try jsonLine(usageRecord) + "\n").write(toFile: stalePath, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-40 * 86400)],
+                                                  ofItemAtPath: stalePath)
+            let staleSize = UInt64((try jsonLine(usageRecord) + "\n").utf8.count)
+            _ = TokenAggregator.scan(roots: [staleRoot], kimiOnly: false, into: &staleFiles)
+            _ = TokenAggregator.scan(roots: [staleRoot], kimiOnly: false, into: &staleFiles)
+            try expect(staleFiles.values.first?.cacheDays.isEmpty == true
+                       && staleFiles.values.first?.days.isEmpty == true
+                       && staleFiles.values.first?.offset == staleSize,
+                       ">31-day-old untouched files must stay skipped after revision bump")
+            // 断言 7（截断/轮换）：size < offset → cacheDays 随文件状态清零重扫，不残留旧模型缓存。
+            var truncateFiles: [String: TokenAggregator.FileScanState] = [:]
+            let truncateRoot = root.appendingPathComponent("truncate-scan").path
+            try FileManager.default.createDirectory(atPath: truncateRoot, withIntermediateDirectories: true)
+            let truncatePath = truncateRoot + "/wire.jsonl"
+            try (try jsonLine(loopMirror) + "\n").write(toFile: truncatePath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [truncateRoot], kimiOnly: false, into: &truncateFiles)
+            try expect(truncateFiles.values.first?.cacheDays[modelDayKey]?["未知模型"] == [20, 5],
+                       "truncate fixture baseline missing cache contribution")
+            try (try jsonLine(usageRecord) + "\n").write(toFile: truncatePath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [truncateRoot], kimiOnly: false, into: &truncateFiles)
+            try expect(truncateFiles.values.first?.cacheDays[modelDayKey]?["k3.1-pro"] == [20, 5]
+                       && truncateFiles.values.first?.cacheDays[modelDayKey]?["未知模型"] == nil
+                       && truncateFiles.values.first.map(totals) == [35, 2],
+                       "truncated file must reset cacheDays with the rescan")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]
@@ -7516,6 +8046,25 @@ enum KimiOfflineRegression {
             try TokenAggregator.parseLines([jsonLine(promaAssistant), jsonLine(promaResult)].joined(separator: "\n"),
                                            kimiOnly: true, cutoffKey: "0000-00-00", into: &promaFile)
             try expect(totals(promaFile) == [35, 3], "Proma result summary was counted as per-call usage")
+            // 断言 1（Proma/Claude）：assistant 行 cache_read/creation 平行累加精确；
+            // result 累计汇总行不产生任何缓存贡献；Claude JSONL（timestamp + message.usage）同路径。
+            let claudeAssistant: [String: Any] = ["type": "assistant",
+                                                  "timestamp": ISO8601DateFormatter().string(from: Date()),
+                                                  "message": ["model": "k3.1-pro", "usage": promaUsage]]
+            var claudeFile = TokenAggregator.FileScanState()
+            try TokenAggregator.parseLines(jsonLine(claudeAssistant), kimiOnly: true,
+                                           cutoffKey: "0000-00-00", into: &claudeFile)
+            try expect(promaFile.cacheDays[modelDayKey]?["k3-256k"] == [20, 5]
+                       && promaFile.cacheDays.count == 1
+                       && claudeFile.cacheDays[modelDayKey]?["k3.1-pro"] == [20, 5],
+                       "Proma/Claude cache read/creation accumulation or result-row exclusion is wrong")
+            // 断言 5（红线）：缓存累加只增不改——各 fixture 的 days/modelDays 与升级前口径完全一致。
+            try expect(totals(promaFile) == [35, 3] && promaFile.modelDays[modelDayKey]?["k3-256k"] == [35, 3]
+                       && claudeFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 3]
+                       && apiFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && workMixed.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
+                       && delayedWork.modelDays[modelDayKey]?["k3d1-agent"] == [35, 2],
+                       "cache accumulation must not change existing days/modelDays numbers")
 
             // SQLite 假库：ZCode 输入已含 cache，不能重复加；Hermes 换 key 不得重复回填。
             let sqlitePath = root.appendingPathComponent("client-usage.sqlite").path
@@ -7558,6 +8107,89 @@ enum KimiOfflineRegression {
             try expect(decodedZState.zcodeModelDays == zState.zcodeModelDays,
                        "model scan cache did not survive persistence")
 
+            // ===== 缓存命中卡 ZCode sibling reader（断言 9-13）=====
+            let sqliteCachePath = root.appendingPathComponent("client-usage-cache.sqlite").path
+            var cacheDB: OpaquePointer?
+            try expect(sqlite3_open(sqliteCachePath, &cacheDB) == SQLITE_OK, "failed to create cache fixture db")
+            defer { sqlite3_close(cacheDB) }
+            func execCache(_ sql: String) throws {
+                try expect(sqlite3_exec(cacheDB, sql, nil, nil, nil) == SQLITE_OK, "cache fixture db SQL failed: \(sql)")
+            }
+            try execCache("""
+                CREATE TABLE model_usage (model_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
+                    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER, started_at INTEGER)
+                """)
+            let yesterdayKey = TokenAggregator.dayFmt.string(from: usageNow.addingTimeInterval(-86400))
+            try execCache("""
+                INSERT INTO model_usage VALUES ('k3.1-pro', 1000, 50, 900, 80, \(nowMS)),
+                    ('kimi-for-coding', 100, 5, 0, 0, \(nowMS)),
+                    ('glm-5.3', 5000, 50, 4000, 0, \(nowMS)),
+                    ('claude-sonnet-5-5', 3000, 30, 2000, 0, \(nowMS)),
+                    (NULL, 500, 50, 400, 0, \(nowMS)),
+                    ('k3.1-pro', 200, 10, 150, 20, \(nowMS - Int64(86400 * 1000))),
+                    ('k3-256k', 7, 1, 3, 2, \(oldMS))
+                """)
+            let zcodeCacheDays = TokenAggregator.scanZCodeCacheDays(at: sqliteCachePath, now: usageNow)
+            let zcodeCacheModelDays = TokenAggregator.scanZCodeModelDays(at: sqliteCachePath, now: usageNow)
+            // 断言 9（精确累加）：按日 × 模型 cache_read/cache_creation 等于手算值。
+            try expect(zcodeCacheDays?[todayKey]?["k3.1-pro"] == [900, 80]
+                       && zcodeCacheDays?[yesterdayKey]?["k3.1-pro"] == [150, 20]
+                       && zcodeCacheDays?[todayKey]?["kimi-for-coding"] == [0, 0],
+                       "ZCode cache reader accumulation is wrong")
+            // 断言 10（行集一致）：同一 fixture 两条 reader 的行集（日 × 模型）必须相同。
+            let cacheRowKeys = zcodeCacheDays?.map(\.key).sorted() ?? []
+            let tokenRowKeys = zcodeCacheModelDays?.map(\.key).sorted() ?? []
+            var rowSetsMatch = cacheRowKeys == tokenRowKeys
+            for (day, models) in zcodeCacheDays ?? [:] {
+                rowSetsMatch = rowSetsMatch
+                    && Set(models.keys) == Set((zcodeCacheModelDays?[day] ?? [:]).keys)
+            }
+            try expect(rowSetsMatch, "ZCode cache reader row set must match the token reader")
+            // 断言 11（Kimi 过滤）：glm-5.3 / claude-sonnet-5-5 / NULL 模型行不进结果。
+            try expect(zcodeCacheDays?.values.allSatisfy { models in
+                models.keys.allSatisfy { TokenAggregator.isKimiModel($0) } } == true,
+                       "ZCode cache reader must filter non-Kimi models")
+            // 断言 12（毫秒时间戳与日界）：昨天行独立成日桶；40 天前行（31 天余量外）不进。
+            try expect(zcodeCacheDays?.keys.sorted() == [yesterdayKey, todayKey].sorted(),
+                       "ZCode cache reader day bucketing or retention is wrong")
+            // 断言 13（失败面）：缺 cache 列 / 缺表 / 库不存在 → nil；装配层该源 (input, cache) 同退。
+            let sqliteNoCacheColumnPath = root.appendingPathComponent("client-usage-nocache.sqlite").path
+            var noCacheDB: OpaquePointer?
+            _ = sqlite3_open(sqliteNoCacheColumnPath, &noCacheDB)
+            _ = sqlite3_exec(noCacheDB, "CREATE TABLE model_usage (unrecognized TEXT)", nil, nil, nil)
+            sqlite3_close(noCacheDB)
+            let sqliteNoTablePath = root.appendingPathComponent("client-usage-notable.sqlite").path
+            var noTableDB: OpaquePointer?
+            _ = sqlite3_open(sqliteNoTablePath, &noTableDB)
+            _ = sqlite3_exec(noTableDB, "CREATE TABLE other_table (x TEXT)", nil, nil, nil)
+            sqlite3_close(noTableDB)
+            try expect(TokenAggregator.scanZCodeCacheDays(at: sqliteNoCacheColumnPath, now: usageNow) == nil,
+                       "missing cache columns must fail the ZCode cache reader")
+            try expect(TokenAggregator.scanZCodeCacheDays(at: sqliteNoTablePath, now: usageNow) == nil,
+                       "missing model_usage table must fail the ZCode cache reader")
+            try expect(TokenAggregator.scanZCodeCacheDays(at: sqliteCachePath + ".missing", now: usageNow) == nil,
+                       "missing ZCode db must fail the cache reader")
+            let cacheFileDays: TokenAggregator.ModelDays = [todayKey: ["k3.1-pro": [100, 0]]]
+            let cacheFileCache: TokenAggregator.CacheDays = [todayKey: ["k3.1-pro": [60, 5]]]
+            let failedAssembly = TokenAggregator.assembleCacheSnapshot(
+                fileModelDays: cacheFileDays, fileCacheDays: cacheFileCache,
+                hermesModelDays: [:], hermesCacheDays: [:],
+                zcodeModelDays: [todayKey: ["k3.1-pro": [10, 0]]], zcodeCacheDays: nil)
+            try expect(failedAssembly.modelDays[todayKey]?["k3.1-pro"] == [100, 0]
+                       && failedAssembly.cacheDays[todayKey]?["k3.1-pro"] == [60, 5],
+                       "ZCode reader failure must drop the whole source (input, cache) from the cache card")
+            let okAssembly = TokenAggregator.assembleCacheSnapshot(
+                fileModelDays: cacheFileDays, fileCacheDays: cacheFileCache,
+                hermesModelDays: [todayKey: ["k3-256k": [10, 1]]],
+                hermesCacheDays: [todayKey: ["k3-256k": [4, 2]]],
+                zcodeModelDays: [todayKey: ["k3.1-pro": [10, 0]]],
+                zcodeCacheDays: [todayKey: ["k3.1-pro": [7, 1]]])
+            try expect(okAssembly.modelDays[todayKey]?["k3.1-pro"] == [110, 0]
+                       && okAssembly.modelDays[todayKey]?["k3-256k"] == [10, 1]
+                       && okAssembly.cacheDays[todayKey]?["k3.1-pro"] == [67, 6]
+                       && okAssembly.cacheDays[todayKey]?["k3-256k"] == [4, 2],
+                       "cache card assembly must merge all sources when the ZCode reader succeeds")
+
             try exec("""
                 CREATE TABLE session_model_usage (
                     session_id TEXT, model TEXT, billing_provider TEXT, billing_base_url TEXT,
@@ -7592,6 +8224,29 @@ enum KimiOfflineRegression {
                        && hermesModels.hermes?.modelDays[todayKey]?["k3.1-pro"] == [40, 3]
                        && hermesModels.hermes?.modelDays[todayKey]?["k3-256k"] == nil,
                        "Hermes model switch double-counted or retained stale model usage")
+            // 断言 4（Hermes 差分）：行快照携带缓存列，新增/续写/删除 diff 语义下 cache 累加正确；
+            // input（含缓存）与 output 既有口径零改动（红线）。
+            try exec("DELETE FROM session_model_usage WHERE session_id IN ('s1', 's2')")
+            try exec("INSERT INTO session_model_usage VALUES ('c1', 'k3.1-pro', 'p', 'https://api.kimi.com/coding', '', 'main', 10, 1, 20, 0, \(nowSeconds))")
+            try exec("INSERT INTO session_model_usage VALUES ('c2', 'k3-256k', 'p', 'https://api.kimi.com/coding', '', 'main', 5, 2, 5, 0, \(nowSeconds))")
+            var hermesCacheState = TokenAggregator.ScanState()
+            try expect(TokenAggregator.scanHermes(into: &hermesCacheState, at: sqlitePath), "Hermes cache initial scan failed")
+            try expect(hermesCacheState.hermes?.days[todayKey] == [40, 3]
+                       && hermesCacheState.hermes?.modelDays[todayKey]?["k3.1-pro"] == [30, 1],
+                       "Hermes cache backfill changed existing input accounting")
+            try expect(hermesCacheState.hermes?.cacheModelDays[todayKey]?["k3.1-pro"] == [20, 0]
+                       && hermesCacheState.hermes?.cacheModelDays[todayKey]?["k3-256k"] == [5, 0],
+                       "Hermes cache columns did not reach the parallel snapshot")
+            try exec("UPDATE session_model_usage SET cache_read_tokens = 25, cache_write_tokens = 4 WHERE session_id = 'c1'")
+            try expect(TokenAggregator.scanHermes(into: &hermesCacheState, at: sqlitePath), "Hermes cache delta scan failed")
+            try expect(hermesCacheState.hermes?.cacheModelDays[todayKey]?["k3.1-pro"] == [25, 4]
+                       && hermesCacheState.hermes?.days[todayKey] == [49, 3],
+                       "Hermes cache diff (extend) is wrong")
+            try exec("DELETE FROM session_model_usage WHERE session_id = 'c1'")
+            try expect(TokenAggregator.scanHermes(into: &hermesCacheState, at: sqlitePath), "Hermes cache delete scan failed")
+            try expect(hermesCacheState.hermes?.cacheModelDays[todayKey]?["k3.1-pro"] == nil
+                       && hermesCacheState.hermes?.cacheModelDays[todayKey]?["k3-256k"] == [5, 0],
+                       "deleted Hermes row left stale cache contributions")
 
             // 更新检查：Release 版本号比较（v 前缀与 describe/dirty 尾巴剥离、逐段数值、短侧补 0、无法解析不提示）
             try expect(!UpdateCheck.isOutdated(local: "v1.0.1", remote: "v1.0.1"), "same release flagged outdated")
@@ -7751,7 +8406,7 @@ enum KimiOfflineRegression {
             try expect(applied == 1 && uiSnapshot.loaded == true && uiSnapshot.current == nil,
                        "the current generation's snapshot must apply normally after the stale one is dropped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

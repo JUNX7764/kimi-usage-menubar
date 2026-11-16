@@ -211,9 +211,9 @@ Kimi for Coding          — 命中 · 输入2.1M
 
 守门新增：周期 pill 短标签 AX + 与卡头同行（frame midY）、三行类型列缘 alignmentRect 精确等于共享常量且 gap 8pt、spacing rhythm 4/2 读回（`stack.customSpacing(after:)`）。
 
-### 迭代 v2.2（2026-11-16 用户追加）：整体行尾全量折叠按钮
+### 迭代 v2.2（2026-11-16 用户追加）：「整体」旁全量折叠按钮
 
-- 「整体」行尾新增 borderless 符号按钮（identifier `kimi-cache-toggle-all`）：一键展开/收起当前周期全部来源行；语义「部分或全部收起 → 全部展开、全部展开 → 全部收起」，仅操作本周期来源集合，其他周期记忆的展开态不动。
-- 列缘保护：所有行型（整体/来源/嵌套）行尾保留等宽槽位（`CacheDetailColumns.toggleSlotWidth` = 24pt），仅整体行放按钮、其余行隐形占位——v2.1 的 hit/input 列缘跨行对齐不被破坏（守门 B 继续有效）。
-- 按钮样式对齐卡片设置页移动按钮（10pt semibold chevron.up/down、次要色、18pt 高）；AX/tooltip 随状态切换（「全部展开来源」/「全部收起来源」）。
-- preview 守门扩展：按钮存在性 + 三态 AX 断言 + 真实 performClick 链路（全开后 work/hermes 嵌套行齐现、全收后齐消），末尾恢复默认 work 展开态，不影响块尾 in-memory 断言。
+- 「整体」标题后紧随（4pt 贴合）borderless 双 chevron 按钮（identifier `kimi-cache-toggle-all`，icon `chevron.up.chevron.down` 10pt semibold 次要色，样式对齐卡片设置页移动按钮）：一键展开/收起当前周期全部来源行；语义「部分或全部收起 → 全部展开、全部展开 → 全部收起」，仅操作本周期来源集合，其他周期记忆的展开态不动。
+- v2.2 初版曾放行尾槽位（所有行型等宽 24pt 占位），用户复核后改为跟随标题形态——按钮在名称列内不占数值列，行尾槽位机制整体移除，v2.1 的 hit/input 列缘跨行对齐保持原样（守门 B 继续有效）。
+- icon 固定双 chevron（`chevron.down.chevron.up` 不存在于 macOS SF Symbols，取 `chevron.up.chevron.down`）；AX/tooltip 保留随状态切换的「全部展开来源」/「全部收起来源」。
+- preview 守门扩展：按钮存在性 + AX 断言 + 真实 performClick 链路（全开后三来源行 ⌄ glyph 齐现且嵌套行齐出、全收后 › glyph 齐回嵌套行齐消；折叠态用来源行 chevron glyph 判定，避免与用量情况明细跨卡同名撞车），末尾恢复默认 work 展开态，不影响块尾 in-memory 断言。

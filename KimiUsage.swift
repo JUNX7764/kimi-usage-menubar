@@ -3054,6 +3054,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if stack.arrangedSubviews.isEmpty && model != nil { rebuildContent() }
         return stack.arrangedSubviews
     }
+    /// --self-test 用：读取真实 footer 工厂创建的「退出」按钮，锁定 hover 底色内的标题居中。
+    var quitActionButtonForTest: PanelActionButton? {
+        func find(_ view: NSView) -> PanelActionButton? {
+            if let button = view as? PanelActionButton, button.style == .plain { return button }
+            return view.subviews.lazy.compactMap(find).first
+        }
+        return find(footerContainer)
+    }
     /// --self-test 用：按指定面板宽度强制重建并布局内容栈，返回各行（几何/顺序断言用）。
     /// 面板保持关闭：不依赖屏幕、窗口或 Popover 展示路径。
     @discardableResult
@@ -3629,7 +3637,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.wantsLayer = true
         button.layer?.cornerRadius = 6
-        button.alignment = style == .prominent ? .center : .left
+        button.alignment = style == .checkbox ? .left : .center
         button.keyEquivalent = item.keyEquivalent
         button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
@@ -7352,6 +7360,8 @@ enum KimiOfflineRegression {
             try expect(styleController.solid.isHidden && styleController.effect.isHidden,
                        "liquid glass on modern system did not hide both painted layers")
             try expect(!styleController.arrangedContentViewsForTest.isEmpty, "no content rows available for identity check")
+            try expect(styleController.quitActionButtonForTest?.alignment == .center,
+                       "quit title must stay centered inside its hover background")
             let contentBefore = styleController.arrangedContentViewsForTest.map(ObjectIdentifier.init)
             select(styleController, .classicMaterial)
             select(styleController, .solid)

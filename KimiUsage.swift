@@ -548,15 +548,27 @@ enum TokenAggregator {
         }
         var mergedDays: ModelDays = [:]
         for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
-        // 缓存命中卡（六源）：文件源分子分母来自同一 FileScanState，Hermes 来自同一段行快照，
-        // 天然同源；ZCode 缓存读取失败 → 该源 (input, cache) 同退（assembleCacheSnapshot）。
-        // 分母复用现有 modelDays 各模型 input（与「用量情况」同源），不重算。
-        let cacheFileModelDays = mergeSourceModelDays(modelDays(from: st.work), modelDays(from: st.cli))
-        let cacheFileCacheDays = mergeSourceCacheDays(cacheDays(from: st.work), cacheDays(from: st.cli))
-        let cacheSnapshot = assembleCacheSnapshot(
-            fileModelDays: cacheFileModelDays, fileCacheDays: cacheFileCacheDays,
-            hermesModelDays: hermesModelDays, hermesCacheDays: st.hermes?.cacheModelDays ?? [:],
-            zcodeModelDays: zcodeModels, zcodeCacheDays: zcodeCacheDays)
+        // 缓存命中卡 v2（六源各自成对）：文件源按 root 分区（与 fileToolStats 同款前缀规则），
+        // 分子 cacheDays 与分母 modelDays 同区拆，防来源行分子分母错位；Hermes 来自同一段行
+        // 快照；ZCode 缓存读取失败 → 该源 (input, cache) 同退（整体缺席，不静默造 0）。
+        // 「整体」= 保留源合并，数学与 v1 全源合并一致（self-test 有 parity 断言）。
+        func cachePair(id: ToolID, roots: [String], files: [String: FileScanState]) -> CacheSnapshot.SourcePair {
+            CacheSnapshot.SourcePair(id: id, modelDays: toolModelDays(files, under: roots),
+                                     cacheDays: toolCacheDays(files, under: roots))
+        }
+        var cacheSources: [CacheSnapshot.SourcePair] = [
+            cachePair(id: .work, roots: [sessionsRoot], files: st.work),
+            cachePair(id: .cli, roots: [apiSessionsRoots[0]], files: st.cli),
+            cachePair(id: .proma, roots: Array(apiSessionsRoots[1...2]), files: st.cli),
+            cachePair(id: .claude, roots: [apiSessionsRoots[3]], files: st.cli),
+            CacheSnapshot.SourcePair(id: .hermes, modelDays: hermesModelDays,
+                                     cacheDays: st.hermes?.cacheModelDays ?? [:])
+        ]
+        if let zcodeCacheDays {
+            cacheSources.append(CacheSnapshot.SourcePair(id: .zcode, modelDays: zcodeModels,
+                                                         cacheDays: zcodeCacheDays))
+        }
+        let cacheSnapshot = assembleCacheSnapshot(sources: cacheSources)
         return BothStats(
             work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
@@ -941,23 +953,35 @@ enum TokenAggregator {
     }
 
     /// 缓存卡装配（纯函数，可离线断言）：分子与分母必须同源。
-    /// 文件源（Work + CLI）分子分母来自同一 FileScanState，Hermes 来自同一行快照，天然同源；
-    /// ZCode 两路独立读取——缓存 sibling reader 失败（nil）→ 该源 (input, cache) 同退
-    /// （防「新分子配旧分母」错位），其余来源照常渲染，不静默造 0。
+    /// v2 按源保留快照对（六源各自成对，与「工具明细」同款 root 分区）：文件源分子分母来自
+    /// 同一 FileScanState 按 root 拆分（cacheDays 与 modelDays 同区拆，防分子分母错位），
+    /// Hermes 来自同一段行快照；ZCode sibling reader 失败（nil）→ 该源整体缺席
+    /// （input 与 cache 同退，防「新分子配旧分母」错位），其余来源照常渲染，不静默造 0。
+    /// 「整体」= 保留源合并（modelDays/cacheDays 与 v1 全源合并同数学，self-test 有 parity 断言）。
     struct CacheSnapshot {
-        var modelDays: ModelDays = [:]   // 分母：各模型窗口 input（复用现有聚合，不重算）
-        var cacheDays: CacheDays = [:]   // 分子：平行 cacheRead/cacheCreation 明细
+        /// 单源快照对：分子（cacheDays）与分母（modelDays）同源装配，按 ToolID 标识。
+        struct SourcePair {
+            var id: ToolID
+            var modelDays: ModelDays = [:]
+            var cacheDays: CacheDays = [:]
+        }
+        /// 保留源（按装配序；ZCode 读取失败时缺席；零用量源不在此剔除——由行装配按窗口隐藏）
+        var sources: [SourcePair] = []
+        var modelDays: ModelDays = [:]   // 「整体」分母：保留源合并（复用现有聚合，不重算）
+        var cacheDays: CacheDays = [:]   // 「整体」分子：保留源合并
     }
 
-    static func assembleCacheSnapshot(fileModelDays: ModelDays, fileCacheDays: CacheDays,
-                                      hermesModelDays: ModelDays, hermesCacheDays: CacheDays,
-                                      zcodeModelDays: ModelDays, zcodeCacheDays: CacheDays?) -> CacheSnapshot {
+    static func assembleCacheSnapshot(sources: [CacheSnapshot.SourcePair]) -> CacheSnapshot {
         var snapshot = CacheSnapshot()
-        snapshot.modelDays = mergeSourceModelDays(fileModelDays, hermesModelDays)
-        snapshot.cacheDays = mergeSourceCacheDays(fileCacheDays, hermesCacheDays)
-        guard let zcodeCacheDays else { return snapshot }
-        snapshot.modelDays = mergeSourceModelDays(snapshot.modelDays, zcodeModelDays)
-        snapshot.cacheDays = mergeSourceCacheDays(snapshot.cacheDays, zcodeCacheDays)
+        snapshot.sources = sources
+        var modelDays: ModelDays = [:]
+        var cacheDays: CacheDays = [:]
+        for source in sources {
+            modelDays = mergeSourceModelDays(modelDays, source.modelDays)
+            cacheDays = mergeSourceCacheDays(cacheDays, source.cacheDays)
+        }
+        snapshot.modelDays = modelDays
+        snapshot.cacheDays = cacheDays
         return snapshot
     }
 
@@ -1381,6 +1405,21 @@ enum TokenAggregator {
                 path == base || path.hasPrefix(base + "/")
             }) { continue }
             days = mergeSourceModelDays(days, st.modelDays)
+        }
+        return days
+    }
+
+    /// 文件状态字典的平行缓存明细按 root 分区聚合（镜像 toolModelDays 同一 realpath 前缀规则；
+    /// 缓存卡 v2 逐源拆分：cacheDays 与 modelDays 必须同区拆，防来源行分子分母错位）。
+    static func toolCacheDays(_ files: [String: FileScanState],
+                              under roots: [String] = []) -> CacheDays {
+        let bases = roots.map { realPath($0) }
+        var days: CacheDays = [:]
+        for (path, st) in files {
+            if !bases.isEmpty && !bases.contains(where: { base in
+                path == base || path.hasPrefix(base + "/")
+            }) { continue }
+            days = mergeSourceCacheDays(days, st.cacheDays)
         }
         return days
     }
@@ -2258,24 +2297,67 @@ struct UsagePanelModel {
         var name: String         // 模型显示名 /「整体」
         var hitText: String      // "97% 命中" / "— 命中"（整数百分比；「—」= 窗口内无缓存读写证据）
         var inputText: String    // "输入196M"（Fmt.tokens）
-        var isOverall: Bool      // 「整体」行恒置顶，不参与排序
+        var isOverall: Bool      // 「整体」行恒置顶，不可展开
+    }
+    /// v2 来源行：可展开的逐源汇总（id 为 ToolID.rawValue，控制器 expandedCacheSources 键）；
+    /// models 为该源窗口内模型行（input 降序、input ≤ 0 已过滤），同模型跨源各自显示该源数字。
+    struct CacheSourceRow {
+        var id: String
+        var name: String
+        var hitText: String
+        var inputText: String
+        var models: [CacheRow]
+    }
+    /// 单窗口行集：「整体」行置顶不可展开；零用量源不出行；来源行按窗口 input 降序
+    /// （tie 按 ToolID 固定序）；整体行与来源行分子分母同源装配。
+    struct CachePeriodRows {
+        var overall: CacheRow?
+        var sources: [CacheSourceRow]
     }
     struct CacheSection {
-        var periods: [[CacheRow]] // [今日, 近 7 天, 近 30 天]；每段「整体」行恒置顶
-        /// 由分母 modelDays（复用现有聚合的各模型窗口 input，与「用量情况」同源，不重算）与
-        /// 分子 cacheDays 预计算三窗口行。input ≤ 0 不进分母（除零守卫，也不出行）；
+        var periods: [CachePeriodRows] // [今日, 近 7 天, 近 30 天]；每段「整体」行恒置顶
+        /// 由六源快照对预计算三窗口行（v2 来源行结构）。分母复用现有聚合的各模型窗口 input
+        /// （与「用量情况」同源，不重算）；input ≤ 0 不进任何行（除零守卫，也不出行）；
         /// 窗口内 cache_read == 0 且 cache_creation == 0 → 「—」（区分「无缓存证据」与「0% 命中」）；
-        /// 「整体」行为全来源全模型合计比值，全部模型无证据 → 同「—」规则；排序按窗口 input 降序。
-        static func building(modelDays: TokenAggregator.ModelDays, cacheDays: TokenAggregator.CacheDays,
+        /// 零用量源不显示行；来源行按窗口 input 降序（tie 按 ToolID 固定序）；
+        /// 「整体」= 保留源合并（全来源全模型合计比值，全部模型无证据 → 同「—」规则），
+        /// 数学与 v1 全源合并一致。
+        static func building(sources: [TokenAggregator.CacheSnapshot.SourcePair],
                              now: Date = Date()) -> CacheSection {
-            func rows(_ stat: TokenStat, _ cache: [String: [Double]]) -> [CacheRow] {
-                let models = stat.models.filter { $0.value.input > 0 }
-                    .sorted { lhs, rhs in
-                        if lhs.value.input != rhs.value.input { return lhs.value.input > rhs.value.input }
-                        return lhs.key < rhs.key
+            // 「整体」= 保留源合并（与 v1 全源合并同数学）；行内模型与来源合计同口径：
+            // 仅 input > 0 的模型进入分子分母（input ≤ 0 不进任何行）。
+            var mergedModelDays: TokenAggregator.ModelDays = [:]
+            var mergedCacheDays: TokenAggregator.CacheDays = [:]
+            for source in sources {
+                mergedModelDays = TokenAggregator.mergeSourceModelDays(mergedModelDays, source.modelDays)
+                mergedCacheDays = TokenAggregator.mergeSourceCacheDays(mergedCacheDays, source.cacheDays)
+            }
+            let mergedStats = TokenAggregator.statWindows(mergedModelDays, now: now)
+            let mergedCaches = TokenAggregator.cacheWindows(mergedCacheDays, now: now)
+            struct SourceWindow {
+                let id: TokenAggregator.ToolID
+                let stat: TokenStat
+                let cache: [String: [Double]]
+                let displayInput: Double   // 来源行排序键：input > 0 模型的 input 合计
+            }
+            let toolOrder = TokenAggregator.ToolID.allCases
+            let entries: [[SourceWindow]] = sources.map { source in
+                let stats = TokenAggregator.statWindows(source.modelDays, now: now)
+                let caches = TokenAggregator.cacheWindows(source.cacheDays, now: now)
+                return [(stats.today, caches.today), (stats.week, caches.week), (stats.month, caches.month)]
+                    .map { stat, cache in
+                        let displayInput = stat.models.values
+                            .filter { $0.input > 0 }.reduce(0) { $0 + $1.input }
+                        return SourceWindow(id: source.id, stat: stat, cache: cache, displayInput: displayInput)
                     }
-                guard !models.isEmpty else { return [] }
-                var result: [CacheRow] = []
+            }
+            // 「—」规则：窗口内 cache_read 与 cache_creation 均为 0 → 「—」，区分「无缓存数据」与「0% 命中」
+            func hitText(_ read: Double, _ creation: Double) -> String? {
+                (read > 0 || creation > 0) ? nil : "— 命中"
+            }
+            func overallRow(_ stat: TokenStat, _ cache: [String: [Double]]) -> CacheRow? {
+                let models = stat.models.filter { $0.value.input > 0 }
+                guard !models.isEmpty else { return nil }
                 var totalInput = 0.0, totalRead = 0.0, totalCreation = 0.0
                 var anyEvidence = false
                 for (model, value) in models {
@@ -2284,27 +2366,57 @@ struct UsagePanelModel {
                     totalRead += cacheValue[0]
                     totalCreation += cacheValue[1]
                     anyEvidence = anyEvidence || cacheValue[0] > 0 || cacheValue[1] > 0
-                    // 「—」规则：窗口内 cache_read 与 cache_creation 均为 0 → 显示「—」，区分「无缓存数据」与「0% 命中」
-                    let modelHit = (cacheValue[0] > 0 || cacheValue[1] > 0)
-                        ? "\(Int((cacheValue[0] / value.input * 100).rounded()))% 命中" : "— 命中"
-                    result.append(CacheRow(
-                        name: TokenAggregator.modelDisplayName(model),
-                        hitText: modelHit,
-                        inputText: "输入\(Fmt.tokens(value.input))", isOverall: false))
                 }
-                let overallHit = anyEvidence
-                    ? "\(Int((totalRead / totalInput * 100).rounded()))% 命中" : "— 命中"
-                result.insert(CacheRow(name: "整体", hitText: overallHit,
-                                       inputText: "输入\(Fmt.tokens(totalInput))", isOverall: true), at: 0)
-                return result
+                let overallHit = hitText(totalRead, totalCreation)
+                    ?? "\(Int((totalRead / totalInput * 100).rounded()))% 命中"
+                return CacheRow(name: "整体", hitText: overallHit,
+                                inputText: "输入\(Fmt.tokens(totalInput))", isOverall: true)
             }
-            let stats = TokenAggregator.statWindows(modelDays, now: now)
-            let caches = TokenAggregator.cacheWindows(cacheDays, now: now)
-            return CacheSection(periods: [
-                rows(stats.today, caches.today),
-                rows(stats.week, caches.week),
-                rows(stats.month, caches.month)
-            ])
+            func sourceRow(_ window: SourceWindow) -> CacheSourceRow? {
+                // 嵌套模型行：input 降序（tie 按模型名）；input ≤ 0 不进任何行
+                let models = window.stat.models.filter { $0.value.input > 0 }
+                    .sorted { lhs, rhs in
+                        if lhs.value.input != rhs.value.input { return lhs.value.input > rhs.value.input }
+                        return lhs.key < rhs.key
+                    }
+                guard !models.isEmpty else { return nil }   // 零用量源不显示行
+                var modelRows: [CacheRow] = []
+                var totalInput = 0.0, totalRead = 0.0, totalCreation = 0.0
+                var anyEvidence = false
+                for (model, value) in models {
+                    let cacheValue = window.cache[model] ?? [0, 0]
+                    totalInput += value.input
+                    totalRead += cacheValue[0]
+                    totalCreation += cacheValue[1]
+                    anyEvidence = anyEvidence || cacheValue[0] > 0 || cacheValue[1] > 0
+                    let modelHit = hitText(cacheValue[0], cacheValue[1])
+                        ?? "\(Int((cacheValue[0] / value.input * 100).rounded()))% 命中"
+                    modelRows.append(CacheRow(name: TokenAggregator.modelDisplayName(model),
+                                              hitText: modelHit,
+                                              inputText: "输入\(Fmt.tokens(value.input))", isOverall: false))
+                }
+                let sourceHit = hitText(totalRead, totalCreation)
+                    ?? "\(Int((totalRead / totalInput * 100).rounded()))% 命中"
+                return CacheSourceRow(id: window.id.rawValue, name: window.id.displayName,
+                                      hitText: sourceHit, inputText: "输入\(Fmt.tokens(totalInput))",
+                                      models: modelRows)
+            }
+            var periods: [CachePeriodRows] = []
+            for index in 0..<3 {
+                // 来源行排序：窗口 input 降序，tie 按 ToolID 固定序；零用量源（无行）不占位
+                let ordered = entries
+                    .map { $0[index] }
+                    .sorted { lhs, rhs in
+                        if lhs.displayInput != rhs.displayInput { return lhs.displayInput > rhs.displayInput }
+                        return (toolOrder.firstIndex(of: lhs.id) ?? 0) < (toolOrder.firstIndex(of: rhs.id) ?? 0)
+                    }
+                    .compactMap { sourceRow($0) }
+                periods.append(CachePeriodRows(
+                    overall: overallRow([mergedStats.today, mergedStats.week, mergedStats.month][index],
+                                        [mergedCaches.today, mergedCaches.week, mergedCaches.month][index]),
+                    sources: ordered))
+            }
+            return CacheSection(periods: periods)
         }
     }
 
@@ -2873,6 +2985,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var cachePeriodIndex = 1  // 缓存命中默认「近 7 天」；in-memory 不落盘，对齐 toolPeriodIndex 现状
     private var briefSelectedIndex: Int?   // 用量简析选中日（重建保留；nil = 最新一日）
     private var expandedUsageBuckets: Set<Int> = []
+    /// 缓存命中卡来源行展开态（v2）：键为 ToolID.rawValue；in-memory 不落盘，模式对齐 expandedUsageBuckets
+    private var expandedCacheSources: Set<String> = []
     private var updateMessage: String?
     private var updateMessageDismissal: DispatchWorkItem?
     var previewWidth: CGFloat?
@@ -3154,7 +3268,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                     addContentRow(PanelCardView(containing: toolsView))
                 case .cache:
                     let cacheView = CacheSectionView(model: model.cache, periodIndex: cachePeriodIndex,
-                        target: self, periodAction: #selector(toggleCachePeriod(_:)))
+                        expandedSources: expandedCacheSources, target: self,
+                        periodAction: #selector(toggleCachePeriod(_:)),
+                        sourceAction: #selector(toggleCacheSource(_:)))
                     addContentRow(PanelCardView(containing: cacheView))
                 }
             }
@@ -3463,6 +3579,14 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         else { expandedUsageBuckets.insert(sender.tag) }
         refreshPanelLayout()
     }
+    // 缓存命中来源行展开/收起（v2）：与 toggleUsageBucket 同款语义（in-memory Set + 面板重建）；
+    // 来源行以 sourceID（ToolID.rawValue）标识，不受周期切换或行序变化影响。
+    @objc private func toggleCacheSource(_ sender: NSButton) {
+        guard let id = (sender as? CacheSourceRowView)?.sourceID else { return }
+        if expandedCacheSources.contains(id) { expandedCacheSources.remove(id) }
+        else { expandedCacheSources.insert(id) }
+        refreshPanelLayout()
+    }
     @objc fileprivate func requestUpdateCheck() { onCheckUpdate?() }
     // 版本点击等临时状态行；dismissAfter 到点后自动清除（与 CodexUsage 一致）
     func setUpdateMessage(_ message: String?, dismissAfter: TimeInterval? = nil) {
@@ -3584,21 +3708,85 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard verifyTokenBucketInteractionsForPreview() else {
             fputs("KimiUsage visual test: model bucket interactions or alignment\n", stderr); return false
         }
-        // 缓存命中卡守门（fixture 固定）：卡片出现、「整体」置顶行、命中率与「—」规则文案齐备。
-        // 默认周期「近 7 天」= day 0 与 day -3 两天：k3.1-pro 98%、kimi-for-coding 无证据、整体 97%。
+        // 缓存命中卡守门（v2 fixture 固定）：整体置顶行、来源行数值与展开态 AX 播报、
+        // 默认展开 Kimi Work 后嵌套模型行文案齐备。默认周期「近 7 天」= day 0 与 day -3 两天；
+        // k3.1-pro 双源各 98%；来源行名称标签带「› / ⌄」前缀，行名经 AX 标签断言（无前缀）。
         let cacheTexts = labels(stack)
-        for expected in ["缓存命中", "整体", "K3.1 Pro", "Kimi for Coding",
+        for expected in ["缓存命中", "整体", "K3.1 Pro",
                          "97% 命中 · 输入\(Fmt.tokens(129_400_000))",
-                         "98% 命中 · 输入\(Fmt.tokens(128_000_000))",
+                         "98% 命中 · 输入\(Fmt.tokens(80_000_000))",
+                         "98% 命中 · 输入\(Fmt.tokens(48_000_000))",
                          "— 命中 · 输入\(Fmt.tokens(1_400_000))"] where !cacheTexts.contains(expected) {
             fputs("KimiUsage visual test: cache hit card missing \(expected)\n", stderr); return false
         }
-        return true
+        // v2 来源行交互守门：三来源行齐备且展开态 AX 播报正确（work 已展开、其余收起）、
+        // 视觉顺序按窗口 input 降序（Work 80M > CLI 48M > Hermes 1.4M）、悬停高亮沿 bucket 行；
+        // 点击展开 Hermes → 嵌套模型行出现，再点击收起 → 消失，展开切换不改整体行数字；
+        // 「整体」行不可展开（无播报「整体」的可点击行）。
+        func allViews(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { allViews($0) } }
+        func cacheSourceRows() -> [CacheSourceRowView] {
+            allViews(stack).compactMap { $0 as? CacheSourceRowView }
+                .sorted { $0.sourceID < $1.sourceID }
+        }
+        func cacheRow(_ id: String) -> CacheSourceRowView? {
+            cacheSourceRows().first { $0.sourceID == id }
+        }
+        let sourceRows = cacheSourceRows()
+        guard sourceRows.count == 3, sourceRows.allSatisfy({ $0.verifyHoverForPreview() }) else {
+            fputs("KimiUsage visual test: cache source rows missing or hover broken\n", stderr); return false
+        }
+        let axTexts = sourceRows.compactMap { $0.accessibilityLabel() }
+        for expected in ["Kimi Work，98% 命中，输入\(Fmt.tokens(80_000_000))，收起模型明细",
+                         "Kimi CLI，98% 命中，输入\(Fmt.tokens(48_000_000))，展开模型明细",
+                         "Hermes，— 命中，输入\(Fmt.tokens(1_400_000))，展开模型明细"] where !axTexts.contains(expected) {
+            fputs("KimiUsage visual test: cache source row AX missing \(expected)\n", stderr); return false
+        }
+        func rowFrame(_ view: NSView) -> NSRect { view.convert(view.bounds, to: stack) }
+        guard let workFrame = cacheRow("work").map(rowFrame),
+              let cliFrame = cacheRow("cli").map(rowFrame),
+              let hermesFrame = cacheRow("hermes").map(rowFrame),
+              workFrame.minY > cliFrame.minY, cliFrame.minY > hermesFrame.minY else {
+            fputs("KimiUsage visual test: cache source rows must sort by window input desc\n", stderr); return false
+        }
+        guard let hermesRow = cacheRow("hermes") else {
+            fputs("KimiUsage visual test: cache hermes source row missing\n", stderr); return false
+        }
+        hermesRow.performClick(nil)
+        var cacheLabelsAfter = labels(stack)
+        guard cacheLabelsAfter.contains("Kimi for Coding"),
+              cacheLabelsAfter.contains("— 命中 · 输入\(Fmt.tokens(1_400_000))"),
+              cacheLabelsAfter.contains("97% 命中 · 输入\(Fmt.tokens(129_400_000))") else {
+            fputs("KimiUsage visual test: cache hermes expansion missing nested rows or overall drifted\n", stderr); return false
+        }
+        guard let hermesRowAfterExpand = cacheRow("hermes") else {
+            fputs("KimiUsage visual test: cache hermes row lost after expand\n", stderr); return false
+        }
+        hermesRowAfterExpand.performClick(nil)
+        cacheLabelsAfter = labels(stack)
+        guard !cacheLabelsAfter.contains("Kimi for Coding"),
+              cacheLabelsAfter.contains("— 命中 · 输入\(Fmt.tokens(1_400_000))"),
+              cacheLabelsAfter.contains("97% 命中 · 输入\(Fmt.tokens(129_400_000))") else {
+            fputs("KimiUsage visual test: cache hermes collapse failed or overall drifted\n", stderr); return false
+        }
+        // 「整体」行不可展开：整体行是无交互 NSView，不存在 accessibilityLabel 以「整体」开头的按钮
+        let overallClickables = allViews(stack).compactMap { $0 as? NSButton }
+            .filter { ($0.accessibilityLabel() ?? "").hasPrefix("整体") }
+        guard overallClickables.isEmpty else {
+            fputs("KimiUsage visual test: overall cache row must not be expandable\n", stderr); return false
+        }
+        // 展开状态 in-memory 保留（展开态跨面板重建不丢；此处仅 work 处于展开态）
+        update(model: model)
+        return expandedCacheSources == ["work"] && labels(stack).contains("K3.1 Pro")
     }
 
     func expandAllTokenBucketsForPreview() {
         expandedUsageBuckets = [0, 1, 2]
         refreshPanelLayout()
+    }
+
+    /// 视觉预览：预展开缓存命中卡一个来源行（守门嵌套行文案需要；生产路径不调用，不落盘）
+    func expandCacheSourceForPreview(_ id: String) {
+        expandedCacheSources.insert(id)
     }
 
     /// 视觉预览：展开工具明细（默认折叠，单独开关验证行布局）
@@ -5057,12 +5245,14 @@ private final class ToolPeriodButton: NSButton {
     }
 }
 
-/// 缓存命中卡：标题行内周期按钮（今日 / 近 7 天 / 近 30 天，默认近 7 天，in-memory），
-/// 无独立折叠态与刷新按钮（跟随面板全局刷新）；「整体」汇总行恒置顶，其余模型行按窗口
-/// input 降序；无独立读取失败态（失败来源无贡献即无行，见装配层同退语义）。
+/// 缓存命中卡：标题行内周期按钮（今日 / 近 7 天 / 近 30 天，默认近 7 天，in-memory）。
+/// v2 行结构：「整体」汇总行置顶不可展开 → 来源行（chevron 点击展开/收起该源模型行，
+/// 交互对齐「用量情况」bucket 行）→ 展开的嵌套模型行（缩进次要样式）；零用量源不显示行；
+/// 无独立折叠态与刷新按钮（跟随面板全局刷新）；无独立读取失败态（失败来源无贡献即无行，
+/// 见装配层同退语义）。
 private final class CacheSectionView: NSView {
-    init(model: UsagePanelModel.CacheSection, periodIndex: Int,
-         target: AnyObject, periodAction: Selector) {
+    init(model: UsagePanelModel.CacheSection, periodIndex: Int, expandedSources: Set<String>,
+         target: AnyObject, periodAction: Selector, sourceAction: Selector) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 5)
@@ -5080,15 +5270,27 @@ private final class CacheSectionView: NSView {
         let header = PanelUI.cardHeader(icon: "arrow.triangle.2.circlepath", title: "缓存命中",
                                         trailing: [periods])
         PanelUI.addFullWidth(header, to: root)
-        let rows = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : []
-        if rows.isEmpty {
+        let period = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : nil
+        if let overall = period?.overall {
+            var lastRow: NSView = CacheRowView(row: overall)
+            PanelUI.addFullWidth(lastRow, to: root)
+            for source in period?.sources ?? [] {
+                let expanded = expandedSources.contains(source.id)
+                let row = CacheSourceRowView(row: source, expanded: expanded, target: target, action: sourceAction)
+                PanelUI.addFullWidth(row, to: root)
+                lastRow = row
+                if expanded {
+                    for modelRow in source.models {
+                        let detail = CacheModelRowView(row: modelRow)
+                        PanelUI.addFullWidth(detail, to: root)
+                        lastRow = detail
+                    }
+                }
+            }
+            root.setCustomSpacing(4, after: lastRow)
+        } else {
             // 空态复用工具明细文案：窗口内没有任何 Kimi 用量
             PanelUI.addFullWidth(PanelUI.label("本周期暂无用量", size: 11, color: .secondaryLabelColor), to: root)
-        }
-        for (index, row) in rows.enumerated() {
-            let view = CacheRowView(row: row)
-            PanelUI.addFullWidth(view, to: root)
-            if index == rows.count - 1 { root.setCustomSpacing(4, after: view) }
         }
         addSubview(root)
         PanelUI.pin(root, to: self)
@@ -5097,6 +5299,7 @@ private final class CacheSectionView: NSView {
 }
 
 /// 缓存命中行：模型名（主文字）｜「97% 命中 · 输入196M」（次要文字右对齐）。
+/// v2 中仅承载「整体」置顶行（不可展开、无交互）；来源行见 CacheSourceRowView。
 private final class CacheRowView: NSView {
     init(row: UsagePanelModel.CacheRow) {
         super.init(frame: .zero)
@@ -5116,6 +5319,120 @@ private final class CacheRowView: NSView {
         main.addArrangedSubview(detail)
         addSubview(main)
         PanelUI.pin(main, to: self)
+        setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// 缓存命中来源行（v2）：NSButton 承载整行点击区域，交互与悬停样式对齐「用量情况」
+/// bucket 行（TokenBucketRow）：labelColor 0.08 悬停高亮、圆角 5、空格/回车触发、
+/// hitTest 整行命中；折叠箭头「› / ⌄」沿用 bucket 行同款字形前缀（面板重建切换，无旋转动画）。
+private final class CacheSourceRowView: NSButton {
+    let sourceID: String   // ToolID.rawValue：控制器 expandedCacheSources 的展开键
+    override var acceptsFirstResponder: Bool { isEnabled }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 { performClick(nil) } else { super.keyDown(with: event) }
+    }
+    private var hovered = false { didSet { needsDisplay = true } }
+    override var wantsUpdateLayer: Bool { true }
+
+    init(row: UsagePanelModel.CacheSourceRow, expanded: Bool,
+         target: AnyObject, action: Selector) {
+        sourceID = row.id
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        // 折叠箭头 ›/⌄ 嵌入行首文字（与 TokenBucketRow 同款），展开态由重建切换
+        let content = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        let name = PanelUI.label((expanded ? "⌄ " : "› ") + row.name, size: 11,
+                                 weight: .medium, wrapping: false)
+        name.lineBreakMode = .byTruncatingTail
+        name.toolTip = row.name
+        content.addArrangedSubview(name)
+        content.addArrangedSubview(PanelUI.spacer())
+        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 11,
+            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
+        detail.alignment = .right
+        detail.setContentHuggingPriority(.required, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
+        content.addArrangedSubview(detail)
+        title = ""
+        isBordered = false
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        self.target = target
+        self.action = action
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            content.leadingAnchor.constraint(equalTo: leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
+        ])
+        toolTip = expanded ? "收起模型明细" : "展开模型明细"
+        setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)，\(expanded ? "收起" : "展开")模型明细")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(hovered ? 0.08 : 0).cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for area in trackingAreas { removeTrackingArea(area) }
+        addTrackingArea(NSTrackingArea(rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let parent = superview else { return super.hitTest(point) }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
+    }
+
+    func verifyHoverForPreview() -> Bool {
+        updateTrackingAreas()
+        hovered = true; updateLayer()
+        let highlighted = layer?.backgroundColor?.alpha ?? 0
+        hovered = false; updateLayer()
+        let cleared = layer?.backgroundColor?.alpha ?? 0
+        return highlighted > 0 && cleared == 0 && !trackingAreas.isEmpty
+    }
+}
+
+/// 展开的嵌套模型行（v2）：缩进次要样式，字体层级对齐用量情况展开明细行
+///（TokenDetailRow modelDetail：名称 9pt / 数字 10pt secondary regular、上下 2pt 内边距），
+/// 数字 monospacedDigits 右对齐；同模型跨源各自显示该源数字。
+private final class CacheModelRowView: NSView {
+    init(row: UsagePanelModel.CacheRow) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        let content = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        let name = PanelUI.label(row.name, size: 9, color: .secondaryLabelColor, wrapping: false)
+        name.lineBreakMode = .byTruncatingMiddle
+        name.toolTip = row.name
+        content.addArrangedSubview(name)
+        content.addArrangedSubview(PanelUI.spacer())
+        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 10,
+            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
+        detail.alignment = .right
+        detail.setContentHuggingPriority(.required, for: .horizontal)
+        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
+        content.addArrangedSubview(detail)
+        addSubview(content)
+        NSLayoutConstraint.activate([
+            content.topAnchor.constraint(equalTo: topAnchor, constant: 2),
+            // 缩进量对齐来源行「› 」字形前缀宽度，使模型名落在来源名起点之下
+            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            content.trailingAnchor.constraint(equalTo: trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
+        ])
         setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)")
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -5900,9 +6217,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let toolsSection = UsagePanelModel.ToolsSection(periods: [toolRows(0), toolRows(1), toolRows(2)], notices: [])
         // 缓存命中卡：分母复用现有聚合的各模型窗口 input（与「用量情况」同源），分子为平行缓存明细；
-        // zcode 缓存读取失败 → 该源 (input, cache) 已在装配层同退，此处不再感知来源失败面。
-        let cacheSection = UsagePanelModel.CacheSection.building(
-            modelDays: usage.cache?.modelDays ?? [:], cacheDays: usage.cache?.cacheDays ?? [:])
+        // 六源各自成对（v2 来源行结构），zcode 缓存读取失败 → 该源 (input, cache) 已在装配层
+        // 同退，此处不再感知来源失败面。
+        let cacheSection = UsagePanelModel.CacheSection.building(sources: usage.cache?.sources ?? [])
         let usageSection = section("用量情况", .codex,
             [usage.mergedTokens?.today, usage.mergedTokens?.week, usage.mergedTokens?.month],
             usage.workTokensError ?? usage.cliTokensError,
@@ -6064,16 +6381,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.mergedTokens = TokenAggregator.statWindows(allDays, now: chartNow)
             usage.staleTokensInWindow = 0
             // 缓存命中卡固定 fixture（模式对齐上方 preview*Days，不读真实库/会话）：
-            // k3.1-pro 恒 98% 命中，kimi-for-coding 无缓存证据显示「—」；
-            // 样本日跨今日 / 近 7 天 / 近 30 天三窗口，默认「近 7 天」= day 0 与 day -3 两天。
+            // v2 六源各自成对、整体数学与 v1 一致——k3.1-pro 恒 98% 命中（Kimi Work 40M/日 +
+            // Kimi CLI 24M/日），kimi-for-coding 无缓存证据显示「—」（Hermes）；
+            // Proma / Claude / ZCode 零用量不出行。样本日跨今日 / 近 7 天 / 近 30 天三窗口，
+            // 默认「近 7 天」= day 0 与 day -3 两天：来源行 input 降序 Work(80M) > CLI(48M) > Hermes(1.4M)。
             var cacheFixture = TokenAggregator.CacheSnapshot()
+            var workDays: TokenAggregator.ModelDays = [:]
+            var workCache: TokenAggregator.CacheDays = [:]
+            var cliDays: TokenAggregator.ModelDays = [:]
+            var cliCache: TokenAggregator.CacheDays = [:]
+            var hermesDays: TokenAggregator.ModelDays = [:]
+            for offset in [0, -3, -12] {
+                let key = TokenAggregator.dayKey(offset, from: chartNow)
+                workDays[key] = ["k3.1-pro": [40_000_000, 2_000_000]]
+                workCache[key] = ["k3.1-pro": [39_200_000, 400_000]]   // 98% 命中 + 写入证据
+                cliDays[key] = ["k3.1-pro": [24_000_000, 1_200_000]]
+                cliCache[key] = ["k3.1-pro": [23_520_000, 240_000]]    // 98% 命中 + 写入证据
+                hermesDays[key] = ["kimi-for-coding": [700_000, 90_000]]
+            }
+            cacheFixture.sources = [
+                .init(id: .work, modelDays: workDays, cacheDays: workCache),
+                .init(id: .cli, modelDays: cliDays, cacheDays: cliCache),
+                .init(id: .hermes, modelDays: hermesDays)
+            ]
             for offset in [0, -3, -12] {
                 let key = TokenAggregator.dayKey(offset, from: chartNow)
                 cacheFixture.modelDays[key] = ["k3.1-pro": [64_000_000, 3_200_000],
                                                "kimi-for-coding": [700_000, 90_000]]
-                cacheFixture.cacheDays[key] = ["k3.1-pro": [62_720_000, 640_000]]   // 98% 命中 + 写入证据
+                cacheFixture.cacheDays[key] = ["k3.1-pro": [62_720_000, 640_000]]
             }
             usage.cache = cacheFixture
+            // 守门需要默认展开一个来源行：嵌套模型行文案在展开后才可见
+            panelController.expandCacheSourceForPreview("work")
             if args.contains("--visual-preview-states") || args.contains("--visual-preview-long") {
                 usage.staleTokensInWindow = 1   // 演示比较条「数据不足」分支
             }
@@ -7216,30 +7555,119 @@ enum KimiOfflineRegression {
                        && KimiPanelLayout.default.visibleOrder == KimiPanelCardID.allCases
                        && editor.layout.order.count == 6,
                        "card settings must list all six cards with 缓存命中 last")
-            // 补充（缓存卡行装配）：命中率整数百分比、— 规则、整体置顶、input 降序、input≤0 不进分母。
+            // 补充（缓存卡 v2 行装配）：整体置顶、来源行 input 降序与 ToolID tie 序、嵌套模型行
+            // 跨源归属、零用量源隐藏、input ≤ 0 不进任何行、— 规则；「整体」= 保留源合并（数学与 v1 一致）。
             let cardNow = Date(timeIntervalSince1970: 1_800_000_000)
-            var cardModelDays: TokenAggregator.ModelDays = [:]
-            cardModelDays[TokenAggregator.dayKey(0, from: cardNow)] =
+            // v1 parity fixture（单源 Work 承载原数字，zero-model 带缓存证据验证 input≤0 连分子一并过滤）：
+            // 整体 60%→45%，K3.1 Pro 90%→60%，kimi-for-coding 恒「—」。
+            var cardWorkDays: TokenAggregator.ModelDays = [:]
+            cardWorkDays[TokenAggregator.dayKey(0, from: cardNow)] =
                 ["k3.1-pro": [1_000, 0], "kimi-for-coding": [500, 0], "zero-model": [0, 0]]
-            cardModelDays[TokenAggregator.dayKey(-2, from: cardNow)] = ["k3.1-pro": [500, 0]]
-            var cardCacheDays: TokenAggregator.CacheDays = [:]
-            cardCacheDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [900, 50]]
-            let cardSection = UsagePanelModel.CacheSection.building(
-                modelDays: cardModelDays, cacheDays: cardCacheDays, now: cardNow)
+            cardWorkDays[TokenAggregator.dayKey(-2, from: cardNow)] = ["k3.1-pro": [500, 0]]
+            var cardWorkCache: TokenAggregator.CacheDays = [:]
+            cardWorkCache[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [900, 50], "zero-model": [30, 5]]
+            let cardWork = TokenAggregator.CacheSnapshot.SourcePair(
+                id: .work, modelDays: cardWorkDays, cacheDays: cardWorkCache)
+            let cardSection = UsagePanelModel.CacheSection.building(sources: [cardWork], now: cardNow)
             try expect(cardSection.periods.count == 3, "cache section must precompute three periods")
-            try expect(cardSection.periods[0].map(\.name) == ["整体", "K3.1 Pro", "Kimi for Coding"]
-                       && cardSection.periods[0][0].hitText == "60% 命中"
-                       && cardSection.periods[0][0].inputText == "输入\(Fmt.tokens(1_500))"
-                       && cardSection.periods[0][1].hitText == "90% 命中"
-                       && cardSection.periods[0][2].hitText == "— 命中"
-                       && !cardSection.periods[0].contains { $0.name == "zero-model" },
-                       "cache card today rows drifted: \(cardSection.periods[0].map { "\($0.name)|\($0.hitText)|\($0.inputText)" })")
-            try expect(cardSection.periods[1].map(\.hitText) == ["45% 命中", "60% 命中", "— 命中"]
-                       && cardSection.periods[2].map(\.hitText) == cardSection.periods[1].map(\.hitText),
+            try expect(cardSection.periods[0].overall?.name == "整体"
+                       && cardSection.periods[0].overall?.hitText == "60% 命中"
+                       && cardSection.periods[0].overall?.inputText == "输入\(Fmt.tokens(1_500))",
+                       "cache card today overall drifted: \(String(describing: cardSection.periods[0].overall))")
+            try expect(cardSection.periods[0].sources.map(\.id) == ["work"]
+                       && cardSection.periods[0].sources.map(\.name) == ["Kimi Work"]
+                       && cardSection.periods[0].sources[0].hitText == "60% 命中"
+                       && cardSection.periods[0].sources[0].models.map(\.name) == ["K3.1 Pro", "Kimi for Coding"]
+                       && cardSection.periods[0].sources[0].models.map(\.hitText) == ["90% 命中", "— 命中"]
+                       && cardSection.periods[0].sources[0].models.map(\.inputText) == ["输入\(Fmt.tokens(1_000))", "输入\(Fmt.tokens(500))"],
+                       "cache card today source/model rows drifted (input≤0 must not enter any row): \(cardSection.periods[0].sources)")
+            try expect(cardSection.periods[1].overall?.hitText == "45% 命中"
+                       && cardSection.periods[1].sources.map(\.hitText) == ["45% 命中"]
+                       && cardSection.periods[1].sources[0].models.map(\.hitText) == ["60% 命中", "— 命中"]
+                       && cardSection.periods[2].overall?.hitText == cardSection.periods[1].overall?.hitText,
                        "cache card week/month rows drifted")
-            let emptySection = UsagePanelModel.CacheSection.building(
-                modelDays: [:], cacheDays: [:], now: cardNow)
-            try expect(emptySection.periods.allSatisfy { $0.isEmpty },
+            // 断言 4（零用量源隐藏 + input≤0 不进任何行）：仅剩 input≤0 模型的来源整行缺席
+            //（模型取 k3-256k，避免与 work 的正用量模型跨源合并后转正），其缓存证据也不进
+            // 整体分子；work 内 input=0 的 zero-model 连同缓存证据不进任何行；其余来源与整体不受影响。
+            var zeroInputDays: TokenAggregator.ModelDays = [:]
+            zeroInputDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3-256k": [-5, 0]]
+            var zeroInputCache: TokenAggregator.CacheDays = [:]
+            zeroInputCache[TokenAggregator.dayKey(0, from: cardNow)] = ["k3-256k": [10, 2]]
+            let zeroSource = TokenAggregator.CacheSnapshot.SourcePair(
+                id: .hermes, modelDays: zeroInputDays, cacheDays: zeroInputCache)
+            let zeroSection = UsagePanelModel.CacheSection.building(sources: [cardWork, zeroSource], now: cardNow)
+            try expect(zeroSection.periods[0].sources.map(\.id) == ["work"]
+                       && zeroSection.periods[0].overall?.inputText == cardSection.periods[0].overall?.inputText
+                       && zeroSection.periods[0].overall?.hitText == cardSection.periods[0].overall?.hitText,
+                       "zero-usage source must hide and non-positive input must not enter any row: \(zeroSection.periods[0].sources)")
+            // 断言 1/5（多源不同率 + 嵌套模型行跨源归属）：来源行各自命中精确，
+            // 同模型跨源嵌套行互不串数字；input 并列时 tie 按 ToolID 固定序。
+            var rateWorkDays: TokenAggregator.ModelDays = [:]
+            rateWorkDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [1_000, 0]]
+            var rateWorkCache: TokenAggregator.CacheDays = [:]
+            rateWorkCache[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [900, 50]]
+            var rateCLIDays: TokenAggregator.ModelDays = [:]
+            rateCLIDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [2_000, 0]]
+            var rateCLICache: TokenAggregator.CacheDays = [:]
+            rateCLICache[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [600, 0]]
+            var ratePromaDays: TokenAggregator.ModelDays = [:]
+            ratePromaDays[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [1_000, 0]]
+            var ratePromaCache: TokenAggregator.CacheDays = [:]
+            ratePromaCache[TokenAggregator.dayKey(0, from: cardNow)] = ["k3.1-pro": [500, 0]]
+            let rateSection = UsagePanelModel.CacheSection.building(sources: [
+                .init(id: .work, modelDays: rateWorkDays, cacheDays: rateWorkCache),
+                .init(id: .cli, modelDays: rateCLIDays, cacheDays: rateCLICache),
+                .init(id: .proma, modelDays: ratePromaDays, cacheDays: ratePromaCache)], now: cardNow)
+            try expect(rateSection.periods[0].overall?.hitText == "50% 命中"
+                       && rateSection.periods[0].overall?.inputText == "输入\(Fmt.tokens(4_000))",
+                       "cache card overall must merge retained sources: \(String(describing: rateSection.periods[0].overall))")
+            try expect(rateSection.periods[0].sources.map(\.name) == ["Kimi CLI", "Kimi Work", "Proma"]
+                       && rateSection.periods[0].sources.map(\.hitText) == ["30% 命中", "90% 命中", "50% 命中"]
+                       && rateSection.periods[0].sources.map(\.inputText) == ["输入\(Fmt.tokens(2_000))", "输入\(Fmt.tokens(1_000))", "输入\(Fmt.tokens(1_000))"],
+                       "cache source rows must sort by window input desc with ToolID tie order: \(rateSection.periods[0].sources.map { "\($0.name)|\($0.hitText)|\($0.inputText)" })")
+            let nestedBySource = rateSection.periods[0].sources.map { $0.models.map { "\($0.name)|\($0.hitText)|\($0.inputText)" } }
+            try expect(nestedBySource == [["K3.1 Pro|30% 命中|输入2.00K"],
+                                          ["K3.1 Pro|90% 命中|输入1.00K"],
+                                          ["K3.1 Pro|50% 命中|输入1.00K"]],
+                       "nested model rows must show per-source numbers: \(nestedBySource)")
+            // 断言 2（root 分区）：cli/proma/claude 共用 st.cli，按 apiSessionsRoots 分区与
+            // fileToolStats 同款前缀规则，cacheDays 与 modelDays 同区拆、不跨源泄漏；
+            // 三分区合并 == 全量合并（整体数学不变的直接证据）。
+            let partitionDay = TokenAggregator.dayKey(0, from: cardNow)
+            func pairState(_ model: [Double], _ cache: [Double]) -> TokenAggregator.FileScanState {
+                var st = TokenAggregator.FileScanState()
+                st.modelDays = [partitionDay: ["k3.1-pro": model]]
+                st.cacheDays = [partitionDay: ["k3.1-pro": cache]]
+                return st
+            }
+            var partitionFiles: [String: TokenAggregator.FileScanState] = [:]
+            partitionFiles[TokenAggregator.realPath(TokenAggregator.apiSessionsRoots[0]) + "/cli.jsonl"] = pairState([100, 0], [90, 5])
+            partitionFiles[TokenAggregator.realPath(TokenAggregator.apiSessionsRoots[1]) + "/proma-a.jsonl"] = pairState([200, 0], [80, 3])
+            partitionFiles[TokenAggregator.realPath(TokenAggregator.apiSessionsRoots[2]) + "/proma-b.jsonl"] = pairState([300, 0], [70, 2])
+            partitionFiles[TokenAggregator.realPath(TokenAggregator.apiSessionsRoots[3]) + "/claude.jsonl"] = pairState([400, 0], [10, 1])
+            func partition(_ roots: [String]) -> (TokenAggregator.ModelDays, TokenAggregator.CacheDays) {
+                (TokenAggregator.toolModelDays(partitionFiles, under: roots),
+                 TokenAggregator.toolCacheDays(partitionFiles, under: roots))
+            }
+            let cliPartition = partition([TokenAggregator.apiSessionsRoots[0]])
+            let promaPartition = partition(Array(TokenAggregator.apiSessionsRoots[1...2]))
+            let claudePartition = partition([TokenAggregator.apiSessionsRoots[3]])
+            try expect(cliPartition.0[partitionDay]?["k3.1-pro"] == [100, 0]
+                       && cliPartition.1[partitionDay]?["k3.1-pro"] == [90, 5]
+                       && promaPartition.0[partitionDay]?["k3.1-pro"] == [500, 0]
+                       && promaPartition.1[partitionDay]?["k3.1-pro"] == [150, 5]
+                       && claudePartition.0[partitionDay]?["k3.1-pro"] == [400, 0]
+                       && claudePartition.1[partitionDay]?["k3.1-pro"] == [10, 1],
+                       "cli/proma/claude root partition must keep numerator and denominator in the same partition")
+            let partitionModelMerge = TokenAggregator.mergeSourceModelDays(
+                TokenAggregator.mergeSourceModelDays(cliPartition.0, promaPartition.0), claudePartition.0)
+            let partitionCacheMerge = TokenAggregator.mergeSourceCacheDays(
+                TokenAggregator.mergeSourceCacheDays(cliPartition.1, promaPartition.1), claudePartition.1)
+            try expect(partitionModelMerge == TokenAggregator.modelDays(from: partitionFiles)
+                       && partitionCacheMerge == TokenAggregator.cacheDays(from: partitionFiles),
+                       "per-source partition merge must equal the whole-state merge (overall math unchanged)")
+            let emptySection = UsagePanelModel.CacheSection.building(sources: [], now: cardNow)
+            try expect(emptySection.periods.allSatisfy { $0.overall == nil && $0.sources.isEmpty },
                        "empty cache fixture must yield the 本周期暂无用量 empty state")
 
             let absent = Fetcher.parseCodeUsagePayload([:])
@@ -8171,24 +8599,37 @@ enum KimiOfflineRegression {
                        "missing ZCode db must fail the cache reader")
             let cacheFileDays: TokenAggregator.ModelDays = [todayKey: ["k3.1-pro": [100, 0]]]
             let cacheFileCache: TokenAggregator.CacheDays = [todayKey: ["k3.1-pro": [60, 5]]]
-            let failedAssembly = TokenAggregator.assembleCacheSnapshot(
-                fileModelDays: cacheFileDays, fileCacheDays: cacheFileCache,
-                hermesModelDays: [:], hermesCacheDays: [:],
-                zcodeModelDays: [todayKey: ["k3.1-pro": [10, 0]]], zcodeCacheDays: nil)
-            try expect(failedAssembly.modelDays[todayKey]?["k3.1-pro"] == [100, 0]
+            let cacheWorkPair = TokenAggregator.CacheSnapshot.SourcePair(
+                id: .work, modelDays: cacheFileDays, cacheDays: cacheFileCache)
+            // 断言 3（ZCode 失败同退，v2）：reader 失败 → 该源整体缺席（来源行与整体均不含其
+            // 贡献），其余来源照常；成功路径保留源合并与 v1 全源合并同数学（parity 断言）。
+            let failedAssembly = TokenAggregator.assembleCacheSnapshot(sources: [cacheWorkPair])
+            try expect(failedAssembly.sources.map(\.id) == [.work]
+                       && failedAssembly.modelDays[todayKey]?["k3.1-pro"] == [100, 0]
                        && failedAssembly.cacheDays[todayKey]?["k3.1-pro"] == [60, 5],
                        "ZCode reader failure must drop the whole source (input, cache) from the cache card")
-            let okAssembly = TokenAggregator.assembleCacheSnapshot(
-                fileModelDays: cacheFileDays, fileCacheDays: cacheFileCache,
-                hermesModelDays: [todayKey: ["k3-256k": [10, 1]]],
-                hermesCacheDays: [todayKey: ["k3-256k": [4, 2]]],
-                zcodeModelDays: [todayKey: ["k3.1-pro": [10, 0]]],
-                zcodeCacheDays: [todayKey: ["k3.1-pro": [7, 1]]])
-            try expect(okAssembly.modelDays[todayKey]?["k3.1-pro"] == [110, 0]
+            let okAssembly = TokenAggregator.assembleCacheSnapshot(sources: [
+                cacheWorkPair,
+                TokenAggregator.CacheSnapshot.SourcePair(id: .hermes, modelDays: [todayKey: ["k3-256k": [10, 1]]],
+                                                         cacheDays: [todayKey: ["k3-256k": [4, 2]]]),
+                TokenAggregator.CacheSnapshot.SourcePair(id: .zcode, modelDays: [todayKey: ["k3.1-pro": [10, 0]]],
+                                                         cacheDays: [todayKey: ["k3.1-pro": [7, 1]]])])
+            try expect(okAssembly.sources.map(\.id) == [.work, .hermes, .zcode]
+                       && okAssembly.modelDays[todayKey]?["k3.1-pro"] == [110, 0]
                        && okAssembly.modelDays[todayKey]?["k3-256k"] == [10, 1]
                        && okAssembly.cacheDays[todayKey]?["k3.1-pro"] == [67, 6]
                        && okAssembly.cacheDays[todayKey]?["k3-256k"] == [4, 2],
-                       "cache card assembly must merge all sources when the ZCode reader succeeds")
+                       "cache card assembly must merge all retained sources when the ZCode reader succeeds")
+            let v1ModelMerge = TokenAggregator.mergeSourceModelDays(
+                TokenAggregator.mergeSourceModelDays([todayKey: ["k3.1-pro": [100, 0]]],
+                                                     [todayKey: ["k3-256k": [10, 1]]]),
+                [todayKey: ["k3.1-pro": [10, 0]]])
+            let v1CacheMerge = TokenAggregator.mergeSourceCacheDays(
+                TokenAggregator.mergeSourceCacheDays([todayKey: ["k3.1-pro": [60, 5]]],
+                                                     [todayKey: ["k3-256k": [4, 2]]]),
+                [todayKey: ["k3.1-pro": [7, 1]]])
+            try expect(okAssembly.modelDays == v1ModelMerge && okAssembly.cacheDays == v1CacheMerge,
+                       "per-source assembly must keep the v1 overall merge math unchanged")
 
             try exec("""
                 CREATE TABLE session_model_usage (

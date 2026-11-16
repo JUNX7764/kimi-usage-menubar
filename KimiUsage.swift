@@ -3709,20 +3709,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             fputs("KimiUsage visual test: model bucket interactions or alignment\n", stderr); return false
         }
         // 缓存命中卡守门（v2 fixture 固定）：整体置顶行、来源行数值与展开态 AX 播报、
-        // 默认展开 Kimi Work 后嵌套模型行文案齐备。默认周期「近 7 天」= day 0 与 day -3 两天；
-        // k3.1-pro 双源各 98%；来源行名称标签带「› / ⌄」前缀，行名经 AX 标签断言（无前缀）。
+        // 默认展开 Kimi Work 后嵌套模型行文案齐备。默认周期「7 天」= day 0 与 day -3 两天；
+        // k3.1-pro 双源各 98%；来源行名称标签带「› / ⌄」前缀，行名经 AX 标签断言（无前缀）；
+        // v2.1 数值拆两列，命中率与输入量为两个独立 label。
         let cacheTexts = labels(stack)
         for expected in ["缓存命中", "整体", "K3.1 Pro",
-                         "97% 命中 · 输入\(Fmt.tokens(129_400_000))",
-                         "98% 命中 · 输入\(Fmt.tokens(80_000_000))",
-                         "98% 命中 · 输入\(Fmt.tokens(48_000_000))",
-                         "— 命中 · 输入\(Fmt.tokens(1_400_000))"] where !cacheTexts.contains(expected) {
+                         "97% 命中", "输入\(Fmt.tokens(129_400_000))",
+                         "98% 命中", "输入\(Fmt.tokens(80_000_000))",
+                         "输入\(Fmt.tokens(48_000_000))",
+                         "— 命中", "输入\(Fmt.tokens(1_400_000))"] where !cacheTexts.contains(expected) {
             fputs("KimiUsage visual test: cache hit card missing \(expected)\n", stderr); return false
         }
-        // v2 来源行交互守门：三来源行齐备且展开态 AX 播报正确（work 已展开、其余收起）、
-        // 视觉顺序按窗口 input 降序（Work 80M > CLI 48M > Hermes 1.4M）、悬停高亮沿 bucket 行；
-        // 点击展开 Hermes → 嵌套模型行出现，再点击收起 → 消失，展开切换不改整体行数字；
-        // 「整体」行不可展开（无播报「整体」的可点击行）。
         func allViews(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { allViews($0) } }
         func cacheSourceRows() -> [CacheSourceRowView] {
             allViews(stack).compactMap { $0 as? CacheSourceRowView }
@@ -3731,6 +3728,71 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         func cacheRow(_ id: String) -> CacheSourceRowView? {
             cacheSourceRows().first { $0.sourceID == id }
         }
+        // v2.1 布局守门 A：周期 pill 用工具明细同款短标签（「今日 / 7 天 / 30 天」），
+        // AX 播报短标签显示名；pill 组必须与卡头标题同行（长标签会在 330pt 卡头换行）。
+        func cacheLabel(_ text: String) -> NSTextField? {
+            allViews(stack).compactMap { $0 as? NSTextField }.first { $0.stringValue == text }
+        }
+        func cacheButton(axLabel: String) -> NSButton? {
+            allViews(stack).compactMap { $0 as? NSButton }.first { $0.accessibilityLabel() == axLabel }
+        }
+        guard cacheButton(axLabel: "缓存命中周期：今日") != nil,
+              cacheButton(axLabel: "缓存命中周期：7 天") != nil,
+              cacheButton(axLabel: "缓存命中周期：30 天") != nil,
+              cacheButton(axLabel: "缓存命中周期：近 7 天") == nil else {
+            fputs("KimiUsage visual test: cache period buttons must use tool-card short labels\n", stderr); return false
+        }
+        guard let cacheTitle = cacheLabel("缓存命中"),
+              let periodProbe = cacheButton(axLabel: "缓存命中周期：30 天") else {
+            fputs("KimiUsage visual test: cache header title or period button missing\n", stderr); return false
+        }
+        let cacheTitleFrame = cacheTitle.convert(cacheTitle.bounds, to: stack)
+        let periodProbeFrame = periodProbe.convert(periodProbe.bounds, to: stack)
+        guard abs(cacheTitleFrame.midY - periodProbeFrame.midY) < 4 else {
+            fputs("KimiUsage visual test: cache period pills must stay on the header line\n", stderr); return false
+        }
+        // v2.1 布局守门 B：数值两列（hit/input）三行类型（整体/来源/嵌套模型）共用同一列缘——
+        // 经 alignmentRect（Auto Layout 列缘语义；wrapping label 自带 ±2pt 对齐内缩）断言
+        // 三行类型的 hit/input 列宽与列缘精确等于 CacheDetailColumns 共享常量、gap 8pt，
+        // 即「命中」「输入」起点跨行垂直对齐。
+        func cacheColumnRects(_ identifier: String) -> [NSRect] {
+            allViews(stack).compactMap { $0 as? NSTextField }
+                .filter { $0.identifier?.rawValue == identifier }
+                .map { label in label.alignmentRect(forFrame: label.convert(label.bounds, to: stack)) }
+        }
+        contentController.view.layoutSubtreeIfNeeded()
+        stack.layoutSubtreeIfNeeded()
+        let hitColumnRects = cacheColumnRects("kimi-cache-hit")
+        let inputColumnRects = cacheColumnRects("kimi-cache-input")
+        guard hitColumnRects.count >= 3, inputColumnRects.count == hitColumnRects.count else {
+            fputs("KimiUsage visual test: cache detail column labels missing (need two shared columns)\n", stderr); return false
+        }
+        guard hitColumnRects.allSatisfy({ abs($0.width - CacheDetailColumns.hitWidth) < 0.5
+                                          && abs($0.minX - hitColumnRects[0].minX) < 0.5 }),
+              inputColumnRects.allSatisfy({ abs($0.width - CacheDetailColumns.inputWidth) < 0.5
+                                            && abs($0.minX - inputColumnRects[0].minX) < 0.5 }),
+              inputColumnRects.allSatisfy({ abs($0.minX - hitColumnRects[0].maxX
+                                                - CacheDetailColumns.columnGap) < 0.5 }) else {
+            fputs("KimiUsage visual test: cache detail columns must share edges across row types\n", stderr); return false
+        }
+        // v2.1 布局守门 C：层级呼吸感——整体行与来源组 4pt、展开组尾行与下一来源行 2pt
+        //（其余行距走默认 5pt）；行视图经 identifier 定位，间距经 stack customSpacing(after:) 读回。
+        func cacheRowView(_ identifier: String) -> NSView? {
+            allViews(stack).first { $0.identifier?.rawValue == identifier }
+        }
+        guard let cacheRootStack = cacheRow("work")?.superview as? NSStackView,
+              let cacheOverallRow = cacheRowView("kimi-cache-overall-row"),
+              let workGroupTailRow = cacheRowView("kimi-cache-model-row") else {
+            fputs("KimiUsage visual test: cache rows or root stack missing for spacing gate\n", stderr); return false
+        }
+        guard abs(cacheRootStack.customSpacing(after: cacheOverallRow) - 4) < 0.5,
+              abs(cacheRootStack.customSpacing(after: workGroupTailRow) - 2) < 0.5 else {
+            fputs("KimiUsage visual test: cache card spacing rhythm must be 4 after overall / 2 after expanded group\n", stderr); return false
+        }
+        // v2 来源行交互守门：三来源行齐备且展开态 AX 播报正确（work 已展开、其余收起）、
+        // 视觉顺序按窗口 input 降序（Work 80M > CLI 48M > Hermes 1.4M）、悬停高亮沿 bucket 行；
+        // 点击展开 Hermes → 嵌套模型行出现，再点击收起 → 消失，展开切换不改整体行数字；
+        // 「整体」行不可展开（无播报「整体」的可点击行）。
         let sourceRows = cacheSourceRows()
         guard sourceRows.count == 3, sourceRows.allSatisfy({ $0.verifyHoverForPreview() }) else {
             fputs("KimiUsage visual test: cache source rows missing or hover broken\n", stderr); return false
@@ -3754,8 +3816,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hermesRow.performClick(nil)
         var cacheLabelsAfter = labels(stack)
         guard cacheLabelsAfter.contains("Kimi for Coding"),
-              cacheLabelsAfter.contains("— 命中 · 输入\(Fmt.tokens(1_400_000))"),
-              cacheLabelsAfter.contains("97% 命中 · 输入\(Fmt.tokens(129_400_000))") else {
+              cacheLabelsAfter.contains("— 命中"), cacheLabelsAfter.contains("输入\(Fmt.tokens(1_400_000))"),
+              cacheLabelsAfter.contains("97% 命中"), cacheLabelsAfter.contains("输入\(Fmt.tokens(129_400_000))") else {
             fputs("KimiUsage visual test: cache hermes expansion missing nested rows or overall drifted\n", stderr); return false
         }
         guard let hermesRowAfterExpand = cacheRow("hermes") else {
@@ -3764,8 +3826,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hermesRowAfterExpand.performClick(nil)
         cacheLabelsAfter = labels(stack)
         guard !cacheLabelsAfter.contains("Kimi for Coding"),
-              cacheLabelsAfter.contains("— 命中 · 输入\(Fmt.tokens(1_400_000))"),
-              cacheLabelsAfter.contains("97% 命中 · 输入\(Fmt.tokens(129_400_000))") else {
+              cacheLabelsAfter.contains("— 命中"), cacheLabelsAfter.contains("输入\(Fmt.tokens(1_400_000))"),
+              cacheLabelsAfter.contains("97% 命中"), cacheLabelsAfter.contains("输入\(Fmt.tokens(129_400_000))") else {
             fputs("KimiUsage visual test: cache hermes collapse failed or overall drifted\n", stderr); return false
         }
         // 「整体」行不可展开：整体行是无交互 NSView，不存在 accessibilityLabel 以「整体」开头的按钮
@@ -5256,7 +5318,9 @@ private final class CacheSectionView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 5)
-        let periodNames = ["今日", "近 7 天", "近 30 天"]   // 命名对齐「用量情况」周期标签
+        // 标签与「工具明细」逐字同款短标签（v2.1）：长标签「近 7 天 / 近 30 天」会在
+        // 330pt 卡头把 pill 组挤到标题第二行；窗口口径不变（默认 index 1 = 近 7 天）。
+        let periodNames = ["今日", "7 天", "30 天"]
         let periods = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 2)
         for (index, name) in periodNames.enumerated() {
             let button = ToolPeriodButton(title: name)
@@ -5272,8 +5336,13 @@ private final class CacheSectionView: NSView {
         PanelUI.addFullWidth(header, to: root)
         let period = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : nil
         if let overall = period?.overall {
-            var lastRow: NSView = CacheRowView(row: overall)
-            PanelUI.addFullWidth(lastRow, to: root)
+            let overallRow = CacheRowView(row: overall)
+            PanelUI.addFullWidth(overallRow, to: root)
+            // 层级呼吸感（v2.1）：整体行与来源组之间 4pt（对齐工具明细末行 4pt 节奏，
+            // 与来源行间默认 5pt 区分开）；展开组尾行与下一来源行之间 2pt（嵌套行属于
+            // 上一来源的视觉分组）；其余行距走 stack 默认 5。
+            root.setCustomSpacing(4, after: overallRow)
+            var lastRow: NSView = overallRow
             for source in period?.sources ?? [] {
                 let expanded = expandedSources.contains(source.id)
                 let row = CacheSourceRowView(row: source, expanded: expanded, target: target, action: sourceAction)
@@ -5285,6 +5354,7 @@ private final class CacheSectionView: NSView {
                         PanelUI.addFullWidth(detail, to: root)
                         lastRow = detail
                     }
+                    root.setCustomSpacing(2, after: lastRow)
                 }
             }
             root.setCustomSpacing(4, after: lastRow)
@@ -5298,12 +5368,45 @@ private final class CacheSectionView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
 
-/// 缓存命中行：模型名（主文字）｜「97% 命中 · 输入196M」（次要文字右对齐）。
+/// 缓存卡数值两列（v2.1）：三行类型（整体/来源/嵌套模型）共用同一套列宽常量，
+/// 跨行「命中」「输入」列缘垂直对齐（对齐用量情况等宽列的列感）。
+/// hit 列宽 = 「100% 命中」11pt monospacedDigits 自然宽度 57pt + 余量（嵌套行 10pt 在
+/// 同列内右对齐，列缘不变）；input 列宽 = 「输入999.99M」11pt 自然宽度 72pt + 余量；
+/// 两列间 8pt gap 由行内 stack spacing 提供（与名称列间距同值）。
+/// 注意：wrapping label 自带 ±2pt 对齐内缩（frame = 对齐矩形 ±4），Auto Layout 以
+/// alignmentRect 求解——列缘语义一律按 alignmentRect 度量（preview 守门 B 同此口径）。
+private enum CacheDetailColumns {
+    static let hitWidth: CGFloat = 62
+    static let inputWidth: CGFloat = 78
+    static let columnGap: CGFloat = 8   // 行内 stack spacing，不另设约束
+    /// 两列数值 label：hit 右对齐固定列、input 右对齐固定列（trailing 贴行尾）。
+    /// identifier 供 preview 守门断言列缘对齐（kimi-cache-hit / kimi-cache-input）。
+    static func labels(hit: String, input: String, size: CGFloat) -> (NSTextField, NSTextField) {
+        let hitLabel = PanelUI.label(hit, size: size, color: .secondaryLabelColor,
+                                     wrapping: false, monospacedDigits: true)
+        hitLabel.alignment = .right
+        hitLabel.identifier = NSUserInterfaceItemIdentifier("kimi-cache-hit")
+        hitLabel.setContentHuggingPriority(.required, for: .horizontal)
+        hitLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hitLabel.widthAnchor.constraint(equalToConstant: hitWidth).isActive = true
+        let inputLabel = PanelUI.label(input, size: size, color: .secondaryLabelColor,
+                                       wrapping: false, monospacedDigits: true)
+        inputLabel.alignment = .right
+        inputLabel.identifier = NSUserInterfaceItemIdentifier("kimi-cache-input")
+        inputLabel.setContentHuggingPriority(.required, for: .horizontal)
+        inputLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        inputLabel.widthAnchor.constraint(equalToConstant: inputWidth).isActive = true
+        return (hitLabel, inputLabel)
+    }
+}
+
+/// 缓存命中行：模型名（主文字）｜「97% 命中」｜「输入196M」两列右对齐（v2.1 列化）。
 /// v2 中仅承载「整体」置顶行（不可展开、无交互）；来源行见 CacheSourceRowView。
 private final class CacheRowView: NSView {
     init(row: UsagePanelModel.CacheRow) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        identifier = NSUserInterfaceItemIdentifier("kimi-cache-overall-row")
         let main = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         let name = PanelUI.label(row.name, size: 11,
                                  weight: row.isOverall ? .semibold : .medium, wrapping: false)
@@ -5311,12 +5414,9 @@ private final class CacheRowView: NSView {
         name.toolTip = row.name
         main.addArrangedSubview(name)
         main.addArrangedSubview(PanelUI.spacer())
-        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 11,
-            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
-        detail.alignment = .right
-        detail.setContentHuggingPriority(.required, for: .horizontal)
-        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
-        main.addArrangedSubview(detail)
+        let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 11)
+        main.addArrangedSubview(hit)
+        main.addArrangedSubview(input)
         addSubview(main)
         PanelUI.pin(main, to: self)
         setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)")
@@ -5341,6 +5441,7 @@ private final class CacheSourceRowView: NSButton {
         sourceID = row.id
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        identifier = NSUserInterfaceItemIdentifier("kimi-cache-source-row")
         // 折叠箭头 ›/⌄ 嵌入行首文字（与 TokenBucketRow 同款），展开态由重建切换
         let content = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
         let name = PanelUI.label((expanded ? "⌄ " : "› ") + row.name, size: 11,
@@ -5349,12 +5450,9 @@ private final class CacheSourceRowView: NSButton {
         name.toolTip = row.name
         content.addArrangedSubview(name)
         content.addArrangedSubview(PanelUI.spacer())
-        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 11,
-            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
-        detail.alignment = .right
-        detail.setContentHuggingPriority(.required, for: .horizontal)
-        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
-        content.addArrangedSubview(detail)
+        let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 11)
+        content.addArrangedSubview(hit)
+        content.addArrangedSubview(input)
         title = ""
         isBordered = false
         wantsLayer = true
@@ -5406,30 +5504,34 @@ private final class CacheSourceRowView: NSButton {
     }
 }
 
-/// 展开的嵌套模型行（v2）：缩进次要样式，字体层级对齐用量情况展开明细行
+/// 展开的嵌套模型行（v2）：次要样式，字体层级对齐用量情况展开明细行
 ///（TokenDetailRow modelDetail：名称 9pt / 数字 10pt secondary regular、上下 2pt 内边距），
 /// 数字 monospacedDigits 右对齐；同模型跨源各自显示该源数字。
+/// 缩进只作用名称列（10pt ≈「› 」字形前缀宽度）；数值两列与整体/来源行共用同一列缘
+///（CacheDetailColumns 常量），不随缩进平移（v2.1 三行类型列缘对齐）。
 private final class CacheModelRowView: NSView {
     init(row: UsagePanelModel.CacheRow) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        identifier = NSUserInterfaceItemIdentifier("kimi-cache-model-row")
         let content = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
+        let indent = NSView()
+        indent.translatesAutoresizingMaskIntoConstraints = false
+        indent.widthAnchor.constraint(equalToConstant: 10).isActive = true
+        content.addArrangedSubview(indent)
+        content.setCustomSpacing(0, after: indent)
         let name = PanelUI.label(row.name, size: 9, color: .secondaryLabelColor, wrapping: false)
         name.lineBreakMode = .byTruncatingMiddle
         name.toolTip = row.name
         content.addArrangedSubview(name)
         content.addArrangedSubview(PanelUI.spacer())
-        let detail = PanelUI.label("\(row.hitText) · \(row.inputText)", size: 10,
-            color: .secondaryLabelColor, wrapping: false, monospacedDigits: true)
-        detail.alignment = .right
-        detail.setContentHuggingPriority(.required, for: .horizontal)
-        detail.setContentCompressionResistancePriority(.required, for: .horizontal)
-        content.addArrangedSubview(detail)
+        let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 10)
+        content.addArrangedSubview(hit)
+        content.addArrangedSubview(input)
         addSubview(content)
         NSLayoutConstraint.activate([
             content.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            // 缩进量对齐来源行「› 」字形前缀宽度，使模型名落在来源名起点之下
-            content.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: leadingAnchor),
             content.trailingAnchor.constraint(equalTo: trailingAnchor),
             content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -2)
         ])

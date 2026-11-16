@@ -160,3 +160,43 @@ Kimi for Coding          — 命中 · 输入2.1M
 - [ ] 无缓存模型显示 `—` 非 0%；`input ≤ 0` 不进分母；ZCode reader 失败时该源同退、其余来源数字不受影响
 - [ ] **用量情况三周期数字升级前后零变化**；其他 5 卡零回归
 - [ ] 无新文件（build.sh 零改动）、无新网络请求、无新定时器、无凭据触碰
+
+---
+
+## 迭代 v2（2026-11-16 用户确认）：来源行 + 点击展开该源模型行
+
+首版已部署（merge 1e6b1a1，模型行平铺）。v2 把行结构改为「来源行 + 展开模型」，实现按 harness 对比命中率。
+
+**行结构：**
+
+```text
+缓存命中                        [今日 | 近 7 天 | 近 30 天]
+──────────────────────────────
+整体                     97% 命中 · 输入196M
+› ZCode                  98% 命中 · 输入82M
+⌄ Kimi Code              97% 命中 · 输入12M
+    K3.1 Pro             97% 命中 · 输入11.2M
+    kimi-for-coding      — 命中 · 输入0.8M
+› Kimi Work              96% 命中 · 输入8M
+```
+
+**数据侧（扫描层零改动）：**
+- 六源各自成对：Work = `st.work`；Kimi Code / Proma / Claude = `st.cli` 按 `fileToolStats` 同款 root 分区（apiSessionsRoots[0] / [1...2] / [3]，cacheDays 与 modelDays 必须同区拆，防分子分母错位）；Hermes = `st.hermes`；ZCode = 独立 reader（nil → 该源从整体与来源行同退）。
+- `assembleCacheSnapshot` 改为按源保留快照对；「整体」= 保留源合并（数学不变）。
+- 规则沿用：零用量源不显示行（工具明细 2026-11-07 决定）、无缓存证据 `—`、`input ≤ 0` 不进分母、来源行按窗口 input 降序（tie 按 ToolID 固定序）；「整体」行不可展开。
+
+**交互（对齐用量情况 bucket 模式）：**
+- 来源行 chevron 点击展开/收起该源模型行（缩进次要样式）；`expandedCacheSources: Set<String>` in-memory（对齐 `expandedUsageBuckets`，不落盘）；键盘与 AX 标签对齐用量情况 bucket 行现状。
+
+**视觉对齐硬约束：**
+- 复用用量情况 bucket 行/展开明细行的控件样式与尺寸（chevron、行高、缩进、悬停高亮、数字 monospacedDigits 右对齐）；卡头/周期行/圆角边距零新样式；深浅色双态不分叉；无新分隔线、无脚注、无来源后缀解释文案。
+
+**断言新增（约 6 条）：**
+1. per-source 命中率精确（多源不同率 fixture）。
+2. cli/proma/claude 按 root 分区正确（同文件状态不跨源泄漏）。
+3. ZCode reader 失败 → 该源行与整体均不含其贡献，其余源不变。
+4. 零用量源隐藏；input≤0 不进任何行。
+5. 嵌套模型行归属正确（同模型跨源各自显示该源数字）。
+6. 展开状态切换不影响数据（preview 交互守门：展开/收起 + 嵌套行文案）。
+
+**验收：** 离线全绿 + preview 截图核对深浅色对齐 + 真机部署后目视（沿用首版 ZCode 精确基线）。版本落 v1.7.11（CHANGELOG 条目并入）。

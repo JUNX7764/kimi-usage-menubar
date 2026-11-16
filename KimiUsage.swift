@@ -3848,7 +3848,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
               cacheLabelsAfter.contains("97% 命中"), cacheLabelsAfter.contains("输入\(Fmt.tokens(129_400_000))") else {
             fputs("KimiUsage visual test: cache hermes collapse failed or overall drifted\n", stderr); return false
         }
-        // v2.2 全量折叠按钮：整体行行尾一键展开/收起当前周期全部来源（点击链路真实走 toggleAllCacheSources）
+        // v2.2.1 全量折叠按钮：紧随「整体」标题，一键展开/收起当前周期全部来源
+        //（点击链路真实走 toggleAllCacheSources）。icon 固定双 chevron，开合语义在 AX/tooltip；
         // 注意：点击后面板整体重建，按钮实例随之更换——每次断言前必须按 identifier 重新查找
         func findToggleAll() -> NSButton? {
             allViews(stack).compactMap({ $0 as? NSButton })
@@ -3857,7 +3858,6 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         guard let toggleAll = findToggleAll() else {
             fputs("KimiUsage visual test: cache toggle-all button missing\n", stderr); return false
         }
-        // 初始态：仅 work 展开 → 按钮 glyph ⌄「全部展开来源」
         guard toggleAll.accessibilityLabel() == "全部展开来源" else {
             fputs("KimiUsage visual test: cache toggle-all must offer expand-all when partially expanded\n", stderr); return false
         }
@@ -5394,7 +5394,7 @@ private final class CacheSectionView: NSView {
         PanelUI.addFullWidth(header, to: root)
         let period = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : nil
         if let overall = period?.overall {
-            // 全量折叠按钮态（v2.2）：当前周期来源非空且全部处于展开态 → ˄（点击全收），否则 ⌄（点击全开）
+            // 全量折叠按钮（v2.2.1）：仅当前周期存在来源行时显示，紧随「整体」标题
             let sources = period?.sources ?? []
             let allExpanded = !sources.isEmpty && sources.allSatisfy { expandedSources.contains($0.id) }
             let overallRow = CacheRowView(row: overall, allExpanded: allExpanded, hasSources: !sources.isEmpty,
@@ -5441,9 +5441,6 @@ private enum CacheDetailColumns {
     static let hitWidth: CGFloat = 62
     static let inputWidth: CGFloat = 78
     static let columnGap: CGFloat = 8   // 行内 stack spacing，不另设约束
-    /// 行尾全量折叠槽（v2.2）：20pt 按钮 + 4pt 间隙。所有行型保留等宽槽位，
-    /// hit/input 列缘跨行不变；仅「整体」行在槽内放按钮，其余行放隐形占位。
-    static let toggleSlotWidth: CGFloat = 24
     /// 两列数值 label：hit 右对齐固定列、input 右对齐固定列（trailing 贴行尾）。
     /// identifier 供 preview 守门断言列缘对齐（kimi-cache-hit / kimi-cache-input）。
     static func labels(hit: String, input: String, size: CGFloat) -> (NSTextField, NSTextField) {
@@ -5463,30 +5460,21 @@ private enum CacheDetailColumns {
         inputLabel.widthAnchor.constraint(equalToConstant: inputWidth).isActive = true
         return (hitLabel, inputLabel)
     }
-    /// 行尾槽位：button 为 nil 时放等宽隐形占位（列缘对齐不因有无按钮而漂移）。
-    /// 按钮样式对齐卡片设置页移动按钮（borderless 符号按钮、次要色）。
-    static func trailingSlot(button: NSButton?) -> NSView {
-        guard let button else {
-            let placeholder = NSView()
-            placeholder.translatesAutoresizingMaskIntoConstraints = false
-            placeholder.widthAnchor.constraint(equalToConstant: toggleSlotWidth).isActive = true
-            return placeholder
-        }
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.widthAnchor.constraint(equalToConstant: toggleSlotWidth).isActive = true
-        button.heightAnchor.constraint(equalToConstant: 18).isActive = true
-        return button
-    }
-    /// 「整体」行尾的全量折叠按钮（v2.2）：一键展开/收起当前周期全部来源行。
-    /// glyph 随状态切换（⌄=点击全部展开 / ˄=点击全部收起），由面板重建刷新。
+    /// 「整体」行内跟随标题的全量折叠按钮（v2.2.1，用户指定双 chevron icon 跟随形态）：
+    /// 一键展开/收起当前周期全部来源行。icon 固定双 chevron（chevron.up.chevron.down，
+    /// chevron.down.chevron.up 不存在于 macOS SF Symbols），开合语义由 AX/tooltip 表达；
+    /// 由面板重建刷新。按钮在名称列内，不占数值列——hit/input 列缘跨行仍按 v2.1 对齐。
     static func toggleAllButton(allExpanded: Bool, target: AnyObject, action: Selector) -> NSButton {
-        let symbol = NSImage(systemSymbolName: allExpanded ? "chevron.up" : "chevron.down",
+        let symbol = NSImage(systemSymbolName: "chevron.up.chevron.down",
                              accessibilityDescription: nil)?
             .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 10, weight: .semibold))
         let button = NSButton(image: symbol ?? NSImage(), target: nil, action: nil)
         button.isBordered = false
         button.contentTintColor = .secondaryLabelColor
         button.identifier = NSUserInterfaceItemIdentifier("kimi-cache-toggle-all")
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 18).isActive = true
         button.toolTip = allExpanded ? "全部收起来源" : "全部展开来源"
         button.setAccessibilityLabel(allExpanded ? "全部收起来源" : "全部展开来源")
         button.target = target
@@ -5496,10 +5484,10 @@ private enum CacheDetailColumns {
 }
 
 /// 缓存命中行：模型名（主文字）｜「97% 命中」｜「输入196M」两列右对齐（v2.1 列化）。
-/// v2 中仅承载「整体」置顶行；v2.2 起行尾槽位承载全量折叠按钮（仅本行，其余行占位）。
+/// v2 中仅承载「整体」置顶行；v2.2.1 起全量折叠按钮紧随「整体」标题（名称列内，
+/// 不占数值列，列缘跨行对齐不受影响）。
 private final class CacheRowView: NSView {
-    /// allExpanded/hasSources/target/toggleAllAction 仅整体行传入（来源卡构造时已算好）；
-    /// 缺省时行尾放等宽占位，列缘不变。
+    /// allExpanded/hasSources/target/toggleAllAction 仅整体行传入；来源行不用本类。
     init(row: UsagePanelModel.CacheRow, allExpanded: Bool? = nil, hasSources: Bool = false,
          target: AnyObject? = nil, toggleAllAction: Selector? = nil) {
         super.init(frame: .zero)
@@ -5511,17 +5499,17 @@ private final class CacheRowView: NSView {
         name.lineBreakMode = .byTruncatingTail
         name.toolTip = row.name
         main.addArrangedSubview(name)
+        if let allExpanded, hasSources, let target, let toggleAllAction {
+            // 全量折叠按钮紧随「整体」（4pt 贴合，用户指定跟随形态）
+            main.setCustomSpacing(4, after: name)
+            main.addArrangedSubview(CacheDetailColumns.toggleAllButton(allExpanded: allExpanded,
+                                                                       target: target,
+                                                                       action: toggleAllAction))
+        }
         main.addArrangedSubview(PanelUI.spacer())
         let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 11)
         main.addArrangedSubview(hit)
         main.addArrangedSubview(input)
-        if let allExpanded, hasSources, let target, let toggleAllAction {
-            main.addArrangedSubview(CacheDetailColumns.trailingSlot(
-                button: CacheDetailColumns.toggleAllButton(allExpanded: allExpanded,
-                                                           target: target, action: toggleAllAction)))
-        } else {
-            main.addArrangedSubview(CacheDetailColumns.trailingSlot(button: nil))
-        }
         addSubview(main)
         PanelUI.pin(main, to: self)
         setAccessibilityLabel("\(row.name)，\(row.hitText)，\(row.inputText)")
@@ -5558,8 +5546,6 @@ private final class CacheSourceRowView: NSButton {
         let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 11)
         content.addArrangedSubview(hit)
         content.addArrangedSubview(input)
-        // 行尾等宽占位（v2.2）：与整体行的全量折叠按钮槽同宽，hit/input 列缘跨行对齐
-        content.addArrangedSubview(CacheDetailColumns.trailingSlot(button: nil))
         title = ""
         isBordered = false
         wantsLayer = true
@@ -5635,8 +5621,6 @@ private final class CacheModelRowView: NSView {
         let (hit, input) = CacheDetailColumns.labels(hit: row.hitText, input: row.inputText, size: 10)
         content.addArrangedSubview(hit)
         content.addArrangedSubview(input)
-        // 行尾等宽占位（v2.2）：与整体行的全量折叠按钮槽同宽，列缘跨行对齐
-        content.addArrangedSubview(CacheDetailColumns.trailingSlot(button: nil))
         addSubview(content)
         NSLayoutConstraint.activate([
             content.topAnchor.constraint(equalTo: topAnchor, constant: 2),

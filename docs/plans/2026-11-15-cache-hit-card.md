@@ -210,3 +210,10 @@ Kimi for Coding          — 命中 · 输入2.1M
 3. **层级呼吸感**：整体行与来源组之间 customSpacing 4（对齐工具明细末行节奏）；展开组尾行与下一来源行之间 customSpacing 2；其余行距走默认 5。行高/内边距沿用 TokenBucketRow/TokenDetailRow 实际常量（2pt 垂直内边距、hover 0.08、圆角 5）。
 
 守门新增：周期 pill 短标签 AX + 与卡头同行（frame midY）、三行类型列缘 alignmentRect 精确等于共享常量且 gap 8pt、spacing rhythm 4/2 读回（`stack.customSpacing(after:)`）。
+
+### 迭代 v2.2（2026-11-16 用户追加）：整体行尾全量折叠按钮
+
+- 「整体」行尾新增 borderless 符号按钮（identifier `kimi-cache-toggle-all`）：一键展开/收起当前周期全部来源行；语义「部分或全部收起 → 全部展开、全部展开 → 全部收起」，仅操作本周期来源集合，其他周期记忆的展开态不动。
+- 列缘保护：所有行型（整体/来源/嵌套）行尾保留等宽槽位（`CacheDetailColumns.toggleSlotWidth` = 24pt），仅整体行放按钮、其余行隐形占位——v2.1 的 hit/input 列缘跨行对齐不被破坏（守门 B 继续有效）。
+- 按钮样式对齐卡片设置页移动按钮（10pt semibold chevron.up/down、次要色、18pt 高）；AX/tooltip 随状态切换（「全部展开来源」/「全部收起来源」）。
+- preview 守门扩展：按钮存在性 + 三态 AX 断言 + 真实 performClick 链路（全开后 work/hermes 嵌套行齐现、全收后齐消），末尾恢复默认 work 展开态，不影响块尾 in-memory 断言。

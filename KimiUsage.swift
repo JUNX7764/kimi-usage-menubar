@@ -248,6 +248,10 @@ struct UsageData {
     var fiveHourError: String?
     var sevenDayError: String?
     var monthError: String?
+    // 月度备援：code 接口新格式 usages.limit_month_total（0..1）。GetSubscription 挂起/失败时
+    // 用它兜底本轮月度值；仅在慢轮月度失败且备援存在时被消费，不单独直读渲染。
+    var monthUsedFallback: Double? // 0..1
+    var monthResetFallback: Date?  // 备援重置时间（新格式 reset_time 可缺省）
     var workTokensError: String?   // Work 会话目录已安装但不可读（保留旧值、不推进成功时间）
     var cliTokensError: String?    // API 客户端来源全部不可读（同上）
     /// 个别会话文件读取失败数：不置错误、推进成功时间，但覆盖不完全（缺键日不证零、比较数据不足）
@@ -1529,7 +1533,39 @@ enum Fetcher {
     }
 
     /// 5 小时 + 7 天窗口：kimi-code 用量接口
+    ///
+    /// 2026-11-19 服务端迁移为新格式：usages 字典（limit_5h / limit_7d / limit_month_*），
+    /// used_ratio 接受数字或数字字符串（0...1），reset_time 为可选 ISO 串，任意键可缺省
+    /// （迁移期只回 limit_5h/limit_7d 且值为 0）。usages 键不存在时回落旧格式解析，
+    /// 服务端回滚也不受影响；两分支互斥，旧分支错误不会覆盖新分支结果。
     static func parseCodeUsagePayload(_ obj: [String: Any]) -> UsageData {
+        if let usages = obj["usages"] as? [String: Any] {
+            var result = UsageData()
+            // 单窗口解析：键缺失报缺失文案；键存在（非字典也算存在但损坏）而
+            // used_ratio 缺失/越界/非法时报无效文案；reset_time 缺省或解析失败即为 nil。
+            func window(_ key: String) -> (used: Double?, reset: Date?, error: String?) {
+                guard let entry = usages[key] as? [String: Any] else {
+                    return (nil, nil, usages[key] != nil ? "invalid" : "missing")
+                }
+                guard let valid = UsageNumber.unitRatio(entry["used_ratio"]) else {
+                    return (nil, nil, "invalid")
+                }
+                return (valid, ISO.parse(entry["reset_time"] as? String), nil)
+            }
+            let five = window("limit_5h")
+            if let used = five.used { result.fiveHourUsed = used; result.fiveHourReset = five.reset }
+            else { result.fiveHourError = five.error == "missing" ? "missing 5H window" : "invalid 5H usage limit/used/remaining" }
+            let seven = window("limit_7d")
+            if let used = seven.used { result.sevenDayUsed = used; result.sevenDayReset = seven.reset }
+            else { result.sevenDayError = "missing or invalid 7D usage limit/remaining" }
+            // 月度备援：可选键，缺省或非法都不报错（月度正源另有 GetSubscription），仅承载可用值
+            if let entry = usages["limit_month_total"] as? [String: Any],
+               let valid = UsageNumber.unitRatio(entry["used_ratio"]) {
+                result.monthUsedFallback = valid
+                result.monthResetFallback = ISO.parse(entry["reset_time"] as? String)
+            }
+            return result
+        }
         var result = UsageData()
         if let usage = obj["usage"] as? [String: Any],
            let limit = UsageNumber.finite(usage["limit"]), limit > 0,
@@ -5948,6 +5984,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     $0.sevenDayReset = r.sevenDayReset
                     $0.fiveHourError = r.fiveHourError
                     $0.sevenDayError = r.sevenDayError
+                    // 新格式 limit_month_total 月度备援：本轮 code 响应自带，供慢轮月度失败时兜底
+                    $0.monthUsedFallback = r.monthUsedFallback
+                    $0.monthResetFallback = r.monthResetFallback
                 }
                 // 历史样本：仅本次响应自身合法（sevenDayUsed/reset 在界内且 sevenDayError==nil）
                 // 才构造 percent 样本，observedAt 取回调真实时间；失败/缺字段轮次不入账。
@@ -5987,10 +6026,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             group.enter()
             Fetcher.fetchMonthUsageWithRetry(webToken: token) { r in
                 mutateMerged {
-                    $0.monthUsed = r.monthUsed
-                    $0.monthReset = r.monthReset
-                    $0.planName = r.planName
-                    $0.monthError = r.monthError
+                    if r.monthUsed != nil {
+                        // 月度接口成功：照旧整组覆盖，并清掉 code 备援避免收尾兜底误判
+                        $0.monthUsed = r.monthUsed
+                        $0.monthReset = r.monthReset
+                        $0.planName = r.planName
+                        $0.monthError = r.monthError
+                        $0.monthUsedFallback = nil
+                        $0.monthResetFallback = nil
+                    } else if let fallbackUsed = $0.monthUsedFallback {
+                        // 月度接口失败但本轮 code 新格式已带回 limit_month_total：保留备援、
+                        // 不置 monthError（数据本轮刚取到，UI 不应同时显示数值与刷新失败）；
+                        // 备援不提供 planName，不覆盖，收尾合并按备援标记保留旧套餐名。
+                        $0.monthUsed = fallbackUsed
+                        $0.monthReset = $0.monthResetFallback
+                        $0.monthError = nil
+                    } else {
+                        // 失败且无备援：保持现状（报错误、旧套餐名走收尾合并保留）
+                        $0.monthUsed = r.monthUsed
+                        $0.monthReset = r.monthReset
+                        $0.planName = r.planName
+                        $0.monthError = r.monthError
+                    }
                 }
                 group.leave()
             }
@@ -6081,10 +6138,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 快轮不触发扫描：首轮完成状态沿旧值保留，扫描完成后不会退回未知态
                 merged.scanCompleted = old.scanCompleted
             } else {
+                // 月度备援收尾兜底：此处所有回调已汇合，若月度正源失败（含 code 回调晚到
+                // 的竞态、无登录态分支）而本轮备援可用，统一补位并清错误，避免数值+失败并存。
+                if merged.monthUsed == nil, let fallbackUsed = merged.monthUsedFallback {
+                    merged.monthUsed = fallbackUsed
+                    merged.monthReset = merged.monthResetFallback
+                    merged.monthError = nil
+                }
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 失败时保留旧套餐；明确退出登录则清空，避免显示上一账号的标签。
+                // 备援生效轮同样保留（备援不提供 planName，不清空也不虚构）。
                 if webToken == nil { merged.planName = nil }
-                else if merged.planName == nil && merged.monthError != nil { merged.planName = old.planName }
+                else if merged.planName == nil && (merged.monthError != nil || merged.monthUsedFallback != nil) {
+                    merged.planName = old.planName
+                }
                 // 账号行：本轮拉到哪个字段用哪个，缺的保留旧值；未拉取（无 web token）整组保留
                 if merged.accountFetched {
                     if merged.accountName == nil { merged.accountName = old.accountName }
@@ -7896,6 +7963,74 @@ enum KimiOfflineRegression {
             try expect(partialReverse.fiveHourUsed == 0, "valid zero-use 5H value rejected")
             try expect(partialReverse.sevenDayUsed == nil && partialReverse.sevenDayError != nil,
                        "invalid 7D fields were treated as zero")
+
+            // 新格式（2026-11 服务端迁移）：usages 字典 + used_ratio（数字或数字字符串）+ 可选 reset_time
+            let newFull = Fetcher.parseCodeUsagePayload([
+                "usages": [
+                    "limit_5h": ["used_ratio": 0.25, "reset_time": "2026-11-19T21:15:00Z"],
+                    "limit_7d": ["used_ratio": "0.75", "reset_time": "2026-11-26T16:00:00Z"],
+                    "limit_month_total": ["used_ratio": "0.4", "reset_time": "2026-12-01T00:00:00Z"]
+                ],
+                "boosterWallet": ["credits": 100]
+            ])
+            try expect(newFull.fiveHourUsed == 0.25 && newFull.sevenDayUsed == 0.75,
+                       "new-schema numeric/string used_ratio lost")
+            try expect(newFull.fiveHourError == nil && newFull.sevenDayError == nil,
+                       "new-schema full payload reported errors")
+            try expect(newFull.fiveHourReset == ISO.parse("2026-11-19T21:15:00Z")
+                       && newFull.sevenDayReset == ISO.parse("2026-11-26T16:00:00Z"),
+                       "new-schema reset_time lost")
+            try expect(newFull.monthUsedFallback == 0.4
+                       && newFull.monthResetFallback == ISO.parse("2026-12-01T00:00:00Z"),
+                       "new-schema month_total fallback lost")
+
+            // 迁移期实测形态：只有 5h/7d 且 used_ratio 为 0、无 reset_time、无 month 键——任意键缺省必须健壮
+            let newMigrated = Fetcher.parseCodeUsagePayload([
+                "usages": ["limit_5h": ["used_ratio": 0], "limit_7d": ["used_ratio": 0]]
+            ])
+            try expect(newMigrated.fiveHourUsed == 0 && newMigrated.sevenDayUsed == 0,
+                       "new-schema zero ratios rejected")
+            try expect(newMigrated.fiveHourReset == nil && newMigrated.sevenDayReset == nil,
+                       "absent new-schema reset_time fabricated")
+            try expect(newMigrated.fiveHourError == nil && newMigrated.sevenDayError == nil,
+                       "new-schema migration payload reported errors")
+            try expect(newMigrated.monthUsedFallback == nil,
+                       "absent month_total fabricated a fallback")
+            let newBadMonth = Fetcher.parseCodeUsagePayload([
+                "usages": ["limit_5h": ["used_ratio": 0], "limit_7d": ["used_ratio": 0],
+                           "limit_month_total": ["used_ratio": 2]]
+            ])
+            try expect(newBadMonth.monthUsedFallback == nil,
+                       "out-of-range month_total fallback accepted")
+
+            // 键缺省报缺失、值非法报无效（错误文案沿用旧格式），越界/NaN/非字典一律拒绝
+            let newPartial = Fetcher.parseCodeUsagePayload(["usages": ["limit_5h": ["used_ratio": 0.1]]])
+            try expect(newPartial.fiveHourUsed == 0.1 && newPartial.sevenDayUsed == nil
+                       && newPartial.sevenDayError != nil, "new-schema missing 7D not rejected")
+            let newEmpty = Fetcher.parseCodeUsagePayload(["usages": [:]])
+            try expect(newEmpty.fiveHourError != nil && newEmpty.sevenDayError != nil,
+                       "new-schema empty usages accepted")
+            let newInvalid = Fetcher.parseCodeUsagePayload([
+                "usages": ["limit_5h": ["used_ratio": 1.5], "limit_7d": ["used_ratio": "NaN"]]
+            ])
+            try expect(newInvalid.fiveHourUsed == nil && newInvalid.fiveHourError != nil,
+                       "out-of-range new-schema 5H ratio accepted")
+            try expect(newInvalid.sevenDayUsed == nil && newInvalid.sevenDayError != nil,
+                       "NaN new-schema 7D ratio accepted")
+            let newMalformed = Fetcher.parseCodeUsagePayload(["usages": ["limit_5h": "broken"]])
+            try expect(newMalformed.fiveHourUsed == nil && newMalformed.fiveHourError != nil,
+                       "non-dict new-schema 5H entry accepted")
+
+            // 新旧互斥：usages 在场即走新分支（旧格式键不参与）；无 usages 时回落旧格式
+            let bothFormats = Fetcher.parseCodeUsagePayload([
+                "usage": ["limit": 100, "remaining": 50],
+                "limits": [["window": ["duration": 300, "timeUnit": "TIME_UNIT_MINUTE"],
+                            "detail": ["limit": 100, "remaining": 20]]],
+                "usages": ["limit_5h": ["used_ratio": 0.9], "limit_7d": ["used_ratio": 0.1]]
+            ])
+            try expect(bothFormats.fiveHourUsed == 0.9 && bothFormats.sevenDayUsed == 0.1,
+                       "new-schema branch must win when usages present")
+
             try expect(Fetcher.parseMonthUsagePayload(["balances": [
                 ["feature": "FEATURE_OMNI", "amountUsedRatio": 0.5]
             ]]).monthUsed == 0.5, "valid monthly ratio rejected")

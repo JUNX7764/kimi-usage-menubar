@@ -3010,6 +3010,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var usageExpanded = true
     private var briefExpanded = true
     private var toolsExpanded = false
+    private var cacheExpanded = true     // 缓存命中：独立板块折叠，默认展开；与来源行展开态分离
     private var historyExpanded = true   // 额度周期回顾：独立折叠，默认展开
     /// 额度周期回顾浏览状态：页锚点/固定选择/浏览窗口都在控制器，视图每次重建即销毁，
     /// 不能藏视图里。关闭重开与刷新保留本进程状态；重启进程回到默认（最新页、默认选择）；
@@ -3312,9 +3313,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                     addContentRow(PanelCardView(containing: toolsView))
                 case .cache:
                     let cacheView = CacheSectionView(model: model.cache, periodIndex: cachePeriodIndex,
-                        expandedSources: expandedCacheSources, target: self,
+                        expanded: cacheExpanded, expandedSources: expandedCacheSources, target: self,
                         periodAction: #selector(toggleCachePeriod(_:)),
                         sourceAction: #selector(toggleCacheSource(_:)),
+                        toggleAction: #selector(toggleCache),
                         toggleAllAction: #selector(toggleAllCacheSources(_:)))
                     addContentRow(PanelCardView(containing: cacheView))
                 }
@@ -3491,6 +3493,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc private func toggleUsage() { usageExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleBrief() { briefExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleTools() { toolsExpanded.toggle(); refreshPanelLayout() }
+    @objc private func toggleCache() { cacheExpanded.toggle(); refreshPanelLayout() }
     @objc private func toggleHistory() { historyExpanded.toggle(); refreshPanelLayout() }
 
     // MARK: 额度周期回顾：浏览状态与交互（状态在控制器，视图无重建即可销毁）
@@ -3805,13 +3808,30 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             fputs("KimiUsage visual test: cache period buttons must use tool-card short labels\n", stderr); return false
         }
         guard let cacheTitle = cacheLabel("缓存命中"),
-              let periodProbe = cacheButton(axLabel: "缓存命中周期：30 天") else {
-            fputs("KimiUsage visual test: cache header title or period button missing\n", stderr); return false
+              let periodProbe = cacheButton(axLabel: "缓存命中周期：30 天"),
+              let collapseCache = cacheButton(axLabel: "折叠缓存命中") else {
+            fputs("KimiUsage visual test: cache header title, period button or disclosure missing\n", stderr); return false
         }
         let cacheTitleFrame = cacheTitle.convert(cacheTitle.bounds, to: stack)
         let periodProbeFrame = periodProbe.convert(periodProbe.bounds, to: stack)
-        guard abs(cacheTitleFrame.midY - periodProbeFrame.midY) < 4 else {
-            fputs("KimiUsage visual test: cache period pills must stay on the header line\n", stderr); return false
+        let cacheToggleFrame = collapseCache.convert(collapseCache.bounds, to: stack)
+        guard abs(cacheTitleFrame.midY - periodProbeFrame.midY) < 4,
+              abs(cacheTitleFrame.midY - cacheToggleFrame.midY) < 4 else {
+            fputs("KimiUsage visual test: cache period pills and disclosure must stay on the header line\n", stderr); return false
+        }
+        // 板块折叠独立于来源展开：收起后只保留卡头与周期按钮，再展开恢复 work 的模型明细。
+        collapseCache.performClick(nil)
+        let cacheOverallGone = !allViews(stack).contains { $0.identifier?.rawValue == "kimi-cache-overall-row" }
+        guard !cacheExpanded, cacheOverallGone, cacheSourceRows().isEmpty,
+              cacheButton(axLabel: "展开缓存命中") != nil,
+              cacheButton(axLabel: "缓存命中周期：7 天") != nil else {
+            fputs("KimiUsage visual test: cache card collapse must hide details but retain its header\n", stderr); return false
+        }
+        cacheButton(axLabel: "展开缓存命中")?.performClick(nil)
+        guard cacheExpanded, expandedCacheSources == ["work"],
+              cacheButton(axLabel: "折叠缓存命中") != nil,
+              labels(stack).contains("K3.1 Pro") else {
+            fputs("KimiUsage visual test: cache card expansion must restore source expansion state\n", stderr); return false
         }
         // v2.1 布局守门 B：数值两列（hit/input）三行类型（整体/来源/嵌套模型）共用同一列缘——
         // 经 alignmentRect（Auto Layout 列缘语义；wrapping label 自带 ±2pt 对齐内缩）断言
@@ -5408,15 +5428,16 @@ private final class ToolPeriodButton: NSButton {
     }
 }
 
-/// 缓存命中卡：标题行内周期按钮（今日 / 近 7 天 / 近 30 天，默认近 7 天，in-memory）。
-/// v2 行结构：「整体」汇总行置顶不可展开 → 来源行（chevron 点击展开/收起该源模型行，
-/// 交互对齐「用量情况」bucket 行）→ 展开的嵌套模型行（缩进次要样式）；零用量源不显示行；
-/// 无独立折叠态与刷新按钮（跟随面板全局刷新）；无独立读取失败态（失败来源无贡献即无行，
+/// 缓存命中卡：标题行内周期按钮（今日 / 近 7 天 / 近 30 天，默认近 7 天，in-memory）与独立板块折叠箭头。
+/// 板块默认展开；折叠只隐藏明细，保留来源行展开态。v2 行结构：「整体」汇总行置顶不可展开
+/// → 来源行（chevron 点击展开/收起该源模型行，交互对齐「用量情况」bucket 行）
+/// → 展开的嵌套模型行（缩进次要样式）；零用量源不显示行；
+/// 无独立刷新按钮（跟随面板全局刷新）；无独立读取失败态（失败来源无贡献即无行，
 /// 见装配层同退语义）。
 private final class CacheSectionView: NSView {
-    init(model: UsagePanelModel.CacheSection, periodIndex: Int, expandedSources: Set<String>,
-         target: AnyObject, periodAction: Selector, sourceAction: Selector,
-         toggleAllAction: Selector) {
+    init(model: UsagePanelModel.CacheSection, periodIndex: Int, expanded: Bool,
+         expandedSources: Set<String>, target: AnyObject, periodAction: Selector,
+         sourceAction: Selector, toggleAction: Selector, toggleAllAction: Selector) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 5)
@@ -5433,40 +5454,44 @@ private final class CacheSectionView: NSView {
             button.setAccessibilityLabel("缓存命中周期：\(name)")
             periods.addArrangedSubview(button)
         }
+        let toggle = PanelUI.disclosureToggle(expanded: expanded, section: "缓存命中",
+                                              target: target, action: toggleAction)
         let header = PanelUI.cardHeader(icon: "arrow.triangle.2.circlepath", title: "缓存命中",
-                                        trailing: [periods])
+                                        trailing: [periods, toggle])
         PanelUI.addFullWidth(header, to: root)
-        let period = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : nil
-        if let overall = period?.overall {
-            // 全量折叠按钮（v2.2.1）：仅当前周期存在来源行时显示，紧随「整体」标题
-            let sources = period?.sources ?? []
-            let allExpanded = !sources.isEmpty && sources.allSatisfy { expandedSources.contains($0.id) }
-            let overallRow = CacheRowView(row: overall, allExpanded: allExpanded, hasSources: !sources.isEmpty,
-                                          target: target, toggleAllAction: toggleAllAction)
-            PanelUI.addFullWidth(overallRow, to: root)
-            // 层级呼吸感（v2.1）：整体行与来源组之间 4pt（对齐工具明细末行 4pt 节奏，
-            // 与来源行间默认 5pt 区分开）；展开组尾行与下一来源行之间 2pt（嵌套行属于
-            // 上一来源的视觉分组）；其余行距走 stack 默认 5。
-            root.setCustomSpacing(4, after: overallRow)
-            var lastRow: NSView = overallRow
-            for source in period?.sources ?? [] {
-                let expanded = expandedSources.contains(source.id)
-                let row = CacheSourceRowView(row: source, expanded: expanded, target: target, action: sourceAction)
-                PanelUI.addFullWidth(row, to: root)
-                lastRow = row
-                if expanded {
-                    for modelRow in source.models {
-                        let detail = CacheModelRowView(row: modelRow)
-                        PanelUI.addFullWidth(detail, to: root)
-                        lastRow = detail
+        if expanded {
+            let period = model.periods.indices.contains(periodIndex) ? model.periods[periodIndex] : nil
+            if let overall = period?.overall {
+                // 全量折叠按钮（v2.2.1）：仅当前周期存在来源行时显示，紧随「整体」标题
+                let sources = period?.sources ?? []
+                let allExpanded = !sources.isEmpty && sources.allSatisfy { expandedSources.contains($0.id) }
+                let overallRow = CacheRowView(row: overall, allExpanded: allExpanded, hasSources: !sources.isEmpty,
+                                              target: target, toggleAllAction: toggleAllAction)
+                PanelUI.addFullWidth(overallRow, to: root)
+                // 层级呼吸感（v2.1）：整体行与来源组之间 4pt（对齐工具明细末行 4pt 节奏，
+                // 与来源行间默认 5pt 区分开）；展开组尾行与下一来源行之间 2pt（嵌套行属于
+                // 上一来源的视觉分组）；其余行距走 stack 默认 5。
+                root.setCustomSpacing(4, after: overallRow)
+                var lastRow: NSView = overallRow
+                for source in period?.sources ?? [] {
+                    let expanded = expandedSources.contains(source.id)
+                    let row = CacheSourceRowView(row: source, expanded: expanded, target: target, action: sourceAction)
+                    PanelUI.addFullWidth(row, to: root)
+                    lastRow = row
+                    if expanded {
+                        for modelRow in source.models {
+                            let detail = CacheModelRowView(row: modelRow)
+                            PanelUI.addFullWidth(detail, to: root)
+                            lastRow = detail
+                        }
+                        root.setCustomSpacing(2, after: lastRow)
                     }
-                    root.setCustomSpacing(2, after: lastRow)
                 }
+                root.setCustomSpacing(4, after: lastRow)
+            } else {
+                // 空态复用工具明细文案：窗口内没有任何 Kimi 用量
+                PanelUI.addFullWidth(PanelUI.label("本周期暂无用量", size: 11, color: .secondaryLabelColor), to: root)
             }
-            root.setCustomSpacing(4, after: lastRow)
-        } else {
-            // 空态复用工具明细文案：窗口内没有任何 Kimi 用量
-            PanelUI.addFullWidth(PanelUI.label("本周期暂无用量", size: 11, color: .secondaryLabelColor), to: root)
         }
         addSubview(root)
         PanelUI.pin(root, to: self)

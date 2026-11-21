@@ -452,6 +452,8 @@ enum TokenAggregator {
     // 接受追加全量重扫的能耗代价，正确性与已审基线一致）。--self-test 经 override 在
     // 13.3+ 二进制内模拟 13.0-13.2 回退分支（SIM 段），双分支语义在任意系统段都有
     // 真实执行锁定，解除旧版回退分支「更长替换漏检 → 自检必败 → 更新死锁」。
+    // 注意：勿在真实 13.0-13.2 系统上置 true——gate=true 而 inode=nil 是错配态
+    // （只影响测试断言选支；扫描行为以局部 inodeAvailable = inode != nil 为准）。
     static var fileIdentifierGateOverride: Bool?
     static var inodeGateAvailable: Bool {
         if let overridden = fileIdentifierGateOverride { return overridden }
@@ -9300,12 +9302,14 @@ enum KimiOfflineRegression {
                 var simAppendFiles: [String: TokenAggregator.FileScanState] = [:]
                 _ = TokenAggregator.scan(roots: [simAppendRoot], kimiOnly: true, into: &simAppendFiles)
                 try expect(simAppendFiles.values.first.map(totals) == [35, 2], "SIM-13.0 append baseline is wrong")
+                let simAppendKey = simAppendFiles.keys.first ?? simAppendPath
+                // 哨兵在追加前注入：下方 == nil 断言才构成「全量重建已发生」的真实观测
+                simAppendFiles[simAppendKey]?.days["zz-sentinel-4"] = [7, 7]
                 let simAppendFh = try FileHandle(forWritingTo: URL(fileURLWithPath: simAppendPath))
                 try simAppendFh.seekToEnd()
                 try simAppendFh.write(contentsOf: Data((try jsonLine(usageRecord) + "\n").utf8))
                 try simAppendFh.close()
                 _ = TokenAggregator.scan(roots: [simAppendRoot], kimiOnly: true, into: &simAppendFiles)
-                let simAppendKey = simAppendFiles.keys.first ?? simAppendPath
                 try expect(simAppendFiles[simAppendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
                            && simAppendFiles[simAppendKey]?.days["zz-sentinel-4"] == nil,
                            "SIM-13.0: append must fully rescan and stay correct")

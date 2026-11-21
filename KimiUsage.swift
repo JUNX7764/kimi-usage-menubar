@@ -330,12 +330,18 @@ enum TokenAggregator {
         /// （resourceValues 已在扫描时取得）。旧缓存无该字段 → 首轮不命中 skip →
         /// 一次性全量重建，与 scanRevision bump 的升级语义一致。
         var mtime: Date? = nil
+        /// 文件身份指纹之二（fileIdentifier/inode）：rename / 原子写替换必换 inode → 全量
+        /// 重扫；同 inode 变大 = 追加 → 保持增量快路（mtime 变化不触发全量重读，守住
+        /// 2026-09-15 能耗优化语义）；同 inode 等长仅 mtime 变 = 原地改写 → 全量重扫。
+        /// 「原地加长不 rename」的替换漏检为已知残余（与 main 旧行为一致，自测 (f) 显式契约）。
+        /// 旧缓存无该字段 → 一次性全量重建。与 mtime 同一次 stat 取得，零额外 I/O。
+        var inode: UInt64? = nil
 
         init() {}
 
         // 旧缓存 JSON 没有 cacheDays 键：合成 Decodable 会因缺键抛错并连带丢弃整个 ScanState
         // （Hermes/ZCode 历史快照随之丢失），因此显式解码并把缺字段按空值起。
-        private enum CodingKeys: String, CodingKey { case offset, days, modelDays, cacheDays, preferUsageRecord, scanRevision, mtime }
+        private enum CodingKeys: String, CodingKey { case offset, days, modelDays, cacheDays, preferUsageRecord, scanRevision, mtime, inode }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             offset = try c.decodeIfPresent(UInt64.self, forKey: .offset) ?? 0
@@ -345,6 +351,7 @@ enum TokenAggregator {
             preferUsageRecord = try c.decodeIfPresent(Bool.self, forKey: .preferUsageRecord) ?? false
             scanRevision = try c.decodeIfPresent(Int.self, forKey: .scanRevision) ?? nil
             mtime = try c.decodeIfPresent(Date.self, forKey: .mtime) ?? nil
+            inode = try c.decodeIfPresent(UInt64.self, forKey: .inode) ?? nil
         }
     }
     struct ScanState: Codable {
@@ -430,6 +437,16 @@ enum TokenAggregator {
 
     // 只关心近 30 天窗口，日聚合保留 31 天余量
     private static let retainSeconds: TimeInterval = 31 * 86400
+
+    // 扫描身份指纹键组：fileIdentifier（inode）自 macOS 13.3 起提供，而部署目标是 13.0；
+    // 更低版本系统取不到 inode（提取处同步门控返回 nil）→ 自动退回 mtime+size 语义，
+    // 与 inode 引入前的行为一致。同一次 stat 取得，零额外 I/O。
+    private static let scanResourceKeys: [URLResourceKey] = {
+        if #available(macOS 13.3, *) {
+            return [.fileSizeKey, .contentModificationDateKey, .fileIdentifierKey]
+        }
+        return [.fileSizeKey, .contentModificationDateKey]
+    }()
 
     static let dayFmt: DateFormatter = {
         let f = DateFormatter()
@@ -719,7 +736,7 @@ enum TokenAggregator {
             // 不是目录（异常）或枚举失败都算该 root 不可读；未枚举成功不入 enumedRoots
             guard isDir.boolValue, let enumerator = FileManager.default.enumerator(
                 at: URL(fileURLWithPath: realRoot),
-                includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+                includingPropertiesForKeys: Self.scanResourceKeys,
                 options: [.skipsHiddenFiles])
             else { continue }
             enumedRoots.append(realRoot)
@@ -727,29 +744,36 @@ enum TokenAggregator {
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 let path = url.path
                 seen.insert(path)
-                guard let vals = try? url.resourceValues(
-                        forKeys: [.fileSizeKey, .contentModificationDateKey]),
+                guard let vals = try? url.resourceValues(forKeys: Set(Self.scanResourceKeys)),
                       let size = vals.fileSize
                 else { failedFiles += 1; continue }
                 let sizeU = UInt64(size)
                 let mtime = vals.contentModificationDate
+                let inode: UInt64?
+                if #available(macOS 13.3, *) { inode = vals.fileIdentifier } else { inode = nil }
                 var st = files[path] ?? FileScanState()
                 // Work v5 / CLI v3：按请求关联模型及双写，并补齐平行缓存明细（cacheDays）；
                 // 旧缓存（无缓存明细）即使文件未变也全量重建，保证窗口内 cacheDays 无空洞。
                 let revision = kimiOnly ? 3 : 5
-                // 文件只增不改：大小、修订与身份指纹（mtime）三重一致才跳过（绝大多数文件走这里）；
-                // 同 offset 的整文件替换（等长换内容）靠 mtime 识别，不再漏记
-                if st.offset == sizeU && st.scanRevision == revision && st.mtime == mtime {
+                // 文件只增不改：大小、修订与身份指纹（mtime + inode）四重一致才跳过
+                // （绝大多数文件走这里）；同 offset 的整文件替换（等长换内容）靠 mtime 识别，
+                // mtime 相同但 inode 变化（cp -p 保mtime 替换）靠 inode 识别
+                if st.offset == sizeU && st.scanRevision == revision && st.mtime == mtime && st.inode == inode {
                     files[path] = st; continue
                 }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小与身份指纹后跳过
                 if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty, st.cacheDays.isEmpty,
                    let mtime, mtime < cutoff {
-                    st.offset = sizeU; st.scanRevision = revision; st.mtime = mtime; files[path] = st; continue
+                    st.offset = sizeU; st.scanRevision = revision; st.mtime = mtime; st.inode = inode
+                    files[path] = st; continue
                 }
-                // 截断/轮换/同路径替换：身份指纹变化或文件变短 = 旧聚合不可信，清零重扫。
-                // 旧缓存 mtime 为 nil → 与任何真实 mtime 不等 → 一次性全量重建（升级语义）。
-                if sizeU < st.offset || st.mtime != mtime { st = FileScanState() }
+                // 复位判定（三支）：文件变短（截断/轮换）、inode 变化（rename/原子写替换）、
+                // 同 inode 等长仅 mtime 变（原地改写）→ 旧聚合不可信，清零重扫。
+                // 同 inode 变大 = 追加 → 不复位，保持增量快路（mtime 变化不触发全量重读）。
+                // 旧缓存 inode/mtime 为 nil → 与真实值不等 → 一次性全量重建（升级语义）。
+                if sizeU < st.offset || st.inode != inode || (sizeU == st.offset && st.mtime != mtime) {
+                    st = FileScanState()
+                }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { failedFiles += 1; continue }
                 // Work 的请求与用量可跨刷新追加，变更时重扫，避免丢失请求上下文。
@@ -761,6 +785,7 @@ enum TokenAggregator {
                     try? fh.close()
                     // 无新增完整行：同步身份指纹，避免每轮对同一文件重复空读
                     st.mtime = mtime
+                    st.inode = inode
                     files[path] = st
                     continue
                 }
@@ -777,6 +802,7 @@ enum TokenAggregator {
                 st.offset = consumed
                 st.scanRevision = revision
                 st.mtime = mtime
+                st.inode = inode
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 st.modelDays = st.modelDays.filter { $0.key >= cutoffKey }
                 st.cacheDays = st.cacheDays.filter { $0.key >= cutoffKey }
@@ -7167,7 +7193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: LaunchAgent 即时生效（偏好决定 bootstrap，加载态决定 bootout）
     // 仅 UI 开关路径调用（visualPreview 已在 onToggleLogin guard），绝不进 --self-test。
-    // launchctl 不存在（try run 抛错）/非零退出/被信号终止统一按失败返回 false。
+    // launchctl 不存在（try run 抛错）/非零退出/被信号终止统一按失败返回。
     private func launchctlSucceeded(_ arguments: [String]) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
@@ -7184,6 +7210,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         return true
+    }
+
+    /// launchctl print 的 program 值（已加载 job 的可执行路径）；job 未加载 / launchctl
+    /// 失败 / 输出无法解析 → nil。解析口径与 update.sh 的 awk 一致（首个 program = 行）。
+    private func launchctlLoadedProgram(_ jobSpecifier: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = ["print", jobSpecifier]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch {
+            NSLog("[KimiUsage] launchctl print spawn failed: %@", error.localizedDescription)
+            return nil
+        }
+        // 先读完管道再等退出（print 输出远小于管道缓冲，无阻塞风险）
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+            if let range = trimmed.range(of: "program = ") {
+                return String(trimmed[range.upperBound...])
+            }
+        }
+        return nil
     }
 
     private var launchAgentDomain: String { "gui/\(getuid())" }
@@ -7218,10 +7270,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ]
                 let data = try PropertyListSerialization.data(fromPropertyList: plist,
                     format: .xml, options: 0)
-                try data.write(to: URL(fileURLWithPath: launchAgentPath))
-                // 开：写完立即 bootstrap（开关立即生效）；失败明确报错不静默，
-                // plist 保留（下次登录仍生效，与既有语义一致）
-                if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
+                // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
+                try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
+                // 开：先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
+                // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
+                // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
+                // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
+                // job 未加载 → 直接 bootstrap。失败明确报错不静默，plist 保留（下次登录
+                // 仍生效，与既有语义一致）。
+                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+                if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
+                    if loadedProgram != exec,
+                       !(launchctlSucceeded(["bootout", jobSpecifier])
+                         && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
+                        panelController.setUpdateMessage("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）", dismissAfter: 5)
+                        NSLog("[KimiUsage] LaunchAgent reload correction failed")
+                    }
+                } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
                     panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
                     NSLog("[KimiUsage] LaunchAgent bootstrap failed")
                 }
@@ -9005,14 +9070,17 @@ enum KimiOfflineRegression {
                        && truncateFiles.values.first.map(totals) == [35, 2],
                        "truncated file must reset cacheDays with the rescan")
 
-            // ===== 断言 14（文件身份指纹 mtime）：同路径整文件替换必须重扫，聚合反映替换后内容 =====
-            // (a) 替换为更长文件：旧逻辑 offset < size 只读追加字节（漏算替换前缀），必失败
+            // ===== 断言 14（文件身份指纹 mtime/inode）：同路径整文件替换必须重扫，聚合反映替换后内容 =====
+            // (a) 替换为更长文件：删旧写新（rename 语义，inode 变化）代表真实替换场景；
+            // 旧逻辑 offset < size 只读追加字节（漏算替换前缀），必失败。
+            // 「原地加长不 rename」的漏检是已知残余（与 main 一致），由 (f) 显式契约锁定。
             let replaceRoot = root.appendingPathComponent("replace-scan").path
             try FileManager.default.createDirectory(atPath: replaceRoot, withIntermediateDirectories: true)
             let replacePath = replaceRoot + "/session.jsonl"
             try (try jsonLine(loopMirror) + "\n").write(toFile: replacePath, atomically: true, encoding: .utf8)
             var replaceFiles: [String: TokenAggregator.FileScanState] = [:]
             _ = TokenAggregator.scan(roots: [replaceRoot], kimiOnly: true, into: &replaceFiles)
+            try FileManager.default.removeItem(atPath: replacePath)
             try (try jsonLine(usageRecord) + "\n" + jsonLine(loopMirror) + "\n")
                 .write(toFile: replacePath, atomically: true, encoding: .utf8)
             _ = TokenAggregator.scan(roots: [replaceRoot], kimiOnly: true, into: &replaceFiles)
@@ -9031,10 +9099,20 @@ enum KimiOfflineRegression {
             var equalFiles: [String: TokenAggregator.FileScanState] = [:]
             _ = TokenAggregator.scan(roots: [equalRoot], kimiOnly: true, into: &equalFiles)
             try expect(equalFiles.values.first.map(totals) == [35, 2], "equal-size fixture baseline scan is wrong")
+            // 删旧写新（rename 语义，inode 变化）
+            try FileManager.default.removeItem(atPath: equalPath)
             try (equalSizeV2 + "\n").write(toFile: equalPath, atomically: true, encoding: .utf8)
             _ = TokenAggregator.scan(roots: [equalRoot], kimiOnly: true, into: &equalFiles)
             try expect(equalFiles.values.first.map(totals) == [55, 6],
                        "same-size content replacement must rescan via the mtime fingerprint")
+            // (b2) 等长原地改写（同 inode、同大小、仅 mtime 变）：mtime+等长分支抓替换
+            let equalRewriteFh = try FileHandle(forWritingTo: URL(fileURLWithPath: equalPath))
+            try equalRewriteFh.truncate(atOffset: 0)
+            try equalRewriteFh.write(contentsOf: Data((equalSizeV1 + "\n").utf8))
+            try equalRewriteFh.close()
+            _ = TokenAggregator.scan(roots: [equalRoot], kimiOnly: true, into: &equalFiles)
+            try expect(equalFiles.values.first.map(totals) == [35, 2],
+                       "same-size in-place rewrite must rescan via the mtime branch")
             // (c) root 本身是符号链接：enumerator 对根级符号链接 ENOTDIR 失败，旧代码静默跳过整个 root
             let linkTarget = root.appendingPathComponent("link-target")
             try FileManager.default.createDirectory(at: linkTarget, withIntermediateDirectories: true)
@@ -9061,6 +9139,84 @@ enum KimiOfflineRegression {
             let danglingScan = TokenAggregator.scan(roots: [danglingRoot], kimiOnly: true, into: &danglingFiles)
             try expect(danglingScan.installed == 0 && danglingScan.enumerated == 0 && danglingScan.okRoots.isEmpty,
                        "dangling symlink root must count as not installed")
+            // (e) 同 inode 追加：变大必须保持增量快路（mtime 变化不触发全量重读，能耗语义）；
+            // 哨兵日键（真实解析永不产生）存活 = 未发生清零重建。未追加再扫 skip 命中：
+            // 哨兵仍在且 offset 不变。
+            let appendRoot = root.appendingPathComponent("append-scan").path
+            try FileManager.default.createDirectory(atPath: appendRoot, withIntermediateDirectories: true)
+            let appendPath = appendRoot + "/session.jsonl"
+            try (try jsonLine(usageRecord) + "\n").write(toFile: appendPath, atomically: true, encoding: .utf8)
+            var appendFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [appendRoot], kimiOnly: true, into: &appendFiles)
+            try expect(appendFiles.values.first.map(totals) == [35, 2], "append fixture baseline scan is wrong")
+            // 状态键是 realPath 形式（/var → /private/var），用字典实际键注入哨兵
+            let appendKey = appendFiles.keys.first ?? appendPath
+            appendFiles[appendKey]?.days["9999-12-31"] = [7, 7]   // 哨兵：重建即清除，skip/增量保留
+            let appendFh = try FileHandle(forWritingTo: URL(fileURLWithPath: appendPath))
+            try appendFh.seekToEnd()
+            try appendFh.write(contentsOf: Data((try jsonLine(usageRecord) + "\n").utf8))
+            try appendFh.close()
+            _ = TokenAggregator.scan(roots: [appendRoot], kimiOnly: true, into: &appendFiles)
+            try expect(appendFiles[appendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
+                       && appendFiles[appendKey]?.days["9999-12-31"] == [7, 7],
+                       "same-inode append must stay incremental without a full rescan")
+            let appendedOffset = appendFiles[appendKey]?.offset
+            _ = TokenAggregator.scan(roots: [appendRoot], kimiOnly: true, into: &appendFiles)
+            try expect(appendFiles[appendKey]?.offset == appendedOffset
+                       && appendFiles[appendKey]?.days["9999-12-31"] == [7, 7],
+                       "unchanged appended file must hit the skip path on the next round")
+            // (f) 原地加长不 rename（残余风险显式契约）：同 inode 且变大 → 只增量读追加段、
+            // 替换前缀不重读，与 main 旧行为一致——锁定该契约而非修复；若未来引入更强
+            // 指纹需同步改此断言。
+            let inplaceRoot = root.appendingPathComponent("inplace-scan").path
+            try FileManager.default.createDirectory(atPath: inplaceRoot, withIntermediateDirectories: true)
+            let inplacePath = inplaceRoot + "/session.jsonl"
+            let inplaceV1 = try jsonLine(usageRecord)
+            // 前缀仅改 inputOther 数字（10→30，等字节数），保证等长替换语义且与 v1 同布局
+            let inplacePrefix = inplaceV1.replacingOccurrences(of: "\"inputOther\":10", with: "\"inputOther\":30")
+            let inplaceTail = try jsonLine(["type": "usage.record", "time": eventMS + 2,
+                                            "model": "k3.1-pro", "usage": kimiUsage])
+            try expect(inplacePrefix != inplaceV1 && inplacePrefix.utf8.count == inplaceV1.utf8.count,
+                       "in-place residual fixture must keep the prefix byte length")
+            try (inplaceV1 + "\n").write(toFile: inplacePath, atomically: true, encoding: .utf8)
+            var inplaceFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [inplaceRoot], kimiOnly: true, into: &inplaceFiles)
+            try expect(inplaceFiles.values.first.map(totals) == [35, 2], "in-place fixture baseline scan is wrong")
+            let inplaceKey = inplaceFiles.keys.first ?? inplacePath
+            inplaceFiles[inplaceKey]?.days["9999-12-30"] = [7, 7]   // 哨兵
+            let inplaceFh = try FileHandle(forWritingTo: URL(fileURLWithPath: inplacePath))
+            try inplaceFh.truncate(atOffset: 0)
+            try inplaceFh.write(contentsOf: Data((inplacePrefix + "\n" + inplaceTail + "\n").utf8))
+            try inplaceFh.close()
+            _ = TokenAggregator.scan(roots: [inplaceRoot], kimiOnly: true, into: &inplaceFiles)
+            // 增量路径：哨兵存活、totals = 旧前缀 [35,2] + 追加段 [35,2] = [70,4]，
+            // 新前缀 [55,2] 未重读（漏检与 main 一致）
+            try expect(inplaceFiles[inplaceKey]?.days["9999-12-30"] == [7, 7]
+                       && inplaceFiles[inplaceKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4],
+                       "in-place grow must keep the incremental path (documented residual, same as main)")
+            // (g) 缓存往返 skip 命中：scan → encoded → decode 回读 → 再 scan。
+            // 身份指纹跨 JSON 往返 bit 级相等是增量扫描命门；哨兵存活 + offset 不变 = 未重建。
+            let persistRoot = root.appendingPathComponent("roundtrip-scan").path
+            try FileManager.default.createDirectory(atPath: persistRoot, withIntermediateDirectories: true)
+            let persistPath = persistRoot + "/session.jsonl"
+            try (try jsonLine(usageRecord) + "\n").write(toFile: persistPath, atomically: true, encoding: .utf8)
+            var roundTripFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [persistRoot], kimiOnly: true, into: &roundTripFiles)
+            var roundTripState = TokenAggregator.ScanState()
+            roundTripState.cli = roundTripFiles
+            let decodedState = try JSONDecoder().decode(TokenAggregator.ScanState.self,
+                                                        from: ScanStateFile.encoded(roundTripState))
+            try expect(decodedState.cli.values.first?.mtime != nil
+                       && decodedState.cli.values.first?.inode != nil,
+                       "scan identity fingerprint did not survive cache round trip")
+            var reloadedFiles = decodedState.cli
+            let reloadedKey = reloadedFiles.keys.first ?? persistPath
+            reloadedFiles[reloadedKey]?.days["9999-12-29"] = [7, 7]   // 哨兵
+            let reloadedOffset = reloadedFiles[reloadedKey]?.offset
+            _ = TokenAggregator.scan(roots: [persistRoot], kimiOnly: true, into: &reloadedFiles)
+            try expect(reloadedFiles[reloadedKey]?.offset == reloadedOffset
+                       && reloadedFiles[reloadedKey]?.days["9999-12-29"] == [7, 7],
+                       "reloaded cache must hit the skip path on rescan")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]

@@ -611,6 +611,19 @@ exit 0
         with plist.open("rb") as f:
             self.assertEqual(plistlib.load(f)["ProgramArguments"], ["/other/KimiUsage"])
 
+    def test_unloaded_job_with_matching_plist_bootstraps(self):
+        # Q2 象限（偏好 ON + job 未加载）：停旧无 bootout（幂等，无 job 可退），启动按
+        # 偏好 bootstrap 保活。旧代码 job 未加载时从不读 plist、走 open -n 直启丢保活，
+        # 此用例锁定该缺陷已修复（防回归）。
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_AGENT_ACTIVE="0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertFalse(any("bootout" in line for line in launch_lines))
+        self.assertTrue(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
+
     def prepare_release(self):
         project = self.base / "release-project"
         (project / "scripts").mkdir(parents=True)

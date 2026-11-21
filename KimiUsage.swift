@@ -325,12 +325,17 @@ enum TokenAggregator {
         /// 已出现 usage.record 的 Work 文件，在追加后重扫以重新匹配镜像。
         var preferUsageRecord: Bool = false
         var scanRevision: Int? = nil
+        /// 文件身份指纹（contentModificationDate）：同 offset 的整文件替换（等长换内容、
+        /// 更长换前缀）旧逻辑会漏算，mtime 变化即视为新内容强制重扫。零额外 I/O
+        /// （resourceValues 已在扫描时取得）。旧缓存无该字段 → 首轮不命中 skip →
+        /// 一次性全量重建，与 scanRevision bump 的升级语义一致。
+        var mtime: Date? = nil
 
         init() {}
 
         // 旧缓存 JSON 没有 cacheDays 键：合成 Decodable 会因缺键抛错并连带丢弃整个 ScanState
         // （Hermes/ZCode 历史快照随之丢失），因此显式解码并把缺字段按空值起。
-        private enum CodingKeys: String, CodingKey { case offset, days, modelDays, cacheDays, preferUsageRecord, scanRevision }
+        private enum CodingKeys: String, CodingKey { case offset, days, modelDays, cacheDays, preferUsageRecord, scanRevision, mtime }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             offset = try c.decodeIfPresent(UInt64.self, forKey: .offset) ?? 0
@@ -339,6 +344,7 @@ enum TokenAggregator {
             cacheDays = try c.decodeIfPresent(CacheDays.self, forKey: .cacheDays) ?? [:]
             preferUsageRecord = try c.decodeIfPresent(Bool.self, forKey: .preferUsageRecord) ?? false
             scanRevision = try c.decodeIfPresent(Int.self, forKey: .scanRevision) ?? nil
+            mtime = try c.decodeIfPresent(Date.self, forKey: .mtime) ?? nil
         }
     }
     struct ScanState: Codable {
@@ -688,18 +694,25 @@ enum TokenAggregator {
         var enumedRoots: [String] = []
         var installed = 0
         var failedFiles = 0
+        // trusted 判定的目标路径每轮只解析一次（此前每个文件重复 realPath）
+        let trustedRoot = realPath(apiSessionsRoots[0])
 
         for root in roots {
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: root, isDirectory: &isDir) else { continue }
             installed += 1
+            // 符号链接 root 按解析后的真实路径枚举与建状态键：enumerator 对根级符号链接
+            // 会 ENOTDIR 失败（整个 root 被静默跳过）；普通 root 解析结果不变，零行为差异。
+            // dangling symlink 已被上方 fileExists 挡掉（遵循链接，目标消失 = 未安装）。
+            // 每个 root 只解析一次，enumedRoots 与下方 trusted 判定复用同一值。
+            let realRoot = realPath(root)
             // 不是目录（异常）或枚举失败都算该 root 不可读；未枚举成功不入 enumedRoots
             guard isDir.boolValue, let enumerator = FileManager.default.enumerator(
-                at: URL(fileURLWithPath: root),
+                at: URL(fileURLWithPath: realRoot),
                 includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
                 options: [.skipsHiddenFiles])
             else { continue }
-            enumedRoots.append(realPath(root))
+            enumedRoots.append(realRoot)
 
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 let path = url.path
@@ -709,19 +722,24 @@ enum TokenAggregator {
                       let size = vals.fileSize
                 else { failedFiles += 1; continue }
                 let sizeU = UInt64(size)
+                let mtime = vals.contentModificationDate
                 var st = files[path] ?? FileScanState()
                 // Work v5 / CLI v3：按请求关联模型及双写，并补齐平行缓存明细（cacheDays）；
                 // 旧缓存（无缓存明细）即使文件未变也全量重建，保证窗口内 cacheDays 无空洞。
                 let revision = kimiOnly ? 3 : 5
-                // 文件只增不改：大小未变直接跳过（绝大多数文件走这里）
-                if st.offset == sizeU && st.scanRevision == revision { files[path] = st; continue }
-                // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小后跳过
-                if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty, st.cacheDays.isEmpty,
-                   let mtime = vals.contentModificationDate, mtime < cutoff {
-                    st.offset = sizeU; st.scanRevision = revision; files[path] = st; continue
+                // 文件只增不改：大小、修订与身份指纹（mtime）三重一致才跳过（绝大多数文件走这里）；
+                // 同 offset 的整文件替换（等长换内容）靠 mtime 识别，不再漏记
+                if st.offset == sizeU && st.scanRevision == revision && st.mtime == mtime {
+                    files[path] = st; continue
                 }
-                // 截断/轮换：该文件的旧聚合已不可信，清零重扫
-                if sizeU < st.offset { st = FileScanState() }
+                // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小与身份指纹后跳过
+                if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty, st.cacheDays.isEmpty,
+                   let mtime, mtime < cutoff {
+                    st.offset = sizeU; st.scanRevision = revision; st.mtime = mtime; files[path] = st; continue
+                }
+                // 截断/轮换/同路径替换：身份指纹变化或文件变短 = 旧聚合不可信，清零重扫。
+                // 旧缓存 mtime 为 nil → 与任何真实 mtime 不等 → 一次性全量重建（升级语义）。
+                if sizeU < st.offset || st.mtime != mtime { st = FileScanState() }
 
                 guard let fh = try? FileHandle(forReadingFrom: url) else { failedFiles += 1; continue }
                 // Work 的请求与用量可跨刷新追加，变更时重扫，避免丢失请求上下文。
@@ -729,19 +747,26 @@ enum TokenAggregator {
                 if rebuild { st = FileScanState() }
                 fh.seek(toFileOffset: st.offset)
                 let data = fh.readDataToEndOfFile()
-                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else { try? fh.close(); continue }
+                guard let lastNL = data.lastIndex(of: UInt8(ascii: "\n")) else {
+                    try? fh.close()
+                    // 无新增完整行：同步身份指纹，避免每轮对同一文件重复空读
+                    st.mtime = mtime
+                    files[path] = st
+                    continue
+                }
                 let text = String(data: data[..<lastNL], encoding: .utf8)
                 try? fh.close()
                 let consumed = st.offset + UInt64(lastNL + 1)
                 guard let text else { failedFiles += 1; continue }
                 if kimiOnly {
-                    let trusted = realPath(root) == realPath(apiSessionsRoots[0])
+                    let trusted = realRoot == trustedRoot
                     parseLines(text, kimiOnly: true, cutoffKey: cutoffKey, allowMissingModel: trusted, into: &st)
                 } else {
                     parseWorkLines(text, cutoffKey: cutoffKey, into: &st)
                 }
                 st.offset = consumed
                 st.scanRevision = revision
+                st.mtime = mtime
                 st.days = st.days.filter { $0.key >= cutoffKey }
                 st.modelDays = st.modelDays.filter { $0.key >= cutoffKey }
                 st.cacheDays = st.cacheDays.filter { $0.key >= cutoffKey }
@@ -8868,6 +8893,63 @@ enum KimiOfflineRegression {
                        && truncateFiles.values.first?.cacheDays[modelDayKey]?["未知模型"] == nil
                        && truncateFiles.values.first.map(totals) == [35, 2],
                        "truncated file must reset cacheDays with the rescan")
+
+            // ===== 断言 14（文件身份指纹 mtime）：同路径整文件替换必须重扫，聚合反映替换后内容 =====
+            // (a) 替换为更长文件：旧逻辑 offset < size 只读追加字节（漏算替换前缀），必失败
+            let replaceRoot = root.appendingPathComponent("replace-scan").path
+            try FileManager.default.createDirectory(atPath: replaceRoot, withIntermediateDirectories: true)
+            let replacePath = replaceRoot + "/session.jsonl"
+            try (try jsonLine(loopMirror) + "\n").write(toFile: replacePath, atomically: true, encoding: .utf8)
+            var replaceFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [replaceRoot], kimiOnly: true, into: &replaceFiles)
+            try (try jsonLine(usageRecord) + "\n" + jsonLine(loopMirror) + "\n")
+                .write(toFile: replacePath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [replaceRoot], kimiOnly: true, into: &replaceFiles)
+            try expect(replaceFiles.values.first.map(totals) == [35, 2],
+                       "same-path replacement with a longer file must rescan and reflect the new content")
+            // (b) 等长替换：大小相同、内容不同（仅 mtime 变化）也必须重扫，旧逻辑直接 skip 必失败
+            // 时间取当前毫秒（13 位数字 +1 不变长），保证行在 31 天窗口内且两行字节数相同
+            let equalBaseMS = Int(Date().timeIntervalSince1970 * 1000)
+            let equalSizeV1 = "{\"type\":\"usage.record\",\"time\":\(equalBaseMS),\"model\":\"k3.1-pro\",\"usage\":{\"inputOther\":10,\"inputCacheRead\":20,\"inputCacheCreation\":5,\"output\":2}}"
+            let equalSizeV2 = "{\"type\":\"usage.record\",\"time\":\(equalBaseMS + 1),\"model\":\"k3.1-pro\",\"usage\":{\"inputOther\":30,\"inputCacheRead\":20,\"inputCacheCreation\":5,\"output\":6}}"
+            try expect(equalSizeV1.utf8.count == equalSizeV2.utf8.count, "equal-size replacement fixture drifted")
+            let equalRoot = root.appendingPathComponent("equal-size-scan").path
+            try FileManager.default.createDirectory(atPath: equalRoot, withIntermediateDirectories: true)
+            let equalPath = equalRoot + "/session.jsonl"
+            try (equalSizeV1 + "\n").write(toFile: equalPath, atomically: true, encoding: .utf8)
+            var equalFiles: [String: TokenAggregator.FileScanState] = [:]
+            _ = TokenAggregator.scan(roots: [equalRoot], kimiOnly: true, into: &equalFiles)
+            try expect(equalFiles.values.first.map(totals) == [35, 2], "equal-size fixture baseline scan is wrong")
+            try (equalSizeV2 + "\n").write(toFile: equalPath, atomically: true, encoding: .utf8)
+            _ = TokenAggregator.scan(roots: [equalRoot], kimiOnly: true, into: &equalFiles)
+            try expect(equalFiles.values.first.map(totals) == [55, 6],
+                       "same-size content replacement must rescan via the mtime fingerprint")
+            // (c) root 本身是符号链接：enumerator 对根级符号链接 ENOTDIR 失败，旧代码静默跳过整个 root
+            let linkTarget = root.appendingPathComponent("link-target")
+            try FileManager.default.createDirectory(at: linkTarget, withIntermediateDirectories: true)
+            try (try jsonLine(usageRecord) + "\n")
+                .write(to: linkTarget.appendingPathComponent("session.jsonl"), atomically: true, encoding: .utf8)
+            let linkRoot = root.appendingPathComponent("link-root").path
+            try FileManager.default.createSymbolicLink(atPath: linkRoot, withDestinationPath: linkTarget.path)
+            var linkFiles: [String: TokenAggregator.FileScanState] = [:]
+            let linkScan = TokenAggregator.scan(roots: [linkRoot], kimiOnly: true, into: &linkFiles)
+            try expect(linkScan.installed == 1 && linkScan.enumerated == 1
+                       && linkFiles.values.first.map(totals) == [35, 2],
+                       "symlinked root must be enumerated and counted")
+            // 重扫不重复计入（状态键在两轮扫描间保持解析后的稳定形式）
+            _ = TokenAggregator.scan(roots: [linkRoot], kimiOnly: true, into: &linkFiles)
+            try expect(linkFiles.count == 1 && linkFiles.values.first.map(totals) == [35, 2],
+                       "symlinked root rescan must not double count")
+            // (d) 链接目标删除：fileExists 遵循链接 = 未安装语义，不枚举不计入
+            let danglingTarget = root.appendingPathComponent("dangling-target")
+            try FileManager.default.createDirectory(at: danglingTarget, withIntermediateDirectories: true)
+            let danglingRoot = root.appendingPathComponent("dangling-root").path
+            try FileManager.default.createSymbolicLink(atPath: danglingRoot, withDestinationPath: danglingTarget.path)
+            try FileManager.default.removeItem(at: danglingTarget)
+            var danglingFiles: [String: TokenAggregator.FileScanState] = [:]
+            let danglingScan = TokenAggregator.scan(roots: [danglingRoot], kimiOnly: true, into: &danglingFiles)
+            try expect(danglingScan.installed == 0 && danglingScan.enumerated == 0 && danglingScan.okRoots.isEmpty,
+                       "dangling symlink root must count as not installed")
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]

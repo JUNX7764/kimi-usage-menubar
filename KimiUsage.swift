@@ -447,6 +447,8 @@ enum TokenAggregator {
         }
         return [.fileSizeKey, .contentModificationDateKey]
     }()
+    /// 键集合与键组同源；resourceValues(forKeys:) 每文件调用，集合预先构造避免热路径重复分配。
+    private static let scanResourceKeySet = Set(scanResourceKeys)
 
     // inode 指纹门控：不可得时 scan 回退为 mtime 整体复位（3023285 语义：替换必重扫，
     // 接受追加全量重扫的能耗代价，正确性与已审基线一致）。--self-test 经 override 在
@@ -757,7 +759,7 @@ enum TokenAggregator {
             for case let url as URL in enumerator where url.pathExtension == "jsonl" {
                 let path = url.path
                 seen.insert(path)
-                guard let vals = try? url.resourceValues(forKeys: Set(Self.scanResourceKeys)),
+                guard let vals = try? url.resourceValues(forKeys: Self.scanResourceKeySet),
                       let size = vals.fileSize
                 else { failedFiles += 1; continue }
                 let sizeU = UInt64(size)
@@ -7271,16 +7273,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 关：加载态决定 bootout。job 未加载属幂等正常态，直接删 plist 不报错；
                 // bootout 失败要报错（KeepAlive 会在重启前继续复活进程），plist 仍删除
                 // （偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
-                var bootoutFailed = false
-                if launchctlSucceeded(["print", "\(launchAgentDomain)/\(launchAgentLabel)"]),
-                   !launchctlSucceeded(["bootout", "\(launchAgentDomain)/\(launchAgentLabel)"]) {
-                    bootoutFailed = true
-                }
-                try FileManager.default.removeItem(atPath: launchAgentPath)
-                if bootoutFailed {
+                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+                if launchctlSucceeded(["print", jobSpecifier]),
+                   !launchctlSucceeded(["bootout", jobSpecifier]) {
                     panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
                     NSLog("[KimiUsage] LaunchAgent bootout failed")
                 }
+                try FileManager.default.removeItem(atPath: launchAgentPath)
             } else {
                 // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
                 // launchd 静默忽略，开机自启失效且用户无感知

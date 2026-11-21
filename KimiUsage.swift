@@ -3169,6 +3169,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private let popover = NSPopover()
     private let contentController = NSViewController()
+    /// 悬停显示状态面板（Sources/PanelHover.swift）：面板体内首次点击回调（宿主复位 hover
+    /// 呈现标记，转固定常开语义）；图标点击不经此回调，由宿主 togglePanel 分派。
+    var onPanelBodyClick: (() -> Void)?
+    /// 悬停显示状态面板：菜单勾选态读取与运行时翻转都委托宿主（AppDelegate 持有
+    /// PanelHoverController）；未注入时按偏好存储默认（开启）展示。
+    var hoverPanelMenuStateProvider: (() -> Bool)?
+    var hoverPanelToggleHandler: (() -> Void)?
     // effect/solid 暴露为 internal：--self-test 断言背景层 hidden/opacity 用，生产路径仍只经 applyBackgroundStyle() 驱动。
     let effect = NSVisualEffectView()
     let solid = PanelSolidBackgroundView()
@@ -3184,6 +3191,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
+    /// 悬停显示状态面板用：面板内容视图（跨开合复用，NSTrackingArea 装一次即可）。
+    var hoverPanelView: NSView { contentController.view }
+    /// 悬停显示状态面板用：popover 窗口屏幕矩形（关闭时为 nil）。
+    var panelWindowFrameForHover: NSRect? { contentController.view.window?.frame }
     private static let maximumWidth: CGFloat = 330
     private var panelWidth = UsagePanelController.maximumWidth
 
@@ -3257,7 +3268,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         contentController.view = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
         configureContent()
         popover.contentViewController = contentController
-        popover.behavior = .transient
+        // 仅 --visual-preview-hover-test 离线回归进程改用 applicationDefined：避免测试期间的
+        // 真实鼠标点击（用户正在用机）把 transient Popover 关掉造成时序断言误报；生产与普通预览不变
+        popover.behavior = CommandLine.arguments.contains("--visual-preview-hover-test")
+            ? .applicationDefined : .transient
         popover.animates = false
         popover.delegate = self
         applyBackgroundStyle()
@@ -4812,7 +4826,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if isOpen { close() } else { show(anchoredTo: button) }
     }
 
-    private func show(anchoredTo button: NSStatusBarButton) {
+    /// 打开面板（internal：宿主 AppDelegate 悬停打开路径 openPanel(byHover:) 直调同一条全路径）。
+    func show(anchoredTo button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         anchorButton = button
         if needsRebuild { rebuildContent(); needsRebuild = false }
@@ -4867,7 +4882,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 if event.keyCode == 53 { self.close(); return nil }
                 return event
             }
-            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window { return event }
+            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window {
+                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由宿主 togglePanel 分派
+                if event.window === self.contentController.view.window { self.onPanelBodyClick?() }
+                return event
+            }
             self.close()
             return event
         }
@@ -4922,7 +4941,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return menu
     }
 
-    /// 统一「···」面板设置菜单：卡片设置入口 + 背景样式子菜单（背景选择仍即时生效）。
+    /// 统一「···」面板设置菜单：卡片设置入口 + 悬停显示开关 + 背景样式子菜单（选择仍即时生效）。
     /// 离线测试直接断言本返回值，不弹出真实 NSMenu。
     func makePanelSettingsMenu() -> NSMenu {
         let menu = NSMenu()
@@ -4931,11 +4950,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         cards.target = self
         cards.isEnabled = !showingCardSettings   // 设置页打开中禁用入口，避免重复进入
         menu.addItem(cards)
+        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        hover.target = self
+        hover.state = (hoverPanelMenuStateProvider?() ?? PanelHoverPreference.load()) ? .on : .off
+        menu.addItem(hover)
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         background.submenu = makeBackgroundStyleMenu()
         menu.addItem(background)
         return menu
     }
+
+    /// 「···」菜单悬停开关动作：翻转逻辑在宿主（控制器为准 + 生产落盘），控制器只承接菜单事件。
+    @objc private func toggleHoverPanel() { hoverPanelToggleHandler?() }
 
     @objc private func showPanelSettingsMenu(_ sender: NSButton) {
         let menu = makePanelSettingsMenu()
@@ -6004,6 +6030,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewQuitCount = 0
     // 预览专用测试背板：--visual-preview-backdrop 时垫在面板后面，让透明/混合材质在截图中可辨；生产路径不创建。
     private var previewBackdropWindow: NSWindow?
+    // 悬停显示状态面板（Sources/PanelHover.swift）：panelPresentedByHover 仅在 hover 打开
+    // 且未 pin 时为真；点击图标、面板内点击、面板关闭任一者即复位
+    private var panelHoverController: PanelHoverController?
+    private var panelPresentedByHover = false
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -6051,6 +6081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
+        installPanelHover()
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         if visualPreview { configureVisualPreview(); return }
@@ -6346,13 +6377,76 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    // MARK: 悬停显示状态面板（Sources/PanelHover.swift）
+
+    /// 悬停控制器安装：闭包注入 + 按环境决定初始开关。
+    /// preview 进程仅在 --visual-preview-hover-test 启用，其余 GUI 回归不受真实鼠标驻留干扰。
+    private func installPanelHover() {
+        panelHoverController = PanelHoverController(iconView: statusItem.button)
+        guard let hover = panelHoverController else { return }
+        hover.isPanelShown = { [weak self] in self?.panelController.isOpen ?? false }
+        hover.presentedByHover = { [weak self] in self?.panelPresentedByHover ?? false }
+        hover.statusItemFrame = { [weak self] in self?.statusItemButtonScreenFrame() }
+        hover.panelFrame = { [weak self] in self?.panelController.panelWindowFrameForHover }
+        hover.panelView = { [weak self] in self?.panelController.hoverPanelView }
+        hover.performShow = { [weak self] in self?.openPanel(byHover: true) }
+        hover.performHide = { [weak self] in self?.panelController.close() }
+        // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 togglePanel 分派
+        panelController.onPanelBodyClick = { [weak self] in self?.panelPresentedByHover = false }
+        // 面板关闭复位呈现标记并丢弃未决转换（popoverDidClose → onClose）
+        panelController.onClose = { [weak self] in
+            self?.panelPresentedByHover = false
+            self?.panelHoverController?.panelDidClose()
+        }
+        // 「···」菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
+        panelController.hoverPanelMenuStateProvider = { PanelHoverPreference.load() }
+        panelController.hoverPanelToggleHandler = { [weak self] in self?.toggleHoverPanel() }
+        let enabled = visualPreview
+            ? CommandLine.arguments.contains("--visual-preview-hover-test")
+            : PanelHoverPreference.load()
+        if enabled { hover.setEnabled(true) }
+    }
+
+    /// 状态栏图标的屏幕矩形（悬停几何与点击判定的共用基准）；两行堆叠图宽度可变，必须实时取。
+    private func statusItemButtonScreenFrame() -> NSRect? {
+        guard let button = statusItem.button, let window = button.window else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
     @objc private func togglePanel() {
+        if panelController.isOpen {
+            // hover 打开且未固定：首次点击转常开（pin，Status Trio 语义，防误关），不关闭
+            if panelPresentedByHover {
+                panelPresentedByHover = false
+                panelHoverController?.cancelPending()
+                return
+            }
+            panelController.close()
+            return
+        }
+        openPanel(byHover: false)
+    }
+
+    /// 打开面板。hover 打开与点击打开共用全路径（打开即最新、门控去重的刷新与更新检查），
+    /// 仅来源标记与 panelPresentedByHover 语义不同。
+    private func openPanel(byHover: Bool) {
         guard let button = statusItem.button else { return }
-        if !panelController.isOpen && !visualPreview {
+        panelPresentedByHover = byHover
+        if !visualPreview {
             refresh()
             checkForUpdate()
         }
-        panelController.toggle(anchoredTo: button)
+        panelController.show(anchoredTo: button)
+        panelHoverController?.installPanelTrackingIfNeeded()
+    }
+
+    /// 「···」菜单开关翻转：运行时状态以控制器为准；生产同步落盘偏好，
+    /// 所有 --visual-preview* 进程不写真实 UserDefaults（previewSuppressesPersistence 已统一置位）。
+    private func toggleHoverPanel() {
+        let next = !(panelHoverController?.isEnabled ?? PanelHoverPreference.load())
+        if !panelController.previewSuppressesPersistence { PanelHoverPreference.save(next) }
+        panelHoverController?.setEnabled(next)
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -6884,6 +6978,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             self.panelController.toggle(anchoredTo: button)
+            if args.contains("--visual-preview-hover-test") {
+                // 必须用 Timer 而非 dispatch 调度：本块处于 didFinishLaunching 的主队列 drain
+                // 链中，测试内的 RunLoop.run(until:) 嵌套运行不会服务被外层 dispatch 块占住
+                // （latch）的主队列，asyncAfter 的 show/hide 定时会饿死；Timer 是 run loop
+                // callout，嵌套 run 期间主队列空闲、定时可正常触发。.common 模式对齐菜单跟踪测试先例。
+                let hoverTimer = Timer(timeInterval: 0.8, repeats: false) { [weak self] _ in
+                    self?.testHoverPresentation()
+                }
+                RunLoop.main.add(hoverTimer, forMode: .common)
+                return
+            }
             if args.contains("--visual-preview-background-menu-test") {
                 self.runPreviewBackgroundMenuTest()
                 return
@@ -7068,7 +7173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let defaultsKey = PanelBackgroundStyle.defaultsKey
         let storedBefore = UserDefaults.standard.string(forKey: defaultsKey)
-        // 统一菜单：0=卡片显示与排序… 1=背景样式（子菜单）；子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
+        // 统一菜单：0=卡片显示与排序… 1=悬停显示状态面板 2=背景样式（子菜单）；
+        // 子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
         let plan: [(index: Int, style: PanelBackgroundStyle)] = [(1, .liquidGlass), (2, .classicMaterial)]
         var step = 0
         func scheduleSelection() {
@@ -7078,8 +7184,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fputs("KimiUsage background menu test: FAIL: panel settings menu was not tracking\n", stderr)
                     exit(1)
                 }
-                guard menu.items.count == 2, menu.items[0].title == "卡片显示与排序…",
-                      menu.items[1].title == "背景样式", let submenu = menu.items[1].submenu else {
+                guard menu.items.count == 3, menu.items[0].title == "卡片显示与排序…",
+                      menu.items[1].title == "悬停显示状态面板",
+                      menu.items[2].title == "背景样式", let submenu = menu.items[2].submenu else {
                     fputs("KimiUsage background menu test: FAIL: panel menu structure changed\n", stderr)
                     exit(1)
                 }
@@ -7119,6 +7226,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             next()
         }
         next()
+    }
+
+    /// 悬停开合时序回归（--visual-preview-hover-test）：几何与指针位置全部注入固定值，
+    /// 不依赖真实鼠标/屏幕。真实 tracking 事件（鼠标划过图标/面板）仍可能扰动，
+    /// 测试须逐个运行、勿在菜单栏上移动鼠标。
+    private func testHoverPresentation() {
+        func fail(_ message: String) -> Never { fputs("KimiUsage hover test: FAIL \(message)\n", stderr); exit(1) }
+        guard let hover = panelHoverController, hover.isEnabled else {
+            fail("hover controller missing or disabled")
+        }
+        // 断开真实 tracking：预览图标会真的出现在菜单栏，真实光标的 enter/exit 会取消合成时序
+        hover.detachTrackingForTesting()
+        let iconRect = NSRect(x: 1200, y: 1055, width: 40, height: 24)
+        let panelRect = NSRect(x: 1180, y: 640, width: 340, height: 400)
+        hover.statusItemFrame = { iconRect }
+        hover.panelFrame = { panelRect }
+        func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+        func expectShown(_ shown: Bool, _ step: String) {
+            guard panelController.isOpen == shown else {
+                fail("\(step): expected shown=\(shown), actual=\(panelController.isOpen), hoverMarked=\(panelPresentedByHover), controllerEnabled=\(hover.isEnabled)")
+            }
+            print("KIMI_HOVER_TEST \(step): ok")
+        }
+        // 固定指针位置的便捷写法
+        func pointAt(_ x: CGFloat, _ y: CGFloat) { hover.pointerLocation = { NSPoint(x: x, y: y) } }
+
+        // 起始态：自动开面板（点击语义）先关掉，从关闭态起跑
+        if panelController.isOpen { togglePanel() }
+        wait(0.3)
+        expectShown(false, "initial-close")
+
+        // 1. 图标驻留 0.2s 才打开；0.1s 不开
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.1)
+        guard !panelController.isOpen else { fail("dwell 0.1s must not open") }
+        wait(0.5)
+        expectShown(true, "dwell-opens")
+        guard panelPresentedByHover else { fail("hover-open must mark presentedByHover") }
+
+        // 2. 图标→面板跨桥区：先排 hide 后被面板 enter 取消，保持打开
+        pointAt(panelRect.midX, panelRect.midY)
+        hover.iconExited()
+        wait(0.05)
+        hover.panelEntered()
+        wait(0.6)
+        expectShown(true, "icon-to-panel-keeps-open")
+
+        // 3. 离开面板（远离）→ 0.3s 收起
+        pointAt(200, 300)
+        hover.panelExited()
+        wait(0.15)
+        guard panelController.isOpen else { fail("0.15s after leave must still be open") }
+        wait(0.45)
+        expectShown(false, "leave-closes")
+        guard !panelPresentedByHover else { fail("close must reset presentedByHover") }
+
+        // 4. 重新悬停打开 → 首次点击=pin（不关闭）；pin 后离开图标不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        expectShown(true, "reopens-by-dwell")
+        togglePanel()
+        guard panelController.isOpen, !panelPresentedByHover else { fail("first click on hover-open panel must pin") }
+        print("KIMI_HOVER_TEST click-pins: ok")
+        hover.iconExited()
+        wait(0.6)
+        expectShown(true, "pinned-survives-icon-exit")
+
+        // 5. pin 后再点 → 关闭
+        togglePanel()
+        expectShown(false, "second-click-closes")
+
+        // 6. 面板内点击=pin（local monitor 置位）→ 离开面板不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelPresentedByHover else { fail("reopens-by-dwell again") }
+        panelPresentedByHover = false   // 与面板 local monitor 面板内点击处置一致
+        hover.panelExited()
+        wait(0.6)
+        expectShown(true, "panel-click-pinned-survives-exit")
+        togglePanel()
+        expectShown(false, "close-after-panel-pin")
+
+        // 7. 「···」菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）
+        let menu = panelController.makePanelSettingsMenu()
+        let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
+        guard let hoverItem else { fail("settings menu missing hover item") }
+        let expectedState: NSControl.StateValue = PanelHoverPreference.load() ? .on : .off
+        guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
+        let wasEnabled = panelHoverController?.isEnabled == true
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == !wasEnabled else { fail("toggle must flip runtime state") }
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == wasEnabled else { fail("second toggle must restore") }
+        print("KIMI_HOVER_TEST settings-toggle: ok")
+
+        // 8. 关闭开关时仍处 hover 呈现的面板应收起（toggleHoverPanel 委托的控制器行为）；
+        //    直接调控制器以隔离 preview 下「偏好值≠arg 启用态」的分叉
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelPresentedByHover else { fail("reopen for disable test") }
+        hover.setEnabled(false)
+        wait(0.2)
+        expectShown(false, "disable-while-hover-open-closes")
+        hover.setEnabled(true)
+
+        print("KimiUsage hover test: PASS")
+        exit(0)
     }
 
     // The fake transport lets overlapping checks complete through the normal main-queue path.
@@ -8021,18 +8238,25 @@ enum KimiOfflineRegression {
                        "panel layout store round trip failed")
             try expect(KimiPanelLayoutStore.hasValueForTest, "panel layout store did not persist value")
 
-            // 统一「···」菜单结构：卡片设置入口 + 背景样式子菜单（背景选择仍即时生效）
+            // 统一「···」菜单结构：卡片设置入口 + 悬停显示开关 + 背景样式子菜单（选择仍即时生效）
+            // 悬停偏好启用内存 backend：菜单勾选态断言不读写真实偏好，缺省态（无存储值）确定为开
+            let endHoverBackend = PanelHoverPreference.beginMemoryOverride()
+            defer { endHoverBackend() }
             _ = KimiPanelLayoutStore.beginMemoryOverride()   // 重置 backend：设置页会话从干净状态开始
             let settingsController = UsagePanelController()
             settingsController.previewReduceTransparencyOverride = false
             settingsController.previewSuppressesPersistence = true
             let panelMenu = settingsController.makePanelSettingsMenu()
-            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "背景样式"],
+            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "背景样式"],
                        "panel settings menu structure changed: \(panelMenu.items.map(\.title))")
             try expect(panelMenu.items[0].target != nil && panelMenu.items[0].action != nil
                        && panelMenu.items[0].isEnabled,
                        "card settings entry missing target/action or wrongly disabled")
-            try expect(panelMenu.items[1].submenu?.items.count == PanelBackgroundStyle.allCases.count,
+            try expect(panelMenu.items[1].target != nil && panelMenu.items[1].action != nil,
+                       "hover toggle missing target/action")
+            try expect(panelMenu.items[1].state == .on,
+                       "hover toggle must default to on (no stored value)")
+            try expect(panelMenu.items[2].submenu?.items.count == PanelBackgroundStyle.allCases.count,
                        "background submenu lost styles")
 
             // 原位设置页（离线可断言部分）：编辑器结构、排序按钮、进出与布局应用。
@@ -9754,7 +9978,58 @@ enum KimiOfflineRegression {
             try expect(applied == 1 && uiSnapshot.loaded == true && uiSnapshot.current == nil,
                        "the current generation's snapshot must apply normally after the stale one is dropped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
+            // 悬停面板纯逻辑（Sources/PanelHover.swift）：几何判定（含边缘 inclusive 与桥区）、
+            // 转换 token、点击决策、偏好默认值；偏好走内存 backend，绝不读写真实用户偏好
+            let hoverIcon = NSRect(x: 100, y: 760, width: 40, height: 24)
+            let hoverPanel = NSRect(x: 100, y: 400, width: 320, height: 340)
+            let hoverGeo = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [hoverPanel])
+            try expect(!hoverIcon.contains(NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "对照：NSRect.contains 为半开（右/上边缘不在内）")
+            try expect(PanelHoverGeometry.containsInclusive(hoverIcon, NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "inclusive 判定必须含右/上边缘像素（菜单栏图标常在边缘悬停/点击）")
+            try expect(hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.minX, y: hoverIcon.minY)),
+                       "图标判定含左/下边缘")
+            try expect(!hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.maxX + 1, y: hoverIcon.midY)),
+                       "图标判定不外扩")
+            try expect(hoverGeo.containsPanel(NSPoint(x: hoverPanel.maxX, y: hoverPanel.maxY)),
+                       "面板判定含右/上边缘")
+            try expect(hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 4)),
+                       "图标-面板桥区计入保持区")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 10)),
+                       "桥区外不保持（面板桥 8pt 与图标桥 8pt 之间的死区）")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: 0, y: 0)), "远离区域不保持")
+            let hoverGeoNoPanel = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [])
+            try expect(hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 5, y: hoverIcon.midY)),
+                       "无面板时图标周围桥区仍保持")
+            try expect(!hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 20, y: hoverIcon.midY)),
+                       "无面板时远离图标不保持")
+            try expect(PanelHoverGeometry(statusItemFrame: nil, panelFrames: []).isWithinHoverArea(NSPoint(x: 0, y: 0)) == false,
+                       "无图标无面板时处处不保持")
+
+            var hoverIntent = PanelHoverIntent()
+            let hoverToken1 = hoverIntent.begin(.show)
+            try expect(hoverIntent.consume(hoverToken1), "首次触发应生效")
+            try expect(!hoverIntent.consume(hoverToken1), "同 token 二次触发须被丢弃")
+            let hoverToken2 = hoverIntent.begin(.hide)
+            hoverIntent.cancel()
+            try expect(!hoverIntent.consume(hoverToken2), "取消后的触发须被丢弃")
+            let hoverToken3 = hoverIntent.begin(.show)
+            _ = hoverIntent.begin(.hide)
+            try expect(!hoverIntent.consume(hoverToken3), "被新转换顶替的旧 token 须失效")
+
+            try expect(panelHoverClickOutcome(isShown: false, presentedByHover: false) == .present, "未打开点击=打开")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: false) == .close, "普通常开点击=关闭")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: true) == .pin, "hover 打开首次点击=固定常开")
+
+            // 菜单段已启用内存 backend；此处重置为干净内存态后验证缺省/落盘语义
+            _ = PanelHoverPreference.beginMemoryOverride()
+            try expect(PanelHoverPreference.load(), "悬停偏好缺省必须为开")
+            try expect(!PanelHoverPreference.hasValueForTest, "悬停偏好缺省态不应有存储值")
+            PanelHoverPreference.save(false)
+            try expect(!PanelHoverPreference.load(), "悬停偏好写入后须如实读取")
+            try expect(PanelHoverPreference.hasValueForTest, "悬停偏好保存后应有存储值")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

@@ -139,4 +139,4 @@ bash -n build.sh scripts/update.sh scripts/release.sh
 
 MIT，详见 [LICENSE](../LICENSE)。
 
-更新检查从同一可安装 Release 读取 tag 与说明，304 和网络失败保留上次结果；面板点击更新后展开说明，确认才启动原有更新器。关闭面板或取消不会下载；说明仅展示目标版本。
+更新检查从同一可安装 Release 读取 tag 与说明，304 和网络失败保留上次结果；面板点击更新后展开说明，确认才启动原有更新器。关闭面板或取消不会下载；说明仅展示目标版本。更新器对 LaunchAgent 采用「偏好（plist 存在且指向本副本）与加载态（launchd job program 是本副本）」解耦语义：停旧按加载态 bootout、启动/回滚按偏好 bootstrap；plist 缺失或指向别处视为偏好 OFF 继续推进（此前「plist 缺失 / 指向别处即中止更新」已放宽），已加载 job 指向另一副本仍中止。App 内开关写 plist（原子写）后立即 bootstrap/bootout 使改动即时生效。

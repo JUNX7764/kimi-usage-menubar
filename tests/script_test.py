@@ -556,15 +556,6 @@ exit 0
         self.assertEqual(self.marker(installed), "old")
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
-    def test_agent_pointing_elsewhere_is_rejected(self):
-        installed = self.prepare_update()
-        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
-        with plist.open("wb") as f: plistlib.dump({"ProgramArguments": ["/other/KimiUsage"]}, f)
-        result = self.run_update()
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.marker(installed), "old")
-        self.assertFalse(any("bootout" in line for line in self.log_lines()))
-
     def test_loaded_agent_mismatch_rejected_even_when_plist_matches(self):
         installed = self.prepare_update()
         result = self.run_update(MOCK_LOADED_BINARY="/other/KimiUsage")
@@ -572,6 +563,66 @@ exit 0
         self.assertEqual(self.marker(installed), "old")
         self.assertIn("已加载的 LaunchAgent", result.stdout)
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
+
+    def test_loaded_job_without_plist_updates_without_bootstrap(self):
+        # LaunchAgent 偏好（plist）与加载态（job）解耦：job 已加载但 plist 缺失不再永久阻断更新；
+        # 停旧按加载态 bootout，启动按偏好（缺失 = OFF）open -n 直启，更新后不 bootstrap
+        installed = self.prepare_update()
+        (self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist").unlink()
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertTrue(any("bootout" in line for line in launch_lines))
+        self.assertFalse(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
+
+    def test_matching_plist_bootstraps_after_update_and_is_preserved(self):
+        # plist 存在且指向本副本 = 偏好 ON：停旧 bootout，更新完成后 bootstrap 恢复保活，
+        # 且 plist 本身原样保留（更新脚本从不增删用户偏好文件）
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertTrue(any("bootout" in line for line in launch_lines))
+        self.assertTrue(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(plist.exists())
+        with plist.open("rb") as f:
+            self.assertEqual(plistlib.load(f)["ProgramArguments"],
+                             [str(installed / "Contents" / "MacOS" / EXECUTABLE)])
+
+    def test_plist_pointing_elsewhere_neither_aborts_nor_bootstraps(self):
+        # plist 指向另一副本 = 偏好 OFF：不中止（加载态校验与旧版一致仍在）、不 bootstrap、
+        # 不动别人的 plist；job 的 program 仍是本副本时按加载态照常 bootout
+        installed = self.prepare_update()
+        plist = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        with plist.open("wb") as f:
+            plistlib.dump({"ProgramArguments": ["/other/KimiUsage"]}, f)
+        result = self.run_update()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertNotIn("指向另一副本", result.stdout)
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertTrue(any("bootout" in line for line in launch_lines))
+        self.assertFalse(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(plist.exists())
+        with plist.open("rb") as f:
+            self.assertEqual(plistlib.load(f)["ProgramArguments"], ["/other/KimiUsage"])
+
+    def test_unloaded_job_with_matching_plist_bootstraps(self):
+        # Q2 象限（偏好 ON + job 未加载）：停旧无 bootout（幂等，无 job 可退），启动按
+        # 偏好 bootstrap 保活。旧代码 job 未加载时从不读 plist、走 open -n 直启丢保活，
+        # 此用例锁定该缺陷已修复（防回归）。
+        installed = self.prepare_update()
+        result = self.run_update(MOCK_AGENT_ACTIVE="0")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        launch_lines = [line for line in self.log_lines() if line.startswith("launchctl")]
+        self.assertFalse(any("bootout" in line for line in launch_lines))
+        self.assertTrue(any("bootstrap" in line for line in launch_lines))
+        self.assertTrue(self.state.exists())
 
     def prepare_release(self):
         project = self.base / "release-project"

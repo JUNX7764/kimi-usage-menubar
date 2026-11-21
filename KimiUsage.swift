@@ -515,14 +515,24 @@ enum TokenAggregator {
             hermesOK = scanHermes(into: &st)
         }
         var zcodeOK: Bool?    // nil = 未安装（db.sqlite 不存在），不算失败
-        if FileManager.default.fileExists(atPath: zcodeDBPath) {
-            zcodeOK = updateZCode(into: &st, at: zcodeDBPath)
-        }
-        // 缓存命中卡 sibling reader：与 token 扫描同趟只读查询（不动 token SQL）；
-        // nil（失败/未安装）→ 装配层把该源 (input, cache) 同退，不静默造 0。
+        // 缓存命中卡 sibling reader：与 token 扫描同趟只读查询（不动 token SQL），
+        // 同一轮聚合对同一个 zcode 库只开一次只读连接，token 扫描与缓存 reader 共用；
+        // 任一 reader 失败（nil/false，含库打不开）→ 装配层把该源 (input, cache) 同退，
+        // 不静默造 0。
         var zcodeCacheDays: CacheDays?
         if FileManager.default.fileExists(atPath: zcodeDBPath) {
-            zcodeCacheDays = scanZCodeCacheDays(at: zcodeDBPath)
+            var zcodeDB: OpaquePointer?
+            if sqlite3_open_v2(zcodeDBPath, &zcodeDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+               let zcodeDB {
+                defer { sqlite3_close(zcodeDB) }
+                let zcodeNow = Date()
+                zcodeOK = updateZCode(into: &st, db: zcodeDB, now: zcodeNow)
+                zcodeCacheDays = scanZCodeCacheDays(db: zcodeDB, now: zcodeNow)
+            } else {
+                // 打开失败也须释放句柄（sqlite 文档要求）；该源读取失败，input 与 cache 同退
+                if zcodeDB != nil { sqlite3_close(zcodeDB) }
+                zcodeOK = false
+            }
         }
         let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
         st.zcodeDays = st.zcodeDays?.filter { $0.key >= cutoffKey }
@@ -876,7 +886,21 @@ enum TokenAggregator {
     private static let zcodeDBPath = NSHomeDirectory() + "/.zcode/cli/db/db.sqlite"
 
     static func updateZCode(into state: inout ScanState, at path: String, now: Date = Date()) -> Bool {
-        guard let modelDays = scanZCodeModelDays(at: path, now: now) else { return false }
+        var db: OpaquePointer?
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db
+        else {
+            // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
+            if db != nil { sqlite3_close(db) }
+            return false
+        }
+        defer { sqlite3_close(db) }
+        return updateZCode(into: &state, db: db, now: now)
+    }
+
+    /// 共享连接内核：同一轮聚合对同一个 zcode 库只开一次只读连接时，token 扫描与
+    /// 缓存 sibling reader 复用它（路径版公开签名保留，供离线自检与外部直调）。
+    static func updateZCode(into state: inout ScanState, db: OpaquePointer, now: Date) -> Bool {
+        guard let modelDays = scanZCodeModelDays(db: db, now: now) else { return false }
         state.zcodeModelDays = modelDays
         state.zcodeDays = days(from: modelDays)
         return true
@@ -893,13 +917,18 @@ enum TokenAggregator {
     /// error / running 行若已有非零 token 也计入；cancelled 行通常为零，无需按状态丢弃真实消耗。
     static func scanZCodeModelDays(at path: String = zcodeDBPath, now: Date = Date()) -> ModelDays? {
         var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db
         else {
             // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
             if db != nil { sqlite3_close(db) }
             return nil
         }
         defer { sqlite3_close(db) }
+        return scanZCodeModelDays(db: db, now: now)
+    }
+
+    /// 共享连接内核（SQL 与路径版完全一致，token 扫描 SQL 不动）。
+    static func scanZCodeModelDays(db: OpaquePointer, now: Date) -> ModelDays? {
         let sql = """
             SELECT model_id, input_tokens, output_tokens, started_at
             FROM model_usage
@@ -939,13 +968,18 @@ enum TokenAggregator {
     /// input_tokens 一并 SELECT（token 路径同列），保持两 reader 的 schema 依赖一致。
     static func scanZCodeCacheDays(at path: String = zcodeDBPath, now: Date = Date()) -> CacheDays? {
         var db: OpaquePointer?
-        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK
+        guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db
         else {
             // 打开失败也须释放句柄（sqlite 文档要求），否则每 5 分钟泄漏一次
             if db != nil { sqlite3_close(db) }
             return nil
         }
         defer { sqlite3_close(db) }
+        return scanZCodeCacheDays(db: db, now: now)
+    }
+
+    /// 共享连接内核：schema 守卫 / busy timeout / SQL 与路径版完全一致。
+    static func scanZCodeCacheDays(db: OpaquePointer, now: Date) -> CacheDays? {
         sqlite3_busy_timeout(db, 1_000)
         // LIMIT 0 探针 schema 守卫：no such table / no such column 都按失败返回 nil（装配层同退该源）
         guard sqlite3_exec(db, "SELECT model_id, input_tokens, cache_read_input_tokens, "
@@ -2286,27 +2320,25 @@ enum RemainingColorTier: Equatable {
 
 // MARK: - 自定义下拉面板（typed model + 原生 AppKit 组件）
 
-struct UsagePanelModel {
-    enum NoticeLevel {
-        case info, warning, error
-    }
-    struct Notice {
+struct UsagePanelModel: Equatable {
+    enum NoticeLevel: Equatable { case info, warning, error }
+    struct Notice: Equatable {
         var text: String
         var level: NoticeLevel
     }
-    struct Quota {
+    struct Quota: Equatable {
         var title: String
         var resetText: String
         var remaining: Int?
         var notices: [Notice]
     }
-    struct TokenModel {
+    struct TokenModel: Equatable {
         var name: String
         var total: String
         var input: String
         var output: String
     }
-    struct TokenBucket {
+    struct TokenBucket: Equatable {
         var summaryLabel: String
         var detailLabel: String
         var total: String
@@ -2314,14 +2346,14 @@ struct UsagePanelModel {
         var output: String
         var models: [TokenModel]
     }
-    struct TokenSection {
+    struct TokenSection: Equatable {
         var title: String
         var accent: PanelAccent
         var buckets: [TokenBucket]
         var notices: [Notice]
     }
-    enum ComparisonDirection { case up, down, flat }
-    struct BriefDay {
+    enum ComparisonDirection: Equatable { case up, down, flat }
+    struct BriefDay: Equatable {
         var label: String        // MM/DD
         var total: Double
         var input: Double
@@ -2329,19 +2361,19 @@ struct UsagePanelModel {
         var covered: Bool        // false = 覆盖未证实：缺失占位，不补零
         var isToday: Bool
     }
-    struct BriefComparison {
+    struct BriefComparison: Equatable {
         var label: String        // 较昨日 / 较前 7 天
         var text: String         // +17.7% / −3.3% / 持平 / 新增 / 数据不足
         var direction: ComparisonDirection
         var detail: String       // 具体日期区间与公式（悬停 / VoiceOver）
     }
-    struct BriefSection {
+    struct BriefSection: Equatable {
         var days: [BriefDay]
         var day: BriefComparison
         var week: BriefComparison
         var notices: [Notice]
     }
-    struct ToolRow {
+    struct ToolRow: Equatable {
         var id: TokenAggregator.ToolID
         var name: String
         var total: String
@@ -2350,11 +2382,11 @@ struct UsagePanelModel {
         var status: String
         var detail: String       // 悬停 / VoiceOver：状态 · 输入 · 输出 · 占比
     }
-    struct ToolsSection {
+    struct ToolsSection: Equatable {
         var periods: [[ToolRow]] // [今日, 近 7 天, 近 30 天]
         var notices: [Notice]
     }
-    struct CacheRow {
+    struct CacheRow: Equatable {
         var name: String         // 模型显示名 /「整体」
         var hitText: String      // "97% 命中" / "— 命中"（整数百分比；「—」= 窗口内无缓存读写证据）
         var inputText: String    // "输入196M"（Fmt.tokens）
@@ -2362,7 +2394,7 @@ struct UsagePanelModel {
     }
     /// v2 来源行：可展开的逐源汇总（id 为 ToolID.rawValue，控制器 expandedCacheSources 键）；
     /// models 为该源窗口内模型行（input 降序、input ≤ 0 已过滤），同模型跨源各自显示该源数字。
-    struct CacheSourceRow {
+    struct CacheSourceRow: Equatable {
         var id: String
         var name: String
         var hitText: String
@@ -2371,11 +2403,11 @@ struct UsagePanelModel {
     }
     /// 单窗口行集：「整体」行置顶不可展开；零用量源不出行；来源行按窗口 input 降序
     /// （tie 按 ToolID 固定序）；整体行与来源行分子分母同源装配。
-    struct CachePeriodRows {
+    struct CachePeriodRows: Equatable {
         var overall: CacheRow?
         var sources: [CacheSourceRow]
     }
-    struct CacheSection {
+    struct CacheSection: Equatable {
         var periods: [CachePeriodRows] // [今日, 近 7 天, 近 30 天]；每段「整体」行恒置顶
         /// 由六源快照对预计算三窗口行（v2 来源行结构）。分母复用现有聚合的各模型窗口 input
         /// （与「用量情况」同源，不重算）；input ≤ 0 不进任何行（除零守卫，也不出行）；
@@ -2497,9 +2529,35 @@ struct UsagePanelModel {
     var refreshItem: NSMenuItem
     var loginItem: NSMenuItem
     var quitItem: NSMenuItem
+
+    /// 等值比较（供面板展开期间「无变化跳过重建」使用，L1 半项）。
+    /// 模型树全量核查过：嵌套类型均为纯值语义（无 NSObject/NSView/class 字段），
+    /// QuotaCycleSnapshot 已是值类型 Equatable；四个 NSMenuItem 实例字段是唯一的
+    /// 引用字段，每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出
+    /// 比较、以显示相关代理值参与：updateItem 有无（更新按钮行显隐）、
+    /// loginItem.state（自启勾选态）；refreshItem/quitItem 标题/动作/快捷键恒定。
+    /// volatile 来源核查：lastAttempt 为 HH:mm 分钟粒度、brief 日标签为日粒度——
+    /// 按各自展示精度参与比较，跨分钟/跨日内容真变时重建，显示语义不变；
+    /// 其余文本/数值均来自既有存储快照，轮内稳定。
+    static func == (lhs: UsagePanelModel, rhs: UsagePanelModel) -> Bool {
+        (lhs.updateItem == nil) == (rhs.updateItem == nil)
+            && lhs.title == rhs.title
+            && lhs.planName == rhs.planName
+            && lhs.accountLine == rhs.accountLine
+            && lhs.quotas == rhs.quotas
+            && lhs.usage == rhs.usage
+            && lhs.brief == rhs.brief
+            && lhs.tools == rhs.tools
+            && lhs.cache == rhs.cache
+            && lhs.history == rhs.history
+            && lhs.notices == rhs.notices
+            && lhs.lastAttempt == rhs.lastAttempt
+            && lhs.version == rhs.version
+            && lhs.loginItem.state == rhs.loginItem.state
+    }
 }
 
-enum PanelAccent {
+enum PanelAccent: Equatable {
     case codex, external
 
     private static func rgb(_ hex: UInt32) -> NSColor {
@@ -3229,8 +3287,20 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     func update(model: UsagePanelModel) {
+        update(model: model, panelIsOpen: isOpen)
+    }
+
+    /// panelIsOpen 参数供离线自检绕过真实 popover 展示路径（面板无需真开即可断言等值跳过）。
+    func update(model: UsagePanelModel, panelIsOpen: Bool) {
+        // 等值跳过（L1 半项）：面板展开期间新旧模型等值时只换存 model，不重排重建；
+        // 面板关闭路径行为不变（仍置 needsRebuild，重开时重建）。其余 UI 状态变化
+        // （更新消息/确认框/折叠/设置页）各有直接 refreshPanelLayout 路径，不经此处。
+        if panelIsOpen, let current = self.model, current == model {
+            self.model = model
+            return
+        }
         self.model = model
-        if isOpen {
+        if panelIsOpen {
             guard !layoutScheduled else { return }
             layoutScheduled = true
             DispatchQueue.main.async { [weak self] in
@@ -7571,6 +7641,47 @@ enum KimiOfflineRegression {
             styleController.applyBackgroundStyle()
             try expect(!styleController.effect.isHidden, "classic rendering lost after preview override release")
 
+            // MARK: 面板等值跳过（L1 半项）：展开期间模型无变化只换存不重建，数值变化才重建
+            func skipFixtureModel(total: String) -> UsagePanelModel {
+                UsagePanelModel(
+                    updateItem: nil, title: "Kimi 用量", planName: nil, accountLine: nil, quotas: [],
+                    usage: UsagePanelModel.TokenSection(title: "用量情况", accent: .codex,
+                        buckets: [UsagePanelModel.TokenBucket(summaryLabel: "今日", detailLabel: "今日",
+                            total: total, input: total, output: "0", models: [])],
+                        notices: []),
+                    brief: UsagePanelModel.BriefSection(days: [],
+                        day: UsagePanelModel.BriefComparison(label: "较昨日", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        week: UsagePanelModel.BriefComparison(label: "较前 7 天", text: "数据不足",
+                            direction: .flat, detail: ""),
+                        notices: []),
+                    tools: UsagePanelModel.ToolsSection(periods: [], notices: []),
+                    cache: UsagePanelModel.CacheSection(periods: []),
+                    history: QuotaCycleSnapshot.inactive,
+                    notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
+                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
+                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
+            }
+            let skipController = UsagePanelController()
+            func pumpPanelQueue() {
+                RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+            }
+            skipController.update(model: skipFixtureModel(total: "1K"), panelIsOpen: true)
+            pumpPanelQueue()
+            let skipBaseline = skipController.arrangedContentViewsForTest.map(ObjectIdentifier.init)
+            try expect(!skipBaseline.isEmpty, "panel skip fixture failed to build content")
+            // (a) 相同数据两次 update（展开态）：内容栈逐元素身份不变（等值跳过，不重建）
+            skipController.update(model: skipFixtureModel(total: "1K"), panelIsOpen: true)
+            pumpPanelQueue()
+            try expect(skipController.arrangedContentViewsForTest.map(ObjectIdentifier.init) == skipBaseline,
+                       "equal model update must not rebuild panel content")
+            // (b) 任一数值变化 → 重建发生（比较不得过宽）
+            skipController.update(model: skipFixtureModel(total: "2K"), panelIsOpen: true)
+            pumpPanelQueue()
+            try expect(skipController.arrangedContentViewsForTest.map(ObjectIdentifier.init) != skipBaseline,
+                       "changed model must rebuild panel content")
+
             // MARK: 额度周期回顾卡片（固定 fixture：顺序 / 单槽几何 / 固定详情 / 短历史等高 / 空态与状态文案）
             try expect(QuotaCycleSnapshot.previewFixture.recordCount >= 13,
                        "preview fixture must offer at least 13 cycles for paging geometry checks")
@@ -9085,6 +9196,18 @@ enum KimiOfflineRegression {
                        "missing model_usage table must fail the ZCode cache reader")
             try expect(TokenAggregator.scanZCodeCacheDays(at: sqliteCachePath + ".missing", now: usageNow) == nil,
                        "missing ZCode db must fail the cache reader")
+            // 断言 15（zcode 连接合一）：同一只读连接上 token 扫描与缓存 sibling reader 的
+            // 行集与路径版直调完全一致；聚合侧单连接（aggregateBothDetailed）复用同款内核。
+            var sharedState = TokenAggregator.ScanState()
+            var sharedDB: OpaquePointer?
+            try expect(sqlite3_open_v2(sqliteCachePath, &sharedDB, SQLITE_OPEN_READONLY, nil) == SQLITE_OK,
+                       "shared zcode connection failed to open")
+            let sharedOK = TokenAggregator.updateZCode(into: &sharedState, db: sharedDB!, now: usageNow)
+            let sharedCacheDays = TokenAggregator.scanZCodeCacheDays(db: sharedDB!, now: usageNow)
+            sqlite3_close(sharedDB)
+            try expect(sharedOK && sharedCacheDays == zcodeCacheDays
+                       && sharedState.zcodeModelDays == zcodeCacheModelDays,
+                       "shared zcode connection must reproduce both readers' path-based results")
             let cacheFileDays: TokenAggregator.ModelDays = [todayKey: ["k3.1-pro": [100, 0]]]
             let cacheFileCache: TokenAggregator.CacheDays = [todayKey: ["k3.1-pro": [60, 5]]]
             let cacheWorkPair = TokenAggregator.CacheSnapshot.SourcePair(

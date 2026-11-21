@@ -448,6 +448,17 @@ enum TokenAggregator {
         return [.fileSizeKey, .contentModificationDateKey]
     }()
 
+    // inode 指纹门控：不可得时 scan 回退为 mtime 整体复位（3023285 语义：替换必重扫，
+    // 接受追加全量重扫的能耗代价，正确性与已审基线一致）。--self-test 经 override 在
+    // 13.3+ 二进制内模拟 13.0-13.2 回退分支（SIM 段），双分支语义在任意系统段都有
+    // 真实执行锁定，解除旧版回退分支「更长替换漏检 → 自检必败 → 更新死锁」。
+    static var fileIdentifierGateOverride: Bool?
+    static var inodeGateAvailable: Bool {
+        if let overridden = fileIdentifierGateOverride { return overridden }
+        if #available(macOS 13.3, *) { return true }
+        return false
+    }
+
     static let dayFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"   // 本地时区，与旧逻辑 Calendar.current 一致
@@ -750,7 +761,11 @@ enum TokenAggregator {
                 let sizeU = UInt64(size)
                 let mtime = vals.contentModificationDate
                 let inode: UInt64?
-                if #available(macOS 13.3, *) { inode = vals.fileIdentifier } else { inode = nil }
+                if #available(macOS 13.3, *) {
+                    inode = Self.inodeGateAvailable ? vals.fileIdentifier : nil
+                } else {
+                    inode = nil
+                }
                 var st = files[path] ?? FileScanState()
                 // Work v5 / CLI v3：按请求关联模型及双写，并补齐平行缓存明细（cacheDays）；
                 // 旧缓存（无缓存明细）即使文件未变也全量重建，保证窗口内 cacheDays 无空洞。
@@ -767,11 +782,18 @@ enum TokenAggregator {
                     st.offset = sizeU; st.scanRevision = revision; st.mtime = mtime; st.inode = inode
                     files[path] = st; continue
                 }
-                // 复位判定（三支）：文件变短（截断/轮换）、inode 变化（rename/原子写替换）、
-                // 同 inode 等长仅 mtime 变（原地改写）→ 旧聚合不可信，清零重扫。
-                // 同 inode 变大 = 追加 → 不复位，保持增量快路（mtime 变化不触发全量重读）。
-                // 旧缓存 inode/mtime 为 nil → 与真实值不等 → 一次性全量重建（升级语义）。
-                if sizeU < st.offset || st.inode != inode || (sizeU == st.offset && st.mtime != mtime) {
+                // 复位判定（按 inode 可用性分支）：
+                // - inode 可得（13.3+）：文件变短（截断/轮换）、inode 变化（rename/原子写
+                //   替换）、同 inode 等长仅 mtime 变（原地改写）→ 清零重扫；同 inode 变大 =
+                //   追加 → 不复位，保持增量快路（mtime 变化不触发全量重读，能耗语义）。
+                // - inode 不可得（13.0-13.2 回退 / SIM）：mtime 变化即复位（3023285 语义：
+                //   更长/等长替换必重扫，接受追加全量重扫，正确性与已审基线一致）。
+                // 旧缓存 mtime 为 nil → 与真实值不等 → 一次性全量重建（升级语义）。
+                let inodeAvailable = inode != nil
+                if sizeU < st.offset
+                    || (inodeAvailable && st.inode != inode)
+                    || (inodeAvailable && sizeU == st.offset && st.mtime != mtime)
+                    || (!inodeAvailable && st.mtime != mtime) {
                     st = FileScanState()
                 }
 
@@ -9139,9 +9161,9 @@ enum KimiOfflineRegression {
             let danglingScan = TokenAggregator.scan(roots: [danglingRoot], kimiOnly: true, into: &danglingFiles)
             try expect(danglingScan.installed == 0 && danglingScan.enumerated == 0 && danglingScan.okRoots.isEmpty,
                        "dangling symlink root must count as not installed")
-            // (e) 同 inode 追加：变大必须保持增量快路（mtime 变化不触发全量重读，能耗语义）；
-            // 哨兵日键（真实解析永不产生）存活 = 未发生清零重建。未追加再扫 skip 命中：
-            // 哨兵仍在且 offset 不变。
+            // (e) 同 inode 追加：13.3+ 必须保持增量快路（mtime 变化不触发全量重读，能耗语义），
+            // 哨兵日键存活 = 未发生清零重建；13.0-13.2 回退走 mtime 复位全量重建（哨兵清除），
+            // 数字仍正确——两分支各自锁定。未追加再扫 skip 命中：哨兵仍在且 offset 不变。
             let appendRoot = root.appendingPathComponent("append-scan").path
             try FileManager.default.createDirectory(atPath: appendRoot, withIntermediateDirectories: true)
             let appendPath = appendRoot + "/session.jsonl"
@@ -9151,19 +9173,27 @@ enum KimiOfflineRegression {
             try expect(appendFiles.values.first.map(totals) == [35, 2], "append fixture baseline scan is wrong")
             // 状态键是 realPath 形式（/var → /private/var），用字典实际键注入哨兵
             let appendKey = appendFiles.keys.first ?? appendPath
-            appendFiles[appendKey]?.days["9999-12-31"] = [7, 7]   // 哨兵：重建即清除，skip/增量保留
+            appendFiles[appendKey]?.days["zz-sentinel-1"] = [7, 7]   // 哨兵：重建即清除，skip/增量保留
             let appendFh = try FileHandle(forWritingTo: URL(fileURLWithPath: appendPath))
             try appendFh.seekToEnd()
             try appendFh.write(contentsOf: Data((try jsonLine(usageRecord) + "\n").utf8))
             try appendFh.close()
             _ = TokenAggregator.scan(roots: [appendRoot], kimiOnly: true, into: &appendFiles)
-            try expect(appendFiles[appendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
-                       && appendFiles[appendKey]?.days["9999-12-31"] == [7, 7],
-                       "same-inode append must stay incremental without a full rescan")
+            if TokenAggregator.inodeGateAvailable {
+                try expect(appendFiles[appendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
+                           && appendFiles[appendKey]?.days["zz-sentinel-1"] == [7, 7],
+                           "same-inode append must stay incremental without a full rescan")
+            } else {
+                // 13.0-13.2 回退：mtime 复位全量重建（哨兵清除，能耗代价被接受），数字仍正确
+                try expect(appendFiles[appendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
+                           && appendFiles[appendKey]?.days["zz-sentinel-1"] == nil,
+                           "append without inode fingerprint must fully rescan and stay correct")
+            }
+            appendFiles[appendKey]?.days["zz-sentinel-1"] = [7, 7]   // 两分支统一重新注入
             let appendedOffset = appendFiles[appendKey]?.offset
             _ = TokenAggregator.scan(roots: [appendRoot], kimiOnly: true, into: &appendFiles)
             try expect(appendFiles[appendKey]?.offset == appendedOffset
-                       && appendFiles[appendKey]?.days["9999-12-31"] == [7, 7],
+                       && appendFiles[appendKey]?.days["zz-sentinel-1"] == [7, 7],
                        "unchanged appended file must hit the skip path on the next round")
             // (f) 原地加长不 rename（残余风险显式契约）：同 inode 且变大 → 只增量读追加段、
             // 替换前缀不重读，与 main 旧行为一致——锁定该契约而非修复；若未来引入更强
@@ -9183,17 +9213,24 @@ enum KimiOfflineRegression {
             _ = TokenAggregator.scan(roots: [inplaceRoot], kimiOnly: true, into: &inplaceFiles)
             try expect(inplaceFiles.values.first.map(totals) == [35, 2], "in-place fixture baseline scan is wrong")
             let inplaceKey = inplaceFiles.keys.first ?? inplacePath
-            inplaceFiles[inplaceKey]?.days["9999-12-30"] = [7, 7]   // 哨兵
+            inplaceFiles[inplaceKey]?.days["zz-sentinel-2"] = [7, 7]   // 哨兵
             let inplaceFh = try FileHandle(forWritingTo: URL(fileURLWithPath: inplacePath))
             try inplaceFh.truncate(atOffset: 0)
             try inplaceFh.write(contentsOf: Data((inplacePrefix + "\n" + inplaceTail + "\n").utf8))
             try inplaceFh.close()
             _ = TokenAggregator.scan(roots: [inplaceRoot], kimiOnly: true, into: &inplaceFiles)
-            // 增量路径：哨兵存活、totals = 旧前缀 [35,2] + 追加段 [35,2] = [70,4]，
-            // 新前缀 [55,2] 未重读（漏检与 main 一致）
-            try expect(inplaceFiles[inplaceKey]?.days["9999-12-30"] == [7, 7]
-                       && inplaceFiles[inplaceKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4],
-                       "in-place grow must keep the incremental path (documented residual, same as main)")
+            if TokenAggregator.inodeGateAvailable {
+                // 13.3+ 增量路径：哨兵存活、totals = 旧前缀 [35,2] + 追加段 [35,2] = [70,4]，
+                // 新前缀 [55,2] 未重读（漏检与 main 一致）
+                try expect(inplaceFiles[inplaceKey]?.days["zz-sentinel-2"] == [7, 7]
+                           && inplaceFiles[inplaceKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4],
+                           "in-place grow must keep the incremental path (documented residual, same as main)")
+            } else {
+                // 13.0-13.2 回退：mtime 整体复位 → 替换被完整重扫（[90,4]），比 13.3+ 漏检更强
+                try expect(inplaceFiles[inplaceKey]?.days["zz-sentinel-2"] == nil
+                           && inplaceFiles[inplaceKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [90, 4],
+                           "in-place grow without inode fingerprint must fully rescan the replacement")
+            }
             // (g) 缓存往返 skip 命中：scan → encoded → decode 回读 → 再 scan。
             // 身份指纹跨 JSON 往返 bit 级相等是增量扫描命门；哨兵存活 + offset 不变 = 未重建。
             let persistRoot = root.appendingPathComponent("roundtrip-scan").path
@@ -9207,16 +9244,116 @@ enum KimiOfflineRegression {
             let decodedState = try JSONDecoder().decode(TokenAggregator.ScanState.self,
                                                         from: ScanStateFile.encoded(roundTripState))
             try expect(decodedState.cli.values.first?.mtime != nil
-                       && decodedState.cli.values.first?.inode != nil,
+                       && (decodedState.cli.values.first?.inode != nil) == TokenAggregator.inodeGateAvailable,
                        "scan identity fingerprint did not survive cache round trip")
             var reloadedFiles = decodedState.cli
             let reloadedKey = reloadedFiles.keys.first ?? persistPath
-            reloadedFiles[reloadedKey]?.days["9999-12-29"] = [7, 7]   // 哨兵
+            reloadedFiles[reloadedKey]?.days["zz-sentinel-3"] = [7, 7]   // 哨兵
             let reloadedOffset = reloadedFiles[reloadedKey]?.offset
             _ = TokenAggregator.scan(roots: [persistRoot], kimiOnly: true, into: &reloadedFiles)
             try expect(reloadedFiles[reloadedKey]?.offset == reloadedOffset
-                       && reloadedFiles[reloadedKey]?.days["9999-12-29"] == [7, 7],
+                       && reloadedFiles[reloadedKey]?.days["zz-sentinel-3"] == [7, 7],
                        "reloaded cache must hit the skip path on rescan")
+
+            // ===== 断言 16（SIM-13.0 回退语义锁定）===== inode 不可得（macOS 13.0-13.2，
+            // 经 override 模拟）→ mtime 整体复位（3023285 语义）：替换必重扫、数字正确；
+            // 接受追加/原地改写全量重建的能耗代价。override 使双分支语义在任意系统段都有
+            // 真实执行，解除回退分支「更长替换漏检 → 自检必败 → update.sh:263 更新死锁」。
+            do {
+                TokenAggregator.fileIdentifierGateOverride = false
+                defer { TokenAggregator.fileIdentifierGateOverride = nil }
+                // SIM-a 更长替换（删旧写新）：mtime 支复位 → 重扫反映替换后内容。
+                // 本断言即翻案直接证据：回退若丢失 mtime 复位，此处置为 [0,0]（尾部错位
+                // 解析 + loop 行被跳过，数据整体丢失）。
+                let simReplaceRoot = root.appendingPathComponent("sim-replace-scan").path
+                try FileManager.default.createDirectory(atPath: simReplaceRoot, withIntermediateDirectories: true)
+                let simReplacePath = simReplaceRoot + "/session.jsonl"
+                try (try jsonLine(loopMirror) + "\n").write(toFile: simReplacePath, atomically: true, encoding: .utf8)
+                var simReplaceFiles: [String: TokenAggregator.FileScanState] = [:]
+                _ = TokenAggregator.scan(roots: [simReplaceRoot], kimiOnly: true, into: &simReplaceFiles)
+                try FileManager.default.removeItem(atPath: simReplacePath)
+                try (try jsonLine(usageRecord) + "\n" + jsonLine(loopMirror) + "\n")
+                    .write(toFile: simReplacePath, atomically: true, encoding: .utf8)
+                _ = TokenAggregator.scan(roots: [simReplaceRoot], kimiOnly: true, into: &simReplaceFiles)
+                try expect(simReplaceFiles.values.first.map(totals) == [35, 2],
+                           "SIM-13.0: longer same-path replacement must rescan via the mtime branch")
+                // SIM-b2 等长原地改写：mtime 支复位
+                let simEqualRoot = root.appendingPathComponent("sim-equal-scan").path
+                try FileManager.default.createDirectory(atPath: simEqualRoot, withIntermediateDirectories: true)
+                let simEqualPath = simEqualRoot + "/session.jsonl"
+                try (equalSizeV1 + "\n").write(toFile: simEqualPath, atomically: true, encoding: .utf8)
+                var simEqualFiles: [String: TokenAggregator.FileScanState] = [:]
+                _ = TokenAggregator.scan(roots: [simEqualRoot], kimiOnly: true, into: &simEqualFiles)
+                let simEqualFh = try FileHandle(forWritingTo: URL(fileURLWithPath: simEqualPath))
+                try simEqualFh.truncate(atOffset: 0)
+                try simEqualFh.write(contentsOf: Data((equalSizeV2 + "\n").utf8))
+                try simEqualFh.close()
+                _ = TokenAggregator.scan(roots: [simEqualRoot], kimiOnly: true, into: &simEqualFiles)
+                try expect(simEqualFiles.values.first.map(totals) == [55, 6],
+                           "SIM-13.0: same-size in-place rewrite must rescan via the mtime branch")
+                // SIM-e 追加：mtime 支复位 → 全量重建（哨兵清除，能耗代价被接受），数字正确；
+                // 未追加再扫 skip 命中（哨兵存活 + offset 不变）
+                let simAppendRoot = root.appendingPathComponent("sim-append-scan").path
+                try FileManager.default.createDirectory(atPath: simAppendRoot, withIntermediateDirectories: true)
+                let simAppendPath = simAppendRoot + "/session.jsonl"
+                try (try jsonLine(usageRecord) + "\n").write(toFile: simAppendPath, atomically: true, encoding: .utf8)
+                var simAppendFiles: [String: TokenAggregator.FileScanState] = [:]
+                _ = TokenAggregator.scan(roots: [simAppendRoot], kimiOnly: true, into: &simAppendFiles)
+                try expect(simAppendFiles.values.first.map(totals) == [35, 2], "SIM-13.0 append baseline is wrong")
+                let simAppendFh = try FileHandle(forWritingTo: URL(fileURLWithPath: simAppendPath))
+                try simAppendFh.seekToEnd()
+                try simAppendFh.write(contentsOf: Data((try jsonLine(usageRecord) + "\n").utf8))
+                try simAppendFh.close()
+                _ = TokenAggregator.scan(roots: [simAppendRoot], kimiOnly: true, into: &simAppendFiles)
+                let simAppendKey = simAppendFiles.keys.first ?? simAppendPath
+                try expect(simAppendFiles[simAppendKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [70, 4]
+                           && simAppendFiles[simAppendKey]?.days["zz-sentinel-4"] == nil,
+                           "SIM-13.0: append must fully rescan and stay correct")
+                simAppendFiles[simAppendKey]?.days["zz-sentinel-4"] = [7, 7]   // 哨兵
+                let simAppendedOffset = simAppendFiles[simAppendKey]?.offset
+                _ = TokenAggregator.scan(roots: [simAppendRoot], kimiOnly: true, into: &simAppendFiles)
+                try expect(simAppendFiles[simAppendKey]?.offset == simAppendedOffset
+                           && simAppendFiles[simAppendKey]?.days["zz-sentinel-4"] == [7, 7],
+                           "SIM-13.0: unchanged appended file must hit the skip path")
+                // SIM-f 原地加长：mtime 支整体复位 → 替换被完整重扫（[90,4] = 新前缀 [55,2]
+                // + 追加段 [35,2]），比 13.3+ 的增量漏检更强
+                let simInplaceRoot = root.appendingPathComponent("sim-inplace-scan").path
+                try FileManager.default.createDirectory(atPath: simInplaceRoot, withIntermediateDirectories: true)
+                let simInplacePath = simInplaceRoot + "/session.jsonl"
+                try (inplaceV1 + "\n").write(toFile: simInplacePath, atomically: true, encoding: .utf8)
+                var simInplaceFiles: [String: TokenAggregator.FileScanState] = [:]
+                _ = TokenAggregator.scan(roots: [simInplaceRoot], kimiOnly: true, into: &simInplaceFiles)
+                let simInplaceFh = try FileHandle(forWritingTo: URL(fileURLWithPath: simInplacePath))
+                try simInplaceFh.truncate(atOffset: 0)
+                try simInplaceFh.write(contentsOf: Data((inplacePrefix + "\n" + inplaceTail + "\n").utf8))
+                try simInplaceFh.close()
+                _ = TokenAggregator.scan(roots: [simInplaceRoot], kimiOnly: true, into: &simInplaceFiles)
+                let simInplaceKey = simInplaceFiles.keys.first ?? simInplacePath
+                try expect(simInplaceFiles[simInplaceKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [90, 4],
+                           "SIM-13.0: in-place grow must fully rescan the replaced content")
+                // SIM-g 缓存往返：mtime 存活 + skip 命中（inode 恒 nil）
+                let simPersistRoot = root.appendingPathComponent("sim-roundtrip-scan").path
+                try FileManager.default.createDirectory(atPath: simPersistRoot, withIntermediateDirectories: true)
+                let simPersistPath = simPersistRoot + "/session.jsonl"
+                try (try jsonLine(usageRecord) + "\n").write(toFile: simPersistPath, atomically: true, encoding: .utf8)
+                var simRoundTripFiles: [String: TokenAggregator.FileScanState] = [:]
+                _ = TokenAggregator.scan(roots: [simPersistRoot], kimiOnly: true, into: &simRoundTripFiles)
+                var simRoundTripState = TokenAggregator.ScanState()
+                simRoundTripState.cli = simRoundTripFiles
+                let simDecoded = try JSONDecoder().decode(TokenAggregator.ScanState.self,
+                                                          from: ScanStateFile.encoded(simRoundTripState))
+                try expect(simDecoded.cli.values.first?.mtime != nil
+                           && simDecoded.cli.values.first?.inode == nil,
+                           "SIM-13.0: mtime must survive cache round trip without inode")
+                var simReloaded = simDecoded.cli
+                let simReloadedKey = simReloaded.keys.first ?? simPersistPath
+                simReloaded[simReloadedKey]?.days["zz-sentinel-5"] = [7, 7]   // 哨兵
+                let simReloadedOffset = simReloaded[simReloadedKey]?.offset
+                _ = TokenAggregator.scan(roots: [simPersistRoot], kimiOnly: true, into: &simReloaded)
+                try expect(simReloaded[simReloadedKey]?.offset == simReloadedOffset
+                           && simReloaded[simReloadedKey]?.days["zz-sentinel-5"] == [7, 7],
+                           "SIM-13.0: reloaded cache must hit the skip path on rescan")
+            }
 
             let promaUsage: [String: Any] = ["input_tokens": 10, "cache_read_input_tokens": 20,
                                              "cache_creation_input_tokens": 5, "output_tokens": 3]

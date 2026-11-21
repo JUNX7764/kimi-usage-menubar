@@ -48,6 +48,8 @@ Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度�
 
 本地 JSONL / SQLite → 只读扫描与来源去重 → `scan-state-v6.json` → 今日、近 7 日、近 30 日及模型明细。
 
+JSONL 增量扫描按「offset + scanRevision + mtime + inode」四重身份指纹判定跳过与重扫：macOS 13.3+（`fileIdentifier` 可得）同 inode 变大走追加增量快路，inode 变化或等长原地改写清零重扫；13.0-13.2 回退为 mtime 整体复位（替换必重扫，接受追加全量重扫），正确性两分支一致。自检经 gate override 在同一二进制内双分支执行锁定。
+
 原始会话与数据库只读。缺少模型名、来源不可读、重复日志和 SQLite 中途失败必须按既定边界降级，不能将部分结果当成完整成功。
 
 ### 自动更新

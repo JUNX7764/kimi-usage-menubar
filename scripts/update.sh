@@ -14,7 +14,8 @@ TMP=""
 WORK=""
 BACKUP=""
 INSTALLED=""
-AGENT=0
+AGENT_PREF=0   # 偏好：plist 存在且指向本副本（启动/回滚阶段按它 bootstrap）
+JOB_LOADED=0   # 加载态：launchd job 的 program 是本副本（停旧阶段按它 bootout）
 STOPPED=0
 SUCCESS=0
 NEW_VERSION=""
@@ -96,7 +97,7 @@ JXA
 }
 
 start_and_wait() {
-    if [ "$AGENT" = 1 ]; then
+    if [ "$AGENT_PREF" = 1 ]; then
         launchctl bootstrap "gui/${MYUID}" "$AGENT_PLIST" || {
             echo "!! LaunchAgent 加载失败，尝试直接启动应用"
             open -n "$INSTALLED" || { echo "!! 应用启动命令失败"; return 1; }
@@ -120,7 +121,7 @@ start_and_wait() {
 rollback() {
     echo "==> 更新失败，恢复旧版本"
     set +e
-    if [ "$AGENT" = 1 ]; then
+    if [ "$JOB_LOADED" = 1 ]; then
         launchctl bootout "gui/${MYUID}/${LABEL}" >/dev/null 2>&1
     fi
     stop_target
@@ -268,13 +269,21 @@ if other_copy_running; then
     echo "!! 检测到另一应用副本正在运行，已中止"
     exit 1
 fi
+# 偏好与加载态解耦：
+# - JOB_LOADED（加载态）：print 成功且 program 是本副本 → 停旧阶段按它 bootout；program
+#   不是本副本仍中止（安全校验保留）。
+# - AGENT_PREF（偏好）：plist 存在且 ProgramArguments 指向本副本 → 启动/回滚阶段按它
+#   bootstrap 保活。plist 缺失或指向别处时视为 OFF：不中止、不 bootstrap、不动别人的
+#   plist；「job 已加载但 plist 缺失」不再永久阻断更新（App 侧开关 bootout 后遗留的
+#   中间态可正常推进，回滚后按偏好重新 bootstrap 旧版保活）。
 if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
     LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
     [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
-    [ -f "$AGENT_PLIST" ] || { echo "!! LaunchAgent plist 不存在"; exit 1; }
+    JOB_LOADED=1
+fi
+if [ -f "$AGENT_PLIST" ]; then
     AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
-    [ "$AGENT_BINARY" = "$BINARY" ] || { echo "!! LaunchAgent 指向另一副本，已中止"; exit 1; }
-    AGENT=1
+    [ "$AGENT_BINARY" = "$BINARY" ] && AGENT_PREF=1
 fi
 
 echo "==> 3/5 在安装位置旁暂存新版本"
@@ -290,7 +299,7 @@ fi
 
 echo "==> 4/5 停止 ${LABEL} 并切换版本"
 if other_copy_running; then echo "!! 检测到另一应用副本正在运行，已中止"; exit 1; fi
-if [ "$AGENT" = 1 ]; then
+if [ "$JOB_LOADED" = 1 ]; then
     launchctl bootout "gui/${MYUID}/${LABEL}"
 fi
 STOPPED=1

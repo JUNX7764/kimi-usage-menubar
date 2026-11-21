@@ -7070,11 +7070,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FileManager.default.fileExists(atPath: launchAgentPath)
     }
 
+    // MARK: LaunchAgent 即时生效（偏好决定 bootstrap，加载态决定 bootout）
+    // 仅 UI 开关路径调用（visualPreview 已在 onToggleLogin guard），绝不进 --self-test。
+    // launchctl 不存在（try run 抛错）/非零退出/被信号终止统一按失败返回 false。
+    private func launchctlSucceeded(_ arguments: [String]) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch {
+            NSLog("[KimiUsage] launchctl %@ spawn failed: %@", arguments.first ?? "", error.localizedDescription)
+            return false
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            NSLog("[KimiUsage] launchctl %@ failed: status %d", arguments.joined(separator: " "), process.terminationStatus)
+            return false
+        }
+        return true
+    }
+
+    private var launchAgentDomain: String { "gui/\(getuid())" }
+
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
         do {
             if isLoginItemEnabled() {
+                // 关：加载态决定 bootout。job 未加载属幂等正常态，直接删 plist 不报错；
+                // bootout 失败要报错（KeepAlive 会在重启前继续复活进程），plist 仍删除
+                // （偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
+                var bootoutFailed = false
+                if launchctlSucceeded(["print", "\(launchAgentDomain)/\(launchAgentLabel)"]),
+                   !launchctlSucceeded(["bootout", "\(launchAgentDomain)/\(launchAgentLabel)"]) {
+                    bootoutFailed = true
+                }
                 try FileManager.default.removeItem(atPath: launchAgentPath)
+                if bootoutFailed {
+                    panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
+                    NSLog("[KimiUsage] LaunchAgent bootout failed")
+                }
             } else {
                 // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
                 // launchd 静默忽略，开机自启失效且用户无感知
@@ -7089,6 +7124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let data = try PropertyListSerialization.data(fromPropertyList: plist,
                     format: .xml, options: 0)
                 try data.write(to: URL(fileURLWithPath: launchAgentPath))
+                // 开：写完立即 bootstrap（开关立即生效）；失败明确报错不静默，
+                // plist 保留（下次登录仍生效，与既有语义一致）
+                if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
+                    panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
+                    NSLog("[KimiUsage] LaunchAgent bootstrap failed")
+                }
             }
         } catch {
             panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)

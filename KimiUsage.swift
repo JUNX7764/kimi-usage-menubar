@@ -6807,9 +6807,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         barThemeDark = isDark(appearance)
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
-        if ProcessInfo.processInfo.arguments.contains("--visual-preview") && !ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--visual-preview-background-test") } {
-            statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: nil)
-        }
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Kimi 余额 · 5H成功 \(Fmt.lastOK(lastFiveHourSuccessAt)) · 7D成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"

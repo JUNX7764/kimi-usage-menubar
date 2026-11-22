@@ -61,7 +61,7 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 ### 面板设置入口与背景样式
 
-头部最右缘「···」按钮 → 统一原生 NSMenu（`卡片显示与排序…` → 原位设置页，`KimiPanelLayout` 显隐/排序经单 key `panelCardLayout.v1` 持久化；`悬停显示状态面板` 开关；`背景样式` 子菜单：纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
+头部最右缘「···」按钮 → 统一原生 NSMenu（`卡片显示与排序…` → 原位设置页，`KimiPanelLayout` 显隐/排序经单 key `panelCardLayout.v1` 持久化；`悬停显示状态面板` 开关；`开机自启` 开关；`背景样式` 子菜单：纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
 
 - 缺省与非法值回退 solid；打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册）共用同一应用入口，切换不重建面板内容。
 - solid：`PanelSolidBackgroundView` opacity=1（无历史 0.9 混合）；classicMaterial：仅 `NSVisualEffectView(.popover)`；liquidGlass：两层自绘背景全部隐藏，露出 macOS 26+ 新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView / NSPanel。卡片底色为 `labelColor@0.035`，描边为 `labelColor@0.09`，无阴影。
@@ -72,6 +72,10 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 ### 悬停显示状态面板
 
 菜单栏图标与面板内容视图各挂 `NSTrackingArea`（`PanelHoverTracking` 经 NSResponder 转发边界事件，零轮询）→ `PanelHoverController` 驻留 0.2s 开 / 离组 0.30s 收（`PanelHoverIntent` token 簿记丢弃陈旧触发）→ `openPanel(byHover:)` 共用点击打开全路径。图标-面板间 8pt 桥区计入保持区；边界判定 inclusive。点击语义由 `panelHoverClickOutcome` 决策矩阵定义：未开=打开、hover 打开中首次点击=pin（面板内点击同样 pin）、pin 后再点=关闭。偏好 `panel.hoverOpen.enabled` 缺省开；翻转以控制器为准、生产落盘、预览不落盘。预览/GUI 回归仅在 `--visual-preview-hover-test` 启用（该旗标下 Popover 改 `applicationDefined`，时序回归 `testHoverPresentation` 全程注入固定矩形与指针位置）。
+
+### 开机自启（LaunchAgent）
+
+真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，三个显式入口（状态菜单勾选、面板底部勾选、··· 面板设置菜单）共用 `onToggleLogin`：OFF 置 optedOut、ON 清除，plist 真值优先于标记。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；失败仅 NSLog + 面板提示，下次启动自然重试。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
 
 ## 4. 信任边界
 

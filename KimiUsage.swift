@@ -3176,6 +3176,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     /// PanelHoverController）；未注入时按偏好存储默认（开启）展示。
     var hoverPanelMenuStateProvider: (() -> Bool)?
     var hoverPanelToggleHandler: (() -> Void)?
+    /// 开机自启（··· 菜单）：勾选态与翻转都委托宿主——plist 是真值、LaunchAgent 操作
+    /// 与显式关闭记忆都在宿主；未注入时按未勾选展示（真值只能在宿主解析）。
+    var loginItemMenuStateProvider: (() -> Bool)?
+    var loginItemToggleHandler: (() -> Void)?
     // effect/solid 暴露为 internal：--self-test 断言背景层 hidden/opacity 用，生产路径仍只经 applyBackgroundStyle() 驱动。
     let effect = NSVisualEffectView()
     let solid = PanelSolidBackgroundView()
@@ -4954,6 +4958,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         hover.target = self
         hover.state = (hoverPanelMenuStateProvider?() ?? PanelHoverPreference.load()) ? .on : .off
         menu.addItem(hover)
+        let login = NSMenuItem(title: "开机自启", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = (loginItemMenuStateProvider?() ?? false) ? .on : .off
+        menu.addItem(login)
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         background.submenu = makeBackgroundStyleMenu()
         menu.addItem(background)
@@ -4962,6 +4970,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     /// 「···」菜单悬停开关动作：翻转逻辑在宿主（控制器为准 + 生产落盘），控制器只承接菜单事件。
     @objc private func toggleHoverPanel() { hoverPanelToggleHandler?() }
+
+    /// 「···」菜单自启开关动作：翻转逻辑在宿主（plist 真值 + opt-out 记忆 + launchctl），
+    /// 控制器只承接菜单事件；面板保持打开。
+    @objc private func toggleLoginItem() { loginItemToggleHandler?() }
 
     @objc private func showPanelSettingsMenu(_ sender: NSButton) {
         let menu = makePanelSettingsMenu()
@@ -6023,6 +6035,18 @@ final class PreviewBackdropView: NSView {
     }
 }
 
+/// 开机自启默认开决策（纯函数，--self-test 覆盖三态）。
+/// plist 始终是真值（update.sh AGENT_PREF 语义同源，脚本不改）：存在 → 永不动；
+/// 缺失且用户从未显式关闭 → 自动安装（默认开）；显式关闭过 → 尊重用户不重装。
+enum LoginItemDecision {
+    static let optedOutDefaultsKey = "login.item.optedOut"
+
+    static func autoInstallNeeded(plistExists: Bool, optedOut: Bool) -> Bool {
+        if plistExists { return false }
+        return !optedOut
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelController = UsagePanelController()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
@@ -6037,6 +6061,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// --self-test 用：悬停接线契约（面板回调与控制器实例），生产路径不读。
     var panelHoverWiringForTest: (panel: UsagePanelController, hover: PanelHoverController?) {
         (panelController, panelHoverController)
+    }
+    /// --self-test 用：自启接线契约（勾选态与 plist 真值同源），生产路径不读。
+    var loginItemWiringForTest: (menuState: Bool, plistExists: Bool) {
+        (panelController.loginItemMenuStateProvider?() ?? false, isLoginItemEnabled())
     }
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -6089,6 +6117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         if visualPreview { configureVisualPreview(); return }
+        autoInstallLoginItemIfNeeded()
         setupQuotaHistory()
         rebuildMenu()
         renderBar()
@@ -6407,6 +6436,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 「···」菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
         panelController.hoverPanelMenuStateProvider = { PanelHoverPreference.load() }
         panelController.hoverPanelToggleHandler = { [weak self] in self?.toggleHoverPanel() }
+        // 「···」菜单自启项：勾选态与状态菜单同源（真实 plist 真值 + preview 一律未勾选），
+        // 翻转走 onToggleLogin（plist 真值 + opt-out 记忆）；launchctl 操作绝不进测试进程
+        panelController.loginItemMenuStateProvider = { [weak self] in
+            guard let self else { return false }
+            return !self.visualPreview && self.isLoginItemEnabled()
+        }
+        panelController.loginItemToggleHandler = { [weak self] in self?.onToggleLogin() }
         let enabled = visualPreview
             ? CommandLine.arguments.contains("--visual-preview-hover-test")
             : PanelHoverPreference.load()
@@ -7179,7 +7215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let defaultsKey = PanelBackgroundStyle.defaultsKey
         let storedBefore = UserDefaults.standard.string(forKey: defaultsKey)
-        // 统一菜单：0=卡片显示与排序… 1=悬停显示状态面板 2=背景样式（子菜单）；
+        // 统一菜单：0=卡片显示与排序… 1=悬停显示状态面板 2=开机自启 3=背景样式（子菜单）；
         // 子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
         let plan: [(index: Int, style: PanelBackgroundStyle)] = [(1, .liquidGlass), (2, .classicMaterial)]
         var step = 0
@@ -7190,9 +7226,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fputs("KimiUsage background menu test: FAIL: panel settings menu was not tracking\n", stderr)
                     exit(1)
                 }
-                guard menu.items.count == 3, menu.items[0].title == "卡片显示与排序…",
-                      menu.items[1].title == "悬停显示状态面板",
-                      menu.items[2].title == "背景样式", let submenu = menu.items[2].submenu else {
+                guard menu.items.count == 4, menu.items[0].title == "卡片显示与排序…",
+                      menu.items[1].title == "悬停显示状态面板", menu.items[2].title == "开机自启",
+                      menu.items[3].title == "背景样式", let submenu = menu.items[3].submenu else {
                     fputs("KimiUsage background menu test: FAIL: panel menu structure changed\n", stderr)
                     exit(1)
                 }
@@ -7523,59 +7559,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var launchAgentDomain: String { "gui/\(getuid())" }
 
+    /// 首次生产启动自动开启自启（默认开，用户决策）：按 LoginItemDecision 三态执行。
+    /// 只在真实生产启动路径运行——--self-test 与所有 --visual-preview* 绝不触碰 LaunchAgent
+    /// （沿用 onToggleLogin 既有约定）。plist 缺失且从未显式关闭时走与显式 ON 相同的
+    /// installLoginItem()；失败仅 NSLog + 面板提示，不崩，下次启动自然重试。
+    private func autoInstallLoginItemIfNeeded() {
+        guard !visualPreview else { return }
+        let optedOut = UserDefaults.standard.bool(forKey: LoginItemDecision.optedOutDefaultsKey)
+        guard LoginItemDecision.autoInstallNeeded(plistExists: isLoginItemEnabled(), optedOut: optedOut) else { return }
+        NSLog("[KimiUsage] plist missing without opt-out: auto-enabling login item (default on)")
+        installLoginItem()
+    }
+
+    /// 显式开关自启（三入口共用：状态菜单勾选、面板底部勾选、··· 面板设置菜单）。
+    /// 显式 OFF 置 login.item.optedOut（自动安装此后不再重装），ON 清除标记恢复默认开语义；
+    /// plist 真值优先于标记（判定在 LoginItemDecision），标记不一致无副作用。
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
+        if isLoginItemEnabled() {
+            removeLoginItem()
+            UserDefaults.standard.set(true, forKey: LoginItemDecision.optedOutDefaultsKey)
+        } else {
+            installLoginItem()
+            UserDefaults.standard.removeObject(forKey: LoginItemDecision.optedOutDefaultsKey)
+        }
+        updateUI()
+    }
+
+    /// 安装 LaunchAgent plist + 加载态校正 bootstrap：显式 ON 与自动安装共用。
+    /// 失败明确报错不静默（NSLog + 面板提示），plist 保留（下次登录仍生效），不崩。
+    private func installLoginItem() {
         do {
-            if isLoginItemEnabled() {
-                // 关：加载态决定 bootout。job 未加载属幂等正常态，直接删 plist 不报错；
-                // bootout 失败要报错（KeepAlive 会在重启前继续复活进程），plist 仍删除
-                // （偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
-                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-                if launchctlSucceeded(["print", jobSpecifier]),
-                   !launchctlSucceeded(["bootout", jobSpecifier]) {
-                    panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
-                    NSLog("[KimiUsage] LaunchAgent bootout failed")
+            // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
+            // launchd 静默忽略，开机自启失效且用户无感知
+            let exec = Bundle.main.executablePath ?? ""
+            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
+            let plist: [String: Any] = [
+                "Label": launchAgentLabel,
+                "ProgramArguments": [exec],
+                "RunAtLoad": true,
+                "KeepAlive": ["SuccessfulExit": false]
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist,
+                format: .xml, options: 0)
+            // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
+            try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
+            // 先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
+            // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
+            // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
+            // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
+            // job 未加载 → 直接 bootstrap。失败明确报错不静默，plist 保留（下次登录
+            // 仍生效，与既有语义一致）。
+            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+            if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
+                if loadedProgram != exec,
+                   !(launchctlSucceeded(["bootout", jobSpecifier])
+                     && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
+                    panelController.setUpdateMessage("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）", dismissAfter: 5)
+                    NSLog("[KimiUsage] LaunchAgent reload correction failed")
                 }
-                try FileManager.default.removeItem(atPath: launchAgentPath)
-            } else {
-                // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
-                // launchd 静默忽略，开机自启失效且用户无感知
-                let exec = Bundle.main.executablePath ?? ""
-                // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
-                let plist: [String: Any] = [
-                    "Label": launchAgentLabel,
-                    "ProgramArguments": [exec],
-                    "RunAtLoad": true,
-                    "KeepAlive": ["SuccessfulExit": false]
-                ]
-                let data = try PropertyListSerialization.data(fromPropertyList: plist,
-                    format: .xml, options: 0)
-                // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
-                try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
-                // 开：先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
-                // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
-                // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
-                // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
-                // job 未加载 → 直接 bootstrap。失败明确报错不静默，plist 保留（下次登录
-                // 仍生效，与既有语义一致）。
-                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-                if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
-                    if loadedProgram != exec,
-                       !(launchctlSucceeded(["bootout", jobSpecifier])
-                         && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
-                        panelController.setUpdateMessage("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）", dismissAfter: 5)
-                        NSLog("[KimiUsage] LaunchAgent reload correction failed")
-                    }
-                } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
-                    panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
-                    NSLog("[KimiUsage] LaunchAgent bootstrap failed")
-                }
+            } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
+                panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
+                NSLog("[KimiUsage] LaunchAgent bootstrap failed")
             }
         } catch {
             panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
-            NSLog("[KimiUsage] LaunchAgent toggle failed: %@", error.localizedDescription)
+            NSLog("[KimiUsage] LaunchAgent install failed: %@", error.localizedDescription)
         }
-        updateUI()
+    }
+
+    /// 移除 LaunchAgent：显式 OFF 共用。加载态决定 bootout，job 未加载属幂等正常态，
+    /// 直接删 plist 不报错；bootout 失败要报错（KeepAlive 会在重启前继续复活进程），
+    /// plist 仍删除（偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
+    private func removeLoginItem() {
+        do {
+            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+            if launchctlSucceeded(["print", jobSpecifier]),
+               !launchctlSucceeded(["bootout", jobSpecifier]) {
+                panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
+                NSLog("[KimiUsage] LaunchAgent bootout failed")
+            }
+            try FileManager.default.removeItem(atPath: launchAgentPath)
+        } catch {
+            panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
+            NSLog("[KimiUsage] LaunchAgent remove failed: %@", error.localizedDescription)
+        }
     }
 
     @objc private func onRefresh() { if visualPreview { previewRefreshCount += 1 } else { refresh(manual: true) } }
@@ -8278,7 +8346,7 @@ enum KimiOfflineRegression {
                        "panel layout store round trip failed")
             try expect(KimiPanelLayoutStore.hasValueForTest, "panel layout store did not persist value")
 
-            // 统一「···」菜单结构：卡片设置入口 + 悬停显示开关 + 背景样式子菜单（选择仍即时生效）
+            // 统一「···」菜单结构：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
             // 悬停偏好启用内存 backend：菜单勾选态断言不读写真实偏好，缺省态（无存储值）确定为开
             let endHoverBackend = PanelHoverPreference.beginMemoryOverride()
             defer { endHoverBackend() }
@@ -8287,7 +8355,7 @@ enum KimiOfflineRegression {
             settingsController.previewReduceTransparencyOverride = false
             settingsController.previewSuppressesPersistence = true
             let panelMenu = settingsController.makePanelSettingsMenu()
-            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "背景样式"],
+            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "开机自启", "背景样式"],
                        "panel settings menu structure changed: \(panelMenu.items.map(\.title))")
             try expect(panelMenu.items[0].target != nil && panelMenu.items[0].action != nil
                        && panelMenu.items[0].isEnabled,
@@ -8296,7 +8364,11 @@ enum KimiOfflineRegression {
                        "hover toggle missing target/action")
             try expect(panelMenu.items[1].state == .on,
                        "hover toggle must default to on (no stored value)")
-            try expect(panelMenu.items[2].submenu?.items.count == PanelBackgroundStyle.allCases.count,
+            try expect(panelMenu.items[2].target != nil && panelMenu.items[2].action != nil,
+                       "login toggle missing target/action")
+            try expect(panelMenu.items[2].state == .off,
+                       "login toggle must default to off (no provider on isolated controller)")
+            try expect(panelMenu.items[3].submenu?.items.count == PanelBackgroundStyle.allCases.count,
                        "background submenu lost styles")
 
             // 原位设置页（离线可断言部分）：编辑器结构、排序按钮、进出与布局应用。
@@ -10098,7 +10170,29 @@ enum KimiOfflineRegression {
                        && PanelHoverPreference.load(),
                        "二次翻转未恢复")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference)")
+            // 开机自启默认开（plist 真值 + 显式关闭记忆）：纯决策三态，不触碰真实 LaunchAgent
+            try expect(LoginItemDecision.optedOutDefaultsKey == "login.item.optedOut", "自启 opt-out 键名锁定")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: true, optedOut: false),
+                       "plist 已存在不得重装")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: true, optedOut: true),
+                       "plist 存在时 opt-out 不参与判定")
+            try expect(LoginItemDecision.autoInstallNeeded(plistExists: false, optedOut: false),
+                       "缺失且从未显式关闭 → 自动安装（默认开）")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: false, optedOut: true),
+                       "显式关闭过 → 尊重用户不重装")
+
+            // 自启接线契约：··· 菜单勾选态与 plist 真值同源（只锁同源不锁开合，测试不依赖
+            // 机器自启状态）；翻转闭包接生产 onToggleLogin——launchctl/plist 操作绝不进
+            // 测试，翻转行为正确性留人工验收，这里只断言装配存在。
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.loginItemMenuStateProvider != nil,
+                       "面板设置菜单自启勾选态接线缺失")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.loginItemToggleHandler != nil,
+                       "面板设置菜单自启翻转接线缺失")
+            let loginWiring = hoverDelegate.loginItemWiringForTest
+            try expect(loginWiring.menuState == loginWiring.plistExists,
+                       "自启菜单勾选态必须与 plist 真值同源")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference/wiring, login item default-on decision/wiring)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

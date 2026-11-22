@@ -2579,14 +2579,20 @@ struct UsagePanelModel: Equatable {
     var lastAttempt: String
     var version: String
     var refreshItem: NSMenuItem
-    var quitItem: NSMenuItem
+    /// 底栏单行化（2026-11-22）：quotaLastOKText = 7 天额度成功时间展示文案（HH:mm），
+    /// 空串 = 无数据（底栏显示「—」）；refreshInFlight 仅手动刷新在飞为 true，
+    /// 自动 10s 轮询不置位；sevenDayErrorLine = 7 天额度失败行（含「最后成功」原文，
+    /// 与额度卡 notice 同源），nil = 无失败。
+    var quotaLastOKText: String = ""
+    var refreshInFlight: Bool = false
+    var sevenDayErrorLine: String?
 
     /// 等值比较（供面板展开期间「无变化跳过重建」使用，L1 半项）。
     /// 模型树全量核查过：嵌套类型均为纯值语义（无 NSObject/NSView/class 字段），
-    /// QuotaCycleSnapshot 已是值类型 Equatable；NSMenuItem 实例字段（refreshItem/quitItem，
-    /// 自启开关不在面板模型——唯一入口在 ⚙ 面板设置菜单）是唯一的引用字段，
+    /// QuotaCycleSnapshot 已是值类型 Equatable；NSMenuItem 实例字段（refreshItem，
+    /// 自启开关与退出项不在面板模型——唯一入口在 ⚙ 面板设置菜单）是唯一的引用字段，
     /// 每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出比较：
-    /// refreshItem/quitItem 标题/动作/快捷键恒定，updateItem 以有无代理（更新按钮行显隐）。
+    /// refreshItem 标题/动作/快捷键恒定，updateItem 以有无代理（更新按钮行显隐）。
     /// volatile 来源核查：lastAttempt 为 HH:mm 分钟粒度、brief 日标签为日粒度——
     /// 按各自展示精度参与比较，跨分钟/跨日内容真变时重建，显示语义不变；
     /// 其余文本/数值均来自既有存储快照，轮内稳定。
@@ -2604,6 +2610,9 @@ struct UsagePanelModel: Equatable {
             && lhs.notices == rhs.notices
             && lhs.lastAttempt == rhs.lastAttempt
             && lhs.version == rhs.version
+            && lhs.quotaLastOKText == rhs.quotaLastOKText
+            && lhs.refreshInFlight == rhs.refreshInFlight
+            && lhs.sevenDayErrorLine == rhs.sevenDayErrorLine
     }
 }
 
@@ -2837,6 +2846,11 @@ final class PanelSolidBackgroundView: NSView {
 final class PanelActionButton: NSButton {
     enum Style {
         case plain, prominent
+        /// 底栏版本胶囊专用视觉态（常驻 6% / hover 12%），只影响该按钮，
+        /// 不改动其他按钮的普通 hover 分支（0/8%）。
+        case pillNeutral
+        /// 底栏数据刷新胶囊：主题蓝浅底（常驻 18% / hover 28%），文字/icon 前景色为 accent。
+        case accentSubtle
     }
 
     var menuItem: NSMenuItem?
@@ -2854,12 +2868,22 @@ final class PanelActionButton: NSButton {
                 layer?.backgroundColor = (hovered
                     ? NSColor.labelColor.withAlphaComponent(0.08)
                     : NSColor.clear).cgColor
+            case .pillNeutral:
+                layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(hovered ? 0.12 : 0.06).cgColor
+            case .accentSubtle:
+                layer?.backgroundColor = PanelAccent.codex.color.withAlphaComponent(hovered ? 0.28 : 0.18).cgColor
             }
         }
     }
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         needsDisplay = true
+    }
+    // 行内文本/附件（版本胶囊右上角更新圆点等）只负责显示；整个按钮区域统一接收鼠标事件，
+    // 圆点等纯展示子视图不截获点击。
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard let parent = superview else { return super.hitTest(point) }
+        return bounds.contains(convert(point, from: parent)) ? self : nil
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -2869,6 +2893,38 @@ final class PanelActionButton: NSButton {
     }
     override func mouseEntered(with event: NSEvent) { hovered = true }
     override func mouseExited(with event: NSEvent) { hovered = false }
+}
+
+/// 6px 更新提示圆点（版本胶囊右上角钉挂，可越出按钮边界 2pt）：主题蓝 accent 随明暗外观
+/// 即时刷新；纯展示不参与命中——PanelActionButton.hitTest 对 bounds 内点一律返回按钮自身，
+/// 圆点不会截获点击（点击区域保持整个胶囊）。
+final class PanelAccentDotView: NSView {
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = PanelAccent.codex.color.cgColor
+        }
+    }
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+}
+
+/// 面板根容器：底栏退出按钮移除后 ⌘Q 失去常驻 responder（NSMenuItem keyEquivalent 仅在
+/// 菜单跟踪期间有效），在此兜底拦截面板窗口内的 ⌘Q 转交 quitHandler（先收起面板再退出，
+/// 与旧 footer 退出按钮的 performAction 语义一致）；其余按键原样交还 super（子视图遍历继续，
+/// 刷新胶囊的 ⌘R 不受影响，也不抢系统级 ⌘ 组合键）。
+final class PanelRootView: NSView {
+    var quitHandler: (() -> Void)?
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "q" {
+            quitHandler?()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 }
 
 class PanelCardView: NSView {
@@ -3145,6 +3201,9 @@ final class QuotaSectionView: PanelCardView {
 
 final class UsagePanelController: NSObject, NSPopoverDelegate {
     var onClose: (() -> Void)?
+    /// 退出请求（⚙ 菜单退出项 / 面板窗口内 ⌘Q 兜底共用）：语义在宿主（NSApp.terminate /
+    /// preview 计数）；面板收起由 PanelRootView.quitHandler 在调用前完成。
+    var onQuitRequest: (() -> Void)?
     var onCheckUpdate: (() -> Void)?
     private var updateConfirmation: (tag: String, notes: String)?
     var onConfirmUpdate: ((String, String) -> Void)?
@@ -3250,14 +3309,9 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if stack.arrangedSubviews.isEmpty && model != nil { rebuildContent() }
         return stack.arrangedSubviews
     }
-    /// --self-test 用：读取真实 footer 工厂创建的「退出」按钮，锁定 hover 底色内的标题居中。
-    var quitActionButtonForTest: PanelActionButton? {
-        func find(_ view: NSView) -> PanelActionButton? {
-            if let button = view as? PanelActionButton, button.style == .plain { return button }
-            return view.subviews.lazy.compactMap(find).first
-        }
-        return find(footerContainer)
-    }
+    /// --self-test 用：读取真实 footer 工厂创建的底栏子树（版本/刷新胶囊、更新时间标签；
+    /// 退出按钮已移除，退出仅存 ⚙ 菜单）。
+    var footerContainerForTest: NSView { footerContainer }
     /// --self-test 用：按指定面板宽度强制重建并布局内容栈，返回各行（几何/顺序断言用）。
     /// 面板保持关闭：不依赖屏幕、窗口或 Popover 展示路径。
     @discardableResult
@@ -3278,7 +3332,15 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     override init() {
         super.init()
-        contentController.view = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
+        let root = PanelRootView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
+        // ⌘Q 兜底接线（底栏退出按钮已移除）：先收起面板再退出，复刻旧 footer 退出按钮
+        // performAction 的「只有退出先收面板」语义；preview/自检共用该根视图，行为一致
+        root.quitHandler = { [weak self] in
+            guard let self else { return }
+            self.close()
+            self.onQuitRequest?()
+        }
+        contentController.view = root
         configureContent()
         popover.contentViewController = contentController
         // 仅 --visual-preview-hover-test 离线回归进程改用 applicationDefined：避免测试期间的
@@ -3417,7 +3479,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         ])
 
         let footerLine = PanelUI.separator()
-        let footer = PanelFooterView(model: model, updateMessage: updateMessage, target: self, buttonFactory: makeActionButton)
+        let footer = PanelFooterView(model: model, updateMessage: updateMessage, target: self)
         footerContainer.addSubview(footerLine)
         footerContainer.addSubview(footer)
         NSLayoutConstraint.activate([
@@ -5999,37 +6061,133 @@ private final class ToolRowView: NSView {
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 }
+/// 底栏单行（2026-11-22）：`[版本胶囊][更新圆点] ←spacer→ [HH:mm 更新] [↻ 数据刷新]`。
+/// 版本胶囊 pillNeutral 直连 requestUpdateCheck、刷新胶囊 accentSubtle 直连 model.refreshItem
+/// 的 target/action（均不经 performAction——胶囊按钮不走 makeActionButton，其 cell.wraps=true
+/// 会破坏单行居中）；icon+文字用 NSTextAttachment 合成单一 attributedTitle（template 附件随
+/// 前景色着色，动态 accent 色随外观即时解析），宽度 = ceil(合成文本.size().width) + 24 保证
+/// 左右 padding 对称、alignment .center 保证内容垂直居中。退出仅存 ⚙ 菜单（⌘Q 由
+/// PanelRootView 兜底），model.lastAttempt 保留但底栏不再显示。
 private final class PanelFooterView: NSView {
-    init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController,
-         buttonFactory: (NSMenuItem, PanelActionButton.Style, String?) -> PanelActionButton) {
+    /// 刷新胶囊单行 attributedTitle：arrow.clockwise 11pt medium template 附件内联 +
+    /// thin space（≈2.4pt，icon-文字间距 ≤ 6pt）+ 文本，前景 accent 12pt medium。
+    /// 在飞态标题「刷新中…」由调用方传入（isEnabled 同步置 false）。
+    static func refreshAttributedTitle(inFlight: Bool) -> NSAttributedString {
+        let text = inFlight ? "刷新中…" : "数据刷新"
+        let attributed = NSMutableAttributedString()
+        let attachment = NSTextAttachment()
+        attachment.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "数据刷新")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+        // template 附件随所在富文本的前景色着色（前景色必须覆盖附件段，否则 icon 退化为黑色模板）；
+        // NSAttributedString(attachment:attributes:) 需 macOS 15，这里用 addAttributes 兼容 macOS 13
+        let iconString = NSMutableAttributedString(attributedString: NSAttributedString(attachment: attachment))
+        iconString.addAttribute(.foregroundColor, value: PanelAccent.codex.color,
+                                range: NSRange(location: 0, length: iconString.length))
+        attributed.append(iconString)
+        attributed.append(NSAttributedString(string: "\u{2009}", attributes: [
+            .foregroundColor: PanelAccent.codex.color]))
+        attributed.append(NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: PanelAccent.codex.color]))
+        // attributedTitle 不吃 button.alignment（NSButtonCell 对富文本按字符串自身段落属性排版，
+        // 缺省 natural=左对齐 → 内容偏左、胶囊左右 padding 不对称），必须显式居中段落
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .center
+        attributed.addAttribute(.paragraphStyle, value: paragraph,
+                                range: NSRange(location: 0, length: attributed.length))
+        return attributed
+    }
+
+    init(model: UsagePanelModel, updateMessage: String?, target: UsagePanelController) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         let root = PanelUI.stack(spacing: 8)
         let meta = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 8)
-        meta.addArrangedSubview(PanelUI.label(model.lastAttempt, size: 11, color: .secondaryLabelColor, wrapping: false))
-        meta.addArrangedSubview(PanelUI.spacer())
-        let version = NSButton(title: model.version, target: target, action: #selector(UsagePanelController.requestUpdateCheck))
+
+        // 版本胶囊（左，pillNeutral 常驻 6%/hover 12%）：短版本号 + monospaced digits
+        let shortVersion = model.version.hasPrefix("版本 ")
+            ? String(model.version.dropFirst("版本 ".count)) : model.version
+        let version = PanelActionButton()
+        version.style = .pillNeutral
+        version.target = target
+        version.action = #selector(UsagePanelController.requestUpdateCheck)
         version.isBordered = false
-        version.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        version.contentTintColor = .secondaryLabelColor
+        version.setButtonType(.momentaryChange)
+        (version.cell as? NSButtonCell)?.highlightsBy = []
+        version.cell?.wraps = false   // 单行硬保证：wrap 布局会把内部 title field 撑出边界、破坏单行居中
+        version.wantsLayer = true
+        version.layer?.cornerRadius = 12
+        version.alignment = .center
+        // attributedTitle 不吃 button.alignment：富文本按字符串自身段落属性排版（缺省左对齐），
+        // 显式居中段落才能保证胶囊左右 padding 对称
+        let versionParagraph = NSMutableParagraphStyle()
+        versionParagraph.alignment = .center
+        version.attributedTitle = NSAttributedString(string: shortVersion, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: versionParagraph])
         version.toolTip = "\(BuildInfo.version) · 点击检查更新"
         version.setAccessibilityLabel("\(model.version)，点击检查更新")
+        version.identifier = NSUserInterfaceItemIdentifier("PanelRole.footer.version")
+        version.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        version.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(version.attributedTitle.size().width) + 24).isActive = true
+        // 更新圆点：钉挂胶囊右上（top/trailing −2，可越界 2pt），有可用更新才显示；
+        // 纯展示不截获点击（PanelActionButton.hitTest 承接整个胶囊区域）
+        let dot = PanelAccentDotView()
+        dot.translatesAutoresizingMaskIntoConstraints = false
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.masksToBounds = true
+        dot.isHidden = model.updateItem == nil
+        version.addSubview(dot)
+        NSLayoutConstraint.activate([
+            dot.widthAnchor.constraint(equalToConstant: 6),
+            dot.heightAnchor.constraint(equalToConstant: 6),
+            dot.topAnchor.constraint(equalTo: version.topAnchor, constant: -2),
+            dot.trailingAnchor.constraint(equalTo: version.trailingAnchor, constant: -2)])
         meta.addArrangedSubview(version)
+        meta.addArrangedSubview(PanelUI.spacer())
+
+        // 更新时间（右二）：7 天额度失败 → 红字「刷新失败」，tooltip 保留完整错误行
+        // （含「最后成功」原文，时间口径不跳变）；成功 → 「HH:mm 更新」；无数据 → 「—」
+        let updatedAt: NSTextField
+        if let errorLine = model.sevenDayErrorLine {
+            updatedAt = PanelUI.label("刷新失败", size: 11, color: .systemRed, wrapping: false)
+            updatedAt.toolTip = errorLine
+        } else if !model.quotaLastOKText.isEmpty {
+            updatedAt = PanelUI.label("\(model.quotaLastOKText) 更新", size: 11, color: .secondaryLabelColor, wrapping: false)
+        } else {
+            updatedAt = PanelUI.label("—", size: 11, color: .secondaryLabelColor, wrapping: false)
+        }
+        updatedAt.identifier = NSUserInterfaceItemIdentifier("PanelRole.footer.updatedAt")
+        meta.addArrangedSubview(updatedAt)
+
+        // 数据刷新胶囊（右一，accentSubtle 18%/hover 28%）：⌘R 快捷键从 item 带过来；
+        // 仅手动刷新在飞时「刷新中…」并禁点（自动 10s 轮询不置位）；失败信号由更新时间红字承担
+        let refresh = PanelActionButton()
+        refresh.style = .accentSubtle
+        refresh.target = model.refreshItem.target
+        refresh.action = model.refreshItem.action
+        refresh.isBordered = false
+        refresh.setButtonType(.momentaryChange)
+        (refresh.cell as? NSButtonCell)?.highlightsBy = []
+        refresh.cell?.wraps = false   // 单行硬保证：同版本胶囊
+        refresh.wantsLayer = true
+        refresh.layer?.cornerRadius = 6
+        refresh.alignment = .center
+        refresh.attributedTitle = Self.refreshAttributedTitle(inFlight: model.refreshInFlight)
+        refresh.isEnabled = !model.refreshInFlight
+        refresh.keyEquivalent = model.refreshItem.keyEquivalent
+        refresh.keyEquivalentModifierMask = model.refreshItem.keyEquivalentModifierMask
+        refresh.identifier = NSUserInterfaceItemIdentifier("PanelRole.footer.refresh")
+        refresh.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        refresh.widthAnchor.constraint(greaterThanOrEqualToConstant: ceil(refresh.attributedTitle.size().width) + 24).isActive = true
+        meta.addArrangedSubview(refresh)
+
         root.addArrangedSubview(meta)
         if let message = updateMessage {
-            let label = PanelUI.label(message, size: 11, color: .secondaryLabelColor)
-            root.addArrangedSubview(label)
+            root.addArrangedSubview(PanelUI.label(message, size: 11, color: .secondaryLabelColor))
         }
-
-        let actions = PanelUI.stack(orientation: .horizontal, alignment: .centerY, spacing: 6)
-        let refresh = buttonFactory(model.refreshItem, .prominent, nil)
-        refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
-        actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(PanelUI.spacer())
-        let quit = buttonFactory(model.quitItem, .plain, nil)
-        quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        actions.addArrangedSubview(quit)
-        root.addArrangedSubview(actions)
         addSubview(root)
         PanelUI.pin(root, to: self)
     }
@@ -6152,6 +6310,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cliTokensLastSuccessAt: Date?
     private var lastAttemptAt = Date()
     private var lastSlowAttemptAt: Date?
+    // 手动刷新在飞位（底栏「刷新中…」状态源）：手动触发可能先排队等待在飞自动轮询
+    // 完成（RefreshGate.queuedManual），在飞窗口跨多个闸门周期，无法从闸门 busy 位直接
+    // 派生（自动轮询同样持有闸门，会误伤「自动不置位」约束），故显式跟踪；
+    // manualRefreshReset 为 20s 兜底，网络悬挂时强制清位，按钮不永久卡死。
+    private var manualRefreshInFlight = false
+    private var manualRefreshReset: DispatchWorkItem?
     // 数据过期阈值：额度 10 分钟、token 统计 30 分钟——超过该时长未成功刷新即在 UI 标 ⚠️
     private let quotaStaleAfter: TimeInterval = 600
     private let tokensStaleAfter: TimeInterval = 1800
@@ -6165,8 +6329,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installPanelHover()
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
-        // ⚙ 菜单退出项（⌘Q）：语义在宿主，preview 计数路径共用（onQuit 内分流）
+        // ⚙ 菜单退出项（⌘Q）与面板窗口 ⌘Q 兜底：语义在宿主，preview 计数路径共用（onQuit 内分流）
         panelController.quitItemHandler = { [weak self] in self?.onQuit() }
+        panelController.onQuitRequest = { [weak self] in self?.onQuit() }
         if visualPreview { configureVisualPreview(); return }
         autoInstallLoginItemIfNeeded()
         setupQuotaHistory()
@@ -6233,11 +6398,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 额度每 10s 刷新；月度和本地扫描按上次尝试时间每 5 分钟刷新。
     private func refresh(manual: Bool = false) {
-        guard refreshGate.begin(manual: manual) else { return }
+        guard refreshGate.begin(manual: manual) else {
+            // 闸门被占（在飞的可能只是自动轮询）：手动请求进入排队，在飞位即刻生效反馈「刷新中…」
+            if manual { setManualRefreshInFlight(true) }
+            return
+        }
+        if manual { setManualRefreshInFlight(true) }
         let now = Date()
         let includeSlow = RefreshSchedule.shouldRunSlow(manual: manual, lastAttempt: lastSlowAttemptAt, now: now)
         if includeSlow { lastSlowAttemptAt = now }
         performRefresh(includeSlow: includeSlow)
+    }
+
+    /// 手动刷新在飞位翻转：置位即重建面板呈现「刷新中…」，重入时先 cancel 旧兜底再重新武装；
+    /// 20s 兜底到点若仍在飞则强制清位（网络悬挂不死锁按钮）。自动 10s 轮询永不置位。
+    private func setManualRefreshInFlight(_ active: Bool) {
+        manualRefreshReset?.cancel()
+        manualRefreshReset = nil
+        let changed = manualRefreshInFlight != active
+        manualRefreshInFlight = active
+        if active {
+            let reset = DispatchWorkItem { [weak self] in
+                guard let self, self.manualRefreshInFlight else { return }
+                self.manualRefreshInFlight = false
+                self.updateUI()
+            }
+            manualRefreshReset = reset
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20, execute: reset)
+        }
+        if changed { updateUI() }
     }
 
     // 本轮所有来源都汇合到一份结果；merged 的每个字段（主线程直写与网络回调）
@@ -6453,6 +6642,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.usage = merged
             self.updateUI()
             if self.refreshGate.finish() { self.performRefresh(includeSlow: true) }
+            // 闸门真正释放才清在飞位；finish 返回 true = 有排队的手动刷新接手，保持置位
+            else { self.setManualRefreshInFlight(false) }
         }
     }
 
@@ -6880,7 +7071,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cache: cacheSection,
             history: historySnapshot,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
-            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), quitItem: item("退出", #selector(onQuit), key: "q")))
+            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"),
+            // 底栏单行化：成功时间（HH:mm，空串=无数据）、手动刷新在飞位、7 天额度失败行
+            // （格式与上方 quota notice 完全同源：失败原因 + 最后成功时间，口径不跳变）
+            quotaLastOKText: lastSevenDaySuccessAt.map { Fmt.time($0) } ?? "",
+            refreshInFlight: manualRefreshInFlight,
+            sevenDayErrorLine: usage.sevenDayError.map {
+                "刷新失败：\($0) · 最后成功 \(lastSevenDaySuccessAt.map { Fmt.dayTime($0) } ?? "--")"
+            }))
     }
 
     private func configureVisualPreview() {
@@ -7724,7 +7922,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func onRefresh() { if visualPreview { previewRefreshCount += 1 } else { refresh(manual: true) } }
+    @objc private func onRefresh() {
+        if visualPreview {
+            previewRefreshCount += 1
+            // 离线预览「刷新中…」按钮态：仅内存置位 0.3s（不触网、不写盘），自愈恢复
+            setManualRefreshInFlight(true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.setManualRefreshInFlight(false)
+            }
+        } else { refresh(manual: true) }
+    }
 
     // 更新检查完成后无条件重建菜单：横幅出现/消失都靠它自愈（刷新周期 ≤10s 也会兜底重建）
     private func checkForUpdate() {
@@ -7949,8 +8156,7 @@ enum KimiOfflineRegression {
                 cache: UsagePanelModel.CacheSection(periods: []),
                 history: QuotaCycleSnapshot.inactive,
                 notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
-                refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")))
+                refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: "")))
             // 隔离真实无障碍状态：显式给定 reduce=false，机器开启「降低透明度」也不影响判定。
             styleController.previewReduceTransparencyOverride = false
             defer {
@@ -8004,8 +8210,7 @@ enum KimiOfflineRegression {
                     cache: UsagePanelModel.CacheSection(periods: []),
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
-                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")),
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: "")),
                     settingsTarget: geometryTarget, settingsAction: geometryAction)
             }
             func headerButtonFrame(plan: String) -> NSRect {
@@ -8077,8 +8282,12 @@ enum KimiOfflineRegression {
             try expect(styleController.solid.isHidden && styleController.effect.isHidden,
                        "liquid glass on modern system did not hide both painted layers")
             try expect(!styleController.arrangedContentViewsForTest.isEmpty, "no content rows available for identity check")
-            try expect(styleController.quitActionButtonForTest?.alignment == .center,
-                       "quit title must stay centered inside its hover background")
+            // 底栏胶囊标题居中（原「退出」按钮居中锁定的延续：版本/刷新胶囊在 hover 底色内居中）
+            let footerPills = descendants(styleController.footerContainerForTest).compactMap { $0 as? PanelActionButton }
+            try expect(footerPills.contains { $0.identifier?.rawValue == "PanelRole.footer.version" }
+                       && footerPills.contains { $0.identifier?.rawValue == "PanelRole.footer.refresh" }
+                       && footerPills.allSatisfy { $0.alignment == .center },
+                       "footer pills missing or title not centered inside hover background")
             let contentBefore = styleController.arrangedContentViewsForTest.map(ObjectIdentifier.init)
             select(styleController, .classicMaterial)
             select(styleController, .solid)
@@ -8148,8 +8357,7 @@ enum KimiOfflineRegression {
                     cache: UsagePanelModel.CacheSection(periods: []),
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
-                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""))
             }
             let skipController = UsagePanelController()
             func pumpPanelQueue() {
@@ -8169,6 +8377,48 @@ enum KimiOfflineRegression {
             pumpPanelQueue()
             try expect(skipController.arrangedContentViewsForTest.map(ObjectIdentifier.init) != skipBaseline,
                        "changed model must rebuild panel content")
+            // (c) 底栏单行化字段进等值比较：任一新字段变化都必须触发重建（比较不得过宽）
+            var okTextVariant = skipFixtureModel(total: "1K")
+            okTextVariant.quotaLastOKText = "14:32"
+            try expect(okTextVariant != skipFixtureModel(total: "1K"),
+                       "footer quota last-OK text must be captured by equality")
+            var inFlightVariant = skipFixtureModel(total: "1K")
+            inFlightVariant.refreshInFlight = true
+            try expect(inFlightVariant != skipFixtureModel(total: "1K"),
+                       "footer refresh-in-flight must be captured by equality")
+            var errorLineVariant = skipFixtureModel(total: "1K")
+            errorLineVariant.sevenDayErrorLine = "刷新失败：x · 最后成功 --"
+            try expect(errorLineVariant != skipFixtureModel(total: "1K"),
+                       "footer seven-day error line must be captured by equality")
+
+            // (d) 底栏单行化：版本胶囊/更新时间/刷新胶囊标识齐备、退出按钮不残留；
+            //     在飞态模型重建后刷新胶囊禁点且标题「刷新中…」
+            func footerButtons(_ controller: UsagePanelController) -> [PanelActionButton] {
+                descendants(controller.footerContainerForTest).compactMap { $0 as? PanelActionButton }
+            }
+            skipController.update(model: skipFixtureModel(total: "1K"), panelIsOpen: false)
+            _ = skipController.rebuildContentForTest(width: 330)
+            let idleFooter = footerButtons(skipController)
+            guard let idleVersion = idleFooter.first(where: { $0.identifier?.rawValue == "PanelRole.footer.version" }),
+                  let idleRefresh = idleFooter.first(where: { $0.identifier?.rawValue == "PanelRole.footer.refresh" }) else {
+                throw Failure(description: "footer version/refresh pill missing: \(idleFooter.map { $0.identifier?.rawValue ?? "?" })")
+            }
+            try expect(idleVersion.isEnabled && idleRefresh.isEnabled,
+                       "footer pills must be enabled when idle")
+            try expect(descendants(skipController.footerContainerForTest).compactMap { $0 as? NSTextField }
+                           .contains { $0.identifier?.rawValue == "PanelRole.footer.updatedAt" },
+                       "footer updatedAt label missing")
+            try expect(!idleFooter.contains { $0.identifier?.rawValue == "PanelRole.footer.quit" },
+                       "footer quit button must be removed (quit lives in ⚙ menu only)")
+            skipController.update(model: inFlightVariant, panelIsOpen: false)
+            _ = skipController.rebuildContentForTest(width: 330)
+            let inFlightFooter = footerButtons(skipController)
+            guard let inFlightRefresh = inFlightFooter.first(where: { $0.identifier?.rawValue == "PanelRole.footer.refresh" }) else {
+                throw Failure(description: "footer refresh pill missing in in-flight rebuild")
+            }
+            try expect(!inFlightRefresh.isEnabled
+                       && inFlightRefresh.attributedTitle.string.contains("刷新中"),
+                       "in-flight refresh pill must be disabled and titled 刷新中…")
 
             // MARK: 额度周期回顾卡片（固定 fixture：顺序 / 单槽几何 / 固定详情 / 短历史等高 / 空态与状态文案）
             try expect(QuotaCycleSnapshot.previewFixture.recordCount >= 13,
@@ -8229,8 +8479,7 @@ enum KimiOfflineRegression {
                     cache: UsagePanelModel.CacheSection(periods: []),
                     history: history,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
-                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
+                    refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""))
             }
             let historyController = UsagePanelController()
             historyController.previewReduceTransparencyOverride = false

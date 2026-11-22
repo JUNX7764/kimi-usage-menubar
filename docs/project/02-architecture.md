@@ -22,7 +22,7 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 S
 | `TokenAggregator` | 汇总 Kimi Work、Kimi Code、ZCode、Proma、Claude Code、Hermes 等本地用量 |
 | `UpdateChecker` | 检查 GitHub Release 和更新资产 |
 | `UpdateProgressController` | 后台更新、进度恢复和错误展示 |
-| `UsagePanelController` | 原生 Popover、额度与模型明细交互、周期浏览状态、卡片布局（`KimiPanelLayout` 显隐/排序）与面板背景样式（纯色/液态玻璃/经典毛玻璃） |
+| `UsagePanelController` | 原生 Popover、额度与模型明细交互、周期浏览状态、卡片布局（`KimiPanelLayout` 显隐/排序）、⚙ 面板设置菜单与面板背景样式（纯色/液态玻璃/经典毛玻璃）；`PanelRootView` 承接面板窗口内 ⌘Q 兜底 |
 | `PanelHover` | 悬停显示状态面板：`PanelHoverGeometry`（inclusive 边缘与 8pt 桥区）、`PanelHoverIntent`（延迟转换 token 簿记）、`panelHoverClickOutcome`（点击决策矩阵）、`PanelHoverPreference`（`panel.hoverOpen.enabled`，缺省开）与 `PanelHoverController`（NSTrackingArea 边界事件驱动，闭包注入可测） |
 | `QuotaCycleHistory` | 7 天额度观测模型、候选/确认状态机、UI 快照与稳定分页 |
 | `QuotaCycleStore` | 加盐凭据作用域、0700/0600 权限、版本化 JSON 与保存节奏 |
@@ -61,13 +61,15 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 ### 面板设置入口与背景样式
 
-头部最右缘「···」按钮 → 统一原生 NSMenu（`卡片显示与排序…` → 原位设置页，`KimiPanelLayout` 显隐/排序经单 key `panelCardLayout.v1` 持久化；`悬停显示状态面板` 开关；`开机自启` 开关；`背景样式` 子菜单：纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
+头部最右缘 `gearshape` ⚙ 按钮（`PanelActionButton`，24×24 圆形 hover 底）→ 统一原生 NSMenu 分组结构（顺序固定 9 项：`外观与布局` 组头（禁用）→ `卡片显示与排序…` → 原位设置页，`KimiPanelLayout` 显隐/排序经单 key `panelCardLayout.v1` 持久化；`背景样式（当前生效样式）` 子菜单：纯色 / 液态玻璃 / 经典毛玻璃，旧系统液态项标题「液态玻璃（需 macOS 26+）」且父标题用降级后实值 → 分隔线 → `通用设置` 组头（禁用）→ `悬停自动展开` 开关 → `开机自启` 开关 → 分隔线 → `退出 KimiUsage` ⌘Q，经 `quitItemHandler` 在宿主执行）→ `PanelBackgroundStyle` → UserDefaults 单 key `panelBackgroundStyle` → `applyBackgroundStyle()` → 背景层 hidden/opacity。
 
 - 缺省与非法值回退 solid；打开、切换、系统无障碍通知（经 `NSWorkspace.shared.notificationCenter` 注册）共用同一应用入口，切换不重建面板内容。
 - solid：`PanelSolidBackgroundView` opacity=1（无历史 0.9 混合）；classicMaterial：仅 `NSVisualEffectView(.popover)`；liquidGlass：两层自绘背景全部隐藏，露出 macOS 26+ 新 SDK 原生 NSPopover chrome，不引入 NSGlassEffectView / NSPanel。卡片底色为 `labelColor@0.035`，描边为 `labelColor@0.09`，无阴影。
 - 旧系统禁用液态菜单项并渲染降级 classicMaterial；「降低透明度」临时强制 solid 且不改写持久化偏好。
 - NSMenu 弹出期间挂起面板 local/global 事件 monitor（避免面板被自己的 monitor 关闭），结束后恢复；主 Popover 保持 transient。
 - 预览回归经 `--visual-preview-background=` / `--visual-preview-backdrop` / `--visual-preview-background-test=` / `--visual-preview-background-menu-test` 走覆盖模式，所有预览路径不写真实 UserDefaults；矩阵/单拍不弹真实 NSMenu，背板只存在于预览进程，合成截图带面板墨水有效性守门。
+- 底栏单行：`[版本胶囊][更新圆点] ←spacer→ [更新时间][数据刷新]`。版本胶囊 `.pillNeutral`、刷新胶囊 `.accentSubtle`（均 `PanelActionButton`，attributedTitle 显式居中段落——富文本不吃 button.alignment；icon+文字 NSTextAttachment 合成单行，icon-文字间距 ≤6pt、内容垂直居中、左右 padding 对称）；更新时间 7 天失败显示红字「刷新失败」并以 tooltip 保留完整错误行（含最后成功时间）；退出按钮已从底栏移除，⌘Q 由面板根容器 `PanelRootView.performKeyEquivalent` 兜底（先收面板再退出，其余按键放行子视图）。
+- 手动刷新在飞位：`manualRefreshInFlight` 仅手动刷新置位（自动 10s 轮询不置位），闸门无排队手动接手才清位，20s DispatchWorkItem 兜底强制清位；在飞时刷新胶囊「刷新中…」并禁点，经 `refreshInFlight` 进面板模型等值比较。
 
 ### 悬停显示状态面板
 
@@ -75,7 +77,7 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 ### 开机自启（LaunchAgent）
 
-真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在「···」面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 先置 optedOut 再删 plist（两步间被杀最坏态收敛为「plist 在 + 标记在」，真值胜出）、ON 清除。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；bootstrap 前以纯函数 `LoginItemDecision.isLaunchdManaged`（XPC_SERVICE_NAME == job label；真机实测 open/Finder 的 LaunchServices 拉起签名为 `application.<bundleid>` 前缀且 ppid 与 agent 拉起同为 1 不可区分，终端直启无该键）判定当前进程是否本 job 托管实例，非托管跳过 bootstrap 防 RunAtLoad 立即 spawn 第二实例双开、plist 留待下次登录生效。失败两种模式分开：plist 写失败 → 下次启动重跑决策自然重试；bootstrap 失败或非托管跳过 → plist 已写入、下次登录 launchd 加载生效。生产启动的自动安装失败仅 NSLog（含 exec 路径；面板未开提示不可见），显式开关失败用面板提示。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
+真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在 ⚙ 面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 先置 optedOut 再删 plist（两步间被杀最坏态收敛为「plist 在 + 标记在」，真值胜出）、ON 清除。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；bootstrap 前以纯函数 `LoginItemDecision.isLaunchdManaged`（XPC_SERVICE_NAME == job label；真机实测 open/Finder 的 LaunchServices 拉起签名为 `application.<bundleid>` 前缀且 ppid 与 agent 拉起同为 1 不可区分，终端直启无该键）判定当前进程是否本 job 托管实例，非托管跳过 bootstrap 防 RunAtLoad 立即 spawn 第二实例双开、plist 留待下次登录生效。失败两种模式分开：plist 写失败 → 下次启动重跑决策自然重试；bootstrap 失败或非托管跳过 → plist 已写入、下次登录 launchd 加载生效。生产启动的自动安装失败仅 NSLog（含 exec 路径；面板未开提示不可见），显式开关失败用面板提示。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
 
 ## 4. 信任边界
 

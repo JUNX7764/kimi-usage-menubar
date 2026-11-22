@@ -2584,7 +2584,7 @@ struct UsagePanelModel: Equatable {
     /// 等值比较（供面板展开期间「无变化跳过重建」使用，L1 半项）。
     /// 模型树全量核查过：嵌套类型均为纯值语义（无 NSObject/NSView/class 字段），
     /// QuotaCycleSnapshot 已是值类型 Equatable；NSMenuItem 实例字段（refreshItem/quitItem，
-    /// 自启开关不在面板模型——唯一入口在「···」面板设置菜单）是唯一的引用字段，
+    /// 自启开关不在面板模型——唯一入口在 ⚙ 面板设置菜单）是唯一的引用字段，
     /// 每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出比较：
     /// refreshItem/quitItem 标题/动作/快捷键恒定，updateItem 以有无代理（更新按钮行显隐）。
     /// volatile 来源核查：lastAttempt 为 HH:mm 分钟粒度、brief 日标签为日粒度——
@@ -2918,7 +2918,7 @@ class PanelCardView: NSView {
 final class PanelHeaderView: NSView {
     /// 标题行右侧「面板设置」按钮（无 target/action 时为 nil）。
     private(set) var panelSettingsButton: NSButton?
-    /// settingsTarget/settingsAction：标题行右侧「···」统一面板设置入口（生产由 UsagePanelController 注入）。
+    /// settingsTarget/settingsAction：标题行右侧 ⚙ 统一面板设置入口（生产由 UsagePanelController 注入）。
     init(model: UsagePanelModel, settingsTarget: AnyObject? = nil, settingsAction: Selector? = nil) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
@@ -2955,12 +2955,22 @@ final class PanelHeaderView: NSView {
         row.addArrangedSubview(titles)
         row.addArrangedSubview(PanelUI.spacer())
         if let settingsTarget, let settingsAction {
-            let settingsImage = NSImage(systemSymbolName: "ellipsis",
-                                        accessibilityDescription: "面板设置")?
-                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular))
-            let settingsButton = NSButton(image: settingsImage ?? NSImage(), target: settingsTarget, action: settingsAction)
+            // 右上角 ⚙ 设置入口（PanelActionButton 自带 hover 底）：image-only、24×24 +
+            // cornerRadius 12 = 圆形 hover 底。target/action 直连 showPanelSettingsMenu，
+            // 不经 performAction（menuItem 为 nil 的按钮走按钮自身 target/action，见其兜底）。
+            let settingsButton = PanelActionButton()
             settingsButton.isBordered = false
+            settingsButton.setButtonType(.momentaryChange)
+            (settingsButton.cell as? NSButtonCell)?.highlightsBy = []
+            settingsButton.image = NSImage(systemSymbolName: "gearshape",
+                                           accessibilityDescription: "面板设置")?
+                .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .medium))
+            settingsButton.imagePosition = .imageOnly
             settingsButton.contentTintColor = .secondaryLabelColor
+            settingsButton.target = settingsTarget
+            settingsButton.action = settingsAction
+            settingsButton.wantsLayer = true
+            settingsButton.layer?.cornerRadius = 12
             settingsButton.toolTip = "面板设置"
             settingsButton.setAccessibilityLabel("面板设置")
             settingsButton.widthAnchor.constraint(equalToConstant: 24).isActive = true
@@ -3172,10 +3182,13 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     /// PanelHoverController）；未注入时按偏好存储默认（开启）展示。
     var hoverPanelMenuStateProvider: (() -> Bool)?
     var hoverPanelToggleHandler: (() -> Void)?
-    /// 开机自启（··· 菜单）：勾选态与翻转都委托宿主——plist 是真值、LaunchAgent 操作
+    /// 开机自启（⚙ 设置菜单）：勾选态与翻转都委托宿主——plist 是真值、LaunchAgent 操作
     /// 与显式关闭记忆都在宿主；未注入时按未勾选展示（真值只能在宿主解析）。
     var loginItemMenuStateProvider: (() -> Bool)?
     var loginItemToggleHandler: (() -> Void)?
+    /// 退出 KimiUsage（⚙ 设置菜单 ⌘Q）：语义在宿主（NSApp.terminate / preview 计数）；
+    /// 未注入时菜单项点击静默（--self-test 的隔离控制器不退出进程）。
+    var quitItemHandler: (() -> Void)?
     // effect/solid 暴露为 internal：--self-test 断言背景层 hidden/opacity 用，生产路径仍只经 applyBackgroundStyle() 驱动。
     let effect = NSVisualEffectView()
     let solid = PanelSolidBackgroundView()
@@ -3216,7 +3229,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     // MARK: 卡片布局（KimiPanelLayout，PanelCustomization.swift）
-    // 卡片显隐与纵向排序；「···」→ 卡片显示与排序… 原位编辑。隐藏卡数据照常获取，
+    // 卡片显隐与纵向排序；⚙ → 卡片显示与排序… 原位编辑。隐藏卡数据照常获取，
     // 折叠状态/每日选中不受影响。持久化与背景样式同款：预览与 --self-test 不写真实偏好。
     private(set) var panelLayout = KimiPanelLayoutStore.load()
     private(set) var showingCardSettings = false
@@ -3491,7 +3504,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private func makeAllHiddenPlaceholder() -> NSView {
         let content = PanelUI.stack(spacing: 7)
         PanelUI.addFullWidth(PanelUI.label("所有卡片已隐藏", size: 13, weight: .semibold), to: content)
-        PanelUI.addFullWidth(PanelUI.label("数据仍在后台正常获取与统计；可在右上角「···」→ 卡片显示与排序中重新开启。",
+        PanelUI.addFullWidth(PanelUI.label("数据仍在后台正常获取与统计；可在右上角 ⚙ 设置菜单 → 卡片显示与排序中重新开启。",
                                            size: 11, color: .secondaryLabelColor), to: content)
         let restore = NSButton(title: "恢复默认卡片布局", target: self, action: #selector(restoreDefaultCardLayout))
         restore.setAccessibilityLabel("恢复默认卡片布局")
@@ -3860,7 +3873,15 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func performAction(_ sender: PanelActionButton) {
-        guard let item = sender.menuItem, let action = item.action else { return }
+        // menuItem 为 nil 的按钮（⚙ 头部设置入口等直连 target/action 的用法）回退走按钮
+        // 自身 target/action：否则该类按钮经 performAction 路径时点击会静默无效。
+        // 回退排除 action == performAction 自身，防漏配 menuItem 的按钮无限递归。
+        guard let item = sender.menuItem, let action = item.action else {
+            guard let target = sender.target, let action = sender.action,
+                  action != #selector(performAction(_:)) else { return }
+            _ = NSApp.sendAction(action, to: target, from: sender)
+            return
+        }
         // 只有「退出」先收起面板；刷新等保持面板打开，动作结果就地可见
         if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
@@ -4934,16 +4955,35 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return menu
     }
 
-    /// 统一「···」面板设置菜单：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
-    /// （选择仍即时生效）。离线测试直接断言本返回值，不弹出真实 NSMenu。
+    /// ⚙ 面板设置菜单（分组结构）：外观与布局（卡片设置入口 + 背景样式子菜单，父标题带当前
+    /// 生效样式）+ 通用设置（悬停自动展开 + 开机自启开关）+ 退出 KimiUsage（⌘Q）。
+    /// 禁用组头仅作分区导航（无 action、isEnabled=false）；退出语义经 quitItemHandler 在宿主
+    /// 执行（NSApp.terminate / preview 计数）。离线测试直接断言本返回值，不弹出真实 NSMenu。
     func makePanelSettingsMenu() -> NSMenu {
+        func groupHeader(_ title: String) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            item.attributedTitle = NSAttributedString(string: title, attributes: [
+                .font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+            return item
+        }
         let menu = NSMenu()
         menu.autoenablesItems = false
+        menu.addItem(groupHeader("外观与布局"))
         let cards = NSMenuItem(title: "卡片显示与排序…", action: #selector(showCardSettings), keyEquivalent: "")
         cards.target = self
         cards.isEnabled = !showingCardSettings   // 设置页打开中禁用入口，避免重复进入
         menu.addItem(cards)
-        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        // 父标题带当前生效样式：liquidGlass 在非 macOS 26 渲染降级 classicMaterial，标题用降级后实值
+        let active = previewBackgroundOverride ?? storedBackgroundStyle
+        let effective: PanelBackgroundStyle =
+            (active == .liquidGlass && !Self.isLiquidGlassSupported) ? .classicMaterial : active
+        let background = NSMenuItem(title: "背景样式（\(effective.menuTitle)）", action: nil, keyEquivalent: "")
+        background.submenu = makeBackgroundStyleMenu()
+        menu.addItem(background)
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(groupHeader("通用设置"))
+        let hover = NSMenuItem(title: "悬停自动展开", action: #selector(toggleHoverPanel), keyEquivalent: "")
         hover.target = self
         hover.state = (hoverPanelMenuStateProvider?() ?? PanelHoverPreference.load()) ? .on : .off
         menu.addItem(hover)
@@ -4951,16 +4991,22 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         login.target = self
         login.state = (loginItemMenuStateProvider?() ?? false) ? .on : .off
         menu.addItem(login)
-        let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
-        background.submenu = makeBackgroundStyleMenu()
-        menu.addItem(background)
+        menu.addItem(NSMenuItem.separator())
+        let quit = NSMenuItem(title: "退出 KimiUsage", action: #selector(quitFromMenu), keyEquivalent: "q")
+        quit.target = self
+        quit.keyEquivalentModifierMask = .command
+        menu.addItem(quit)
         return menu
     }
 
-    /// 「···」菜单悬停开关动作：翻转逻辑在宿主（控制器为准 + 生产落盘），控制器只承接菜单事件。
+    /// ⚙ 菜单退出项动作：退出语义在宿主（onQuit → NSApp.terminate / preview 计数），
+    /// 控制器只承接菜单事件；未注入时静默（--self-test 构造的隔离控制器不退出进程）。
+    @objc fileprivate func quitFromMenu() { quitItemHandler?() }
+
+    /// ⚙ 菜单悬停开关动作：翻转逻辑在宿主（控制器为准 + 生产落盘），控制器只承接菜单事件。
     @objc private func toggleHoverPanel() { hoverPanelToggleHandler?() }
 
-    /// 「···」菜单自启开关动作：翻转逻辑在宿主（plist 真值 + opt-out 记忆 + launchctl），
+    /// ⚙ 菜单自启开关动作：翻转逻辑在宿主（plist 真值 + opt-out 记忆 + launchctl），
     /// 控制器只承接菜单事件；面板保持打开。
     @objc private func toggleLoginItem() { loginItemToggleHandler?() }
 
@@ -4979,7 +5025,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     @objc func showCardSettings() {
         showingCardSettings = true
         refreshPanelLayout()
-        // 焦点接管（GLM 实测坑）：否则焦点残留「···」按钮，Space 会再弹菜单，
+        // 焦点接管（GLM 实测坑）：否则焦点残留 ⚙ 设置按钮，Space 会再弹菜单，
         // 菜单跟踪期间 transient popover 失去 key 被关闭。
         if let editor = currentCardSettingsEditor {
             contentController.view.window?.makeFirstResponder(editor.initialKeyView)
@@ -6119,6 +6165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installPanelHover()
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
+        // ⚙ 菜单退出项（⌘Q）：语义在宿主，preview 计数路径共用（onQuit 内分流）
+        panelController.quitItemHandler = { [weak self] in self?.onQuit() }
         if visualPreview { configureVisualPreview(); return }
         autoInstallLoginItemIfNeeded()
         setupQuotaHistory()
@@ -6436,10 +6484,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.panelPresentedByHover = false
             self?.panelHoverController?.panelDidClose()
         }
-        // 「···」菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
+        // ⚙ 菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
         panelController.hoverPanelMenuStateProvider = { PanelHoverPreference.load() }
         panelController.hoverPanelToggleHandler = { [weak self] in self?.toggleHoverPanel() }
-        // 「···」菜单自启项：勾选态与 plist 真值同源（preview 一律未勾选），
+        // ⚙ 菜单自启项：勾选态与 plist 真值同源（preview 一律未勾选），
         // 翻转走 onToggleLogin（plist 真值 + opt-out 记忆）；launchctl 操作绝不进测试进程
         panelController.loginItemMenuStateProvider = { [weak self] in
             guard let self else { return false }
@@ -6486,7 +6534,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelHoverController?.installPanelTrackingIfNeeded()
     }
 
-    /// 「···」菜单开关翻转：运行时状态以控制器为准；生产同步落盘偏好，
+    /// ⚙ 菜单悬停开关翻转：运行时状态以控制器为准；生产同步落盘偏好，
     /// 所有 --visual-preview* 进程不写真实 UserDefaults（previewSuppressesPersistence 已统一置位）。
     private func toggleHoverPanel() {
         let next = !(panelHoverController?.isEnabled ?? PanelHoverPreference.load())
@@ -6568,6 +6616,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
         barThemeDark = isDark(appearance)
         statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+        if ProcessInfo.processInfo.arguments.contains("--visual-preview") && !ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--visual-preview-background-test") } {
+            statusItem.button?.image = NSImage(systemSymbolName: "chart.bar.fill", accessibilityDescription: nil)
+        }
         statusItem.button?.title = ""
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Kimi 余额 · 5H成功 \(Fmt.lastOK(lastFiveHourSuccessAt)) · 7D成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
@@ -7012,7 +7063,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let sample = "新增\n• 支持切换面板背景样式\n\n优化\n• 改善深色模式下的文字显示\n\n修复\n• 修复部分情况下的面板闪烁"
             panelController.showUpdateConfirmation(tag: "v1.7.8", notes: args.contains("--visual-preview-update-notes-long") ? Array(repeating: sample, count: 8).joined(separator: "\n") : sample)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self = self, let button = self.statusItem.button else { return }
             // 背景矩阵回归以子进程单拍方式运行（每个组合独立进程，避免中途改外观后
             // 系统胶囊窗口内容失效），父进程不需要弹出自己的面板。
@@ -7202,7 +7253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 真实 NSMenu 事件烟测（--visual-preview-background-menu-test，preview-only）：
-    /// 经头部真实「···」按钮路径弹出统一面板设置菜单（popUp 同步 tracking），用 .common 模式
+    /// 经头部真实 ⚙ 按钮路径弹出统一面板设置菜单（popUp 同步 tracking），用 .common 模式
     /// Timer（含菜单跟踪 runloop 模式）延时经「背景样式」子菜单 `performActionForItem(at:)`
     /// 选择并 `cancelTracking` 结束；断言选择已应用、主 transient popover 全程 isOpen、菜单返回后
     /// local/global monitor 已恢复、真实 UserDefaults 未被写入。不用只构造 NSMenuItem 直调 action 的假路径。
@@ -7216,7 +7267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let defaultsKey = PanelBackgroundStyle.defaultsKey
         let storedBefore = UserDefaults.standard.string(forKey: defaultsKey)
-        // 统一菜单：0=卡片显示与排序… 1=悬停显示状态面板 2=开机自启 3=背景样式（子菜单）；
+        // 统一菜单（分组结构）：0=外观与布局（组头）1=卡片显示与排序… 2=背景样式（子菜单）
+        // 3=分隔线 4=通用设置（组头）5=悬停自动展开 6=开机自启 7=分隔线 8=退出 KimiUsage；
         // 子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
         let plan: [(index: Int, style: PanelBackgroundStyle)] = [(1, .liquidGlass), (2, .classicMaterial)]
         var step = 0
@@ -7227,9 +7279,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fputs("KimiUsage background menu test: FAIL: panel settings menu was not tracking\n", stderr)
                     exit(1)
                 }
-                guard menu.items.count == 4, menu.items[0].title == "卡片显示与排序…",
-                      menu.items[1].title == "悬停显示状态面板", menu.items[2].title == "开机自启",
-                      menu.items[3].title == "背景样式", let submenu = menu.items[3].submenu else {
+                guard menu.items.count == 9,
+                      menu.items[0].title == "外观与布局", !menu.items[0].isEnabled,
+                      menu.items[1].title == "卡片显示与排序…",
+                      menu.items[2].title.hasPrefix("背景样式（"), let submenu = menu.items[2].submenu,
+                      menu.items[4].title == "通用设置", !menu.items[4].isEnabled,
+                      menu.items[5].title == "悬停自动展开", menu.items[6].title == "开机自启",
+                      menu.items[7].title.isEmpty, menu.items[8].title == "退出 KimiUsage" else {
                     fputs("KimiUsage background menu test: FAIL: panel menu structure changed\n", stderr)
                     exit(1)
                 }
@@ -7385,11 +7441,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         togglePanel()
         expectShown(false, "close-after-panel-pin")
 
-        // 8. 「···」菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）。
+        // 8. ⚙ 设置菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）。
         //    第二次翻转 setEnabled(true) 会装回真实图标 tracking：步末必须再次断离，
         //    否则第 9 步的合成驻留会被真实光标划过菜单栏触发 iconExited 取消而假 FAIL。
         let menu = panelController.makePanelSettingsMenu()
-        let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
+        let hoverItem = menu.items.first { $0.title == "悬停自动展开" }
         guard let hoverItem else { fail("settings menu missing hover item") }
         let expectedState: NSControl.StateValue = PanelHoverPreference.load() ? .on : .off
         guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
@@ -7575,7 +7631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installLoginItem(notifyPanel: false)
     }
 
-    /// 显式开关自启（唯一入口：「···」面板设置菜单，经 loginItemToggleHandler 闭包注入）。
+    /// 显式开关自启（唯一入口：⚙ 面板设置菜单，经 loginItemToggleHandler 闭包注入）。
     /// 显式 OFF 置 login.item.optedOut（自动安装此后不再重装），ON 清除标记恢复默认开语义；
     /// plist 真值优先于标记（判定在 LoginItemDecision），标记不一致无副作用。
     @objc private func onToggleLogin() {
@@ -7963,7 +8019,7 @@ enum KimiOfflineRegression {
             let longPlanFrame = headerButtonFrame(plan: "ALLEGRETTO")
             try expect(!shortPlanFrame.isEmpty, "header panel settings button missing")
             // 名义 24×24；NSButton 内部内容约束会随符号高度微调实际 frame（paintpalette ~24.5×30.5，
-            // ellipsis ~24×20.5）——点击热区视觉等价，断言用容差守住下限，避免对引擎消解细节过拟合。
+            // gearshape ~24×23）——点击热区视觉等价，断言用容差守住下限，避免对引擎消解细节过拟合。
             try expect(abs(NSMaxX(shortPlanFrame) - 330) < 1,
                        "settings button not pinned to header trailing: \(shortPlanFrame)")
             try expect(shortPlanFrame.width >= 22 && shortPlanFrame.width <= 25.5
@@ -8328,7 +8384,7 @@ enum KimiOfflineRegression {
             try expect(failedTexts.contains { $0.contains("历史未保存") },
                        "persistence failure must surface 历史未保存")
 
-            // ===== 卡片布局与「···」统一面板设置（PanelCustomization.swift）=====
+            // ===== 卡片布局与 ⚙ 统一面板设置（PanelCustomization.swift）=====
             // 布局模型：默认序、显隐、排序、JSON 往返、损坏回退、旧配置迁移（新卡按默认相对位置插入）。
             // 内存 backend 已在面板区段起点启用（self-test 全程不读真实用户布局）。
             try expect(KimiPanelLayout.default.order == KimiPanelCardID.allCases
@@ -8364,7 +8420,8 @@ enum KimiOfflineRegression {
                        "panel layout store round trip failed")
             try expect(KimiPanelLayoutStore.hasValueForTest, "panel layout store did not persist value")
 
-            // 统一「···」菜单结构：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
+            // 统一 ⚙ 菜单结构（分组）：外观与布局（组头）+ 卡片设置 + 背景样式子菜单（父标题带
+            // 当前生效样式）+ 通用设置（组头）+ 悬停自动展开 + 开机自启 + 退出 KimiUsage（⌘Q）
             // 悬停偏好启用内存 backend：菜单勾选态断言不读写真实偏好，缺省态（无存储值）确定为开
             let endHoverBackend = PanelHoverPreference.beginMemoryOverride()
             defer { endHoverBackend() }
@@ -8373,21 +8430,30 @@ enum KimiOfflineRegression {
             settingsController.previewReduceTransparencyOverride = false
             settingsController.previewSuppressesPersistence = true
             let panelMenu = settingsController.makePanelSettingsMenu()
-            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "开机自启", "背景样式"],
+            try expect(panelMenu.items.map(\.title) == ["外观与布局", "卡片显示与排序…", "背景样式（纯色）", "",
+                                                        "通用设置", "悬停自动展开", "开机自启", "", "退出 KimiUsage"],
                        "panel settings menu structure changed: \(panelMenu.items.map(\.title))")
-            try expect(panelMenu.items[0].target != nil && panelMenu.items[0].action != nil
-                       && panelMenu.items[0].isEnabled,
+            try expect(!panelMenu.items[0].isEnabled && panelMenu.items[0].action == nil
+                       && !panelMenu.items[4].isEnabled && panelMenu.items[4].action == nil,
+                       "group headers must be disabled with no action")
+            try expect(panelMenu.items[1].target != nil && panelMenu.items[1].action != nil
+                       && panelMenu.items[1].isEnabled,
                        "card settings entry missing target/action or wrongly disabled")
-            try expect(panelMenu.items[1].target != nil && panelMenu.items[1].action != nil,
-                       "hover toggle missing target/action")
-            try expect(panelMenu.items[1].state == .on,
-                       "hover toggle must default to on (no stored value)")
-            try expect(panelMenu.items[2].target != nil && panelMenu.items[2].action != nil,
-                       "login toggle missing target/action")
-            try expect(panelMenu.items[2].state == .off,
-                       "login toggle must default to off (no provider on isolated controller)")
-            try expect(panelMenu.items[3].submenu?.items.count == PanelBackgroundStyle.allCases.count,
+            try expect(panelMenu.items[2].submenu?.items.count == PanelBackgroundStyle.allCases.count,
                        "background submenu lost styles")
+            try expect(panelMenu.items[5].target != nil && panelMenu.items[5].action != nil,
+                       "hover toggle missing target/action")
+            try expect(panelMenu.items[5].state == .on,
+                       "hover toggle must default to on (no stored value)")
+            try expect(panelMenu.items[6].target != nil && panelMenu.items[6].action != nil,
+                       "login toggle missing target/action")
+            try expect(panelMenu.items[6].state == .off,
+                       "login toggle must default to off (no provider on isolated controller)")
+            try expect(panelMenu.items[8].target === settingsController
+                       && panelMenu.items[8].action == #selector(UsagePanelController.quitFromMenu)
+                       && panelMenu.items[8].keyEquivalent == "q"
+                       && panelMenu.items[8].keyEquivalentModifierMask == .command,
+                       "menu quit item wiring/keyEquivalent changed")
 
             // 原位设置页（离线可断言部分）：编辑器结构、排序按钮、进出与布局应用。
             // 复选框显隐与完成按钮的真实点击在 --visual-preview-card-settings-test（真实窗口）覆盖；

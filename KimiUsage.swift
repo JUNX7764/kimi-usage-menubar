@@ -2579,15 +2579,14 @@ struct UsagePanelModel: Equatable {
     var lastAttempt: String
     var version: String
     var refreshItem: NSMenuItem
-    var loginItem: NSMenuItem
     var quitItem: NSMenuItem
 
     /// 等值比较（供面板展开期间「无变化跳过重建」使用，L1 半项）。
     /// 模型树全量核查过：嵌套类型均为纯值语义（无 NSObject/NSView/class 字段），
-    /// QuotaCycleSnapshot 已是值类型 Equatable；四个 NSMenuItem 实例字段是唯一的
-    /// 引用字段，每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出
-    /// 比较、以显示相关代理值参与：updateItem 有无（更新按钮行显隐）、
-    /// loginItem.state（自启勾选态）；refreshItem/quitItem 标题/动作/快捷键恒定。
+    /// QuotaCycleSnapshot 已是值类型 Equatable；NSMenuItem 实例字段（refreshItem/quitItem，
+    /// 自启开关不在面板模型——唯一入口在「···」面板设置菜单）是唯一的引用字段，
+    /// 每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出比较：
+    /// refreshItem/quitItem 标题/动作/快捷键恒定，updateItem 以有无代理（更新按钮行显隐）。
     /// volatile 来源核查：lastAttempt 为 HH:mm 分钟粒度、brief 日标签为日粒度——
     /// 按各自展示精度参与比较，跨分钟/跨日内容真变时重建，显示语义不变；
     /// 其余文本/数值均来自既有存储快照，轮内稳定。
@@ -2605,7 +2604,6 @@ struct UsagePanelModel: Equatable {
             && lhs.notices == rhs.notices
             && lhs.lastAttempt == rhs.lastAttempt
             && lhs.version == rhs.version
-            && lhs.loginItem.state == rhs.loginItem.state
     }
 }
 
@@ -2838,7 +2836,7 @@ final class PanelSolidBackgroundView: NSView {
 
 final class PanelActionButton: NSButton {
     enum Style {
-        case plain, prominent, checkbox
+        case plain, prominent
     }
 
     var menuItem: NSMenuItem?
@@ -2856,8 +2854,6 @@ final class PanelActionButton: NSButton {
                 layer?.backgroundColor = (hovered
                     ? NSColor.labelColor.withAlphaComponent(0.08)
                     : NSColor.clear).cgColor
-            case .checkbox:
-                layer?.backgroundColor = NSColor.clear.cgColor
             }
         }
     }
@@ -3841,7 +3837,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.wantsLayer = true
         button.layer?.cornerRadius = 6
-        button.alignment = style == .checkbox ? .left : .center
+        button.alignment = .center
         button.keyEquivalent = item.keyEquivalent
         button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
@@ -3854,25 +3850,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
             .foregroundColor: textColor
         ])
-        if style == .checkbox {
-            button.setButtonType(.switch)
-            button.isBordered = false
-            button.state = item.state
-            button.contentTintColor = PanelAccent.codex.color
-        } else {
-            button.setButtonType(.momentaryChange)
-            button.isBordered = false
-            (button.cell as? NSButtonCell)?.highlightsBy = []
-            button.cell?.wraps = true
-            button.cell?.lineBreakMode = .byWordWrapping
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
-        }
+        button.setButtonType(.momentaryChange)
+        button.isBordered = false
+        (button.cell as? NSButtonCell)?.highlightsBy = []
+        button.cell?.wraps = true
+        button.cell?.lineBreakMode = .byWordWrapping
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
         return button
     }
 
     @objc private func performAction(_ sender: PanelActionButton) {
         guard let item = sender.menuItem, let action = item.action else { return }
-        // 只有「退出」先收起面板；刷新/开机自启等保持面板打开，动作结果就地可见
+        // 只有「退出」先收起面板；刷新等保持面板打开，动作结果就地可见
         if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
             _ = NSApp.sendAction(action, to: item.target, from: item)
@@ -5990,7 +5979,6 @@ private final class PanelFooterView: NSView {
         let refresh = buttonFactory(model.refreshItem, .prominent, nil)
         refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
         actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(buttonFactory(model.loginItem, .checkbox, nil))
         actions.addArrangedSubview(PanelUI.spacer())
         let quit = buttonFactory(model.quitItem, .plain, nil)
         quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
@@ -6706,8 +6694,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         func item(_ title: String, _ selector: Selector, key: String = "") -> NSMenuItem {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: key); item.target = self; return item
         }
-        let login = item("开机自启", #selector(onToggleLogin))
-        login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
         // v1.5 用量洞察：用量情况（合并 Work + API 客户端）+ 用量简析 + 工具明细，同一扫描快照
         // 覆盖口径：首轮扫描未完成时一切缺失日都不可证实，日图显示缺口、比较显示数据不足
@@ -6828,7 +6814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cache: cacheSection,
             history: historySnapshot,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
-            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
+            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), quitItem: item("退出", #selector(onQuit), key: "q")))
     }
 
     private func configureVisualPreview() {
@@ -7571,7 +7557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installLoginItem()
     }
 
-    /// 显式开关自启（三入口共用：状态菜单勾选、面板底部勾选、··· 面板设置菜单）。
+    /// 显式开关自启（唯一入口：「···」面板设置菜单，经 loginItemToggleHandler 闭包注入）。
     /// 显式 OFF 置 login.item.optedOut（自动安装此后不再重装），ON 清除标记恢复默认开语义；
     /// plist 真值优先于标记（判定在 LoginItemDecision），标记不一致无副作用。
     @objc private func onToggleLogin() {
@@ -7872,7 +7858,6 @@ enum KimiOfflineRegression {
                 history: QuotaCycleSnapshot.inactive,
                 notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                 refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                 quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")))
             // 隔离真实无障碍状态：显式给定 reduce=false，机器开启「降低透明度」也不影响判定。
             styleController.previewReduceTransparencyOverride = false
@@ -7928,7 +7913,6 @@ enum KimiOfflineRegression {
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")),
                     settingsTarget: geometryTarget, settingsAction: geometryAction)
             }
@@ -8073,7 +8057,6 @@ enum KimiOfflineRegression {
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
             }
             let skipController = UsagePanelController()
@@ -8155,7 +8138,6 @@ enum KimiOfflineRegression {
                     history: history,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
             }
             let historyController = UsagePanelController()

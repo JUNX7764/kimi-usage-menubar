@@ -2579,15 +2579,14 @@ struct UsagePanelModel: Equatable {
     var lastAttempt: String
     var version: String
     var refreshItem: NSMenuItem
-    var loginItem: NSMenuItem
     var quitItem: NSMenuItem
 
     /// 等值比较（供面板展开期间「无变化跳过重建」使用，L1 半项）。
     /// 模型树全量核查过：嵌套类型均为纯值语义（无 NSObject/NSView/class 字段），
-    /// QuotaCycleSnapshot 已是值类型 Equatable；四个 NSMenuItem 实例字段是唯一的
-    /// 引用字段，每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出
-    /// 比较、以显示相关代理值参与：updateItem 有无（更新按钮行显隐）、
-    /// loginItem.state（自启勾选态）；refreshItem/quitItem 标题/动作/快捷键恒定。
+    /// QuotaCycleSnapshot 已是值类型 Equatable；NSMenuItem 实例字段（refreshItem/quitItem，
+    /// 自启开关不在面板模型——唯一入口在「···」面板设置菜单）是唯一的引用字段，
+    /// 每轮重建都是新实例，指针比较永不等（CodexUsage 教训），故排除出比较：
+    /// refreshItem/quitItem 标题/动作/快捷键恒定，updateItem 以有无代理（更新按钮行显隐）。
     /// volatile 来源核查：lastAttempt 为 HH:mm 分钟粒度、brief 日标签为日粒度——
     /// 按各自展示精度参与比较，跨分钟/跨日内容真变时重建，显示语义不变；
     /// 其余文本/数值均来自既有存储快照，轮内稳定。
@@ -2605,7 +2604,6 @@ struct UsagePanelModel: Equatable {
             && lhs.notices == rhs.notices
             && lhs.lastAttempt == rhs.lastAttempt
             && lhs.version == rhs.version
-            && lhs.loginItem.state == rhs.loginItem.state
     }
 }
 
@@ -2838,7 +2836,7 @@ final class PanelSolidBackgroundView: NSView {
 
 final class PanelActionButton: NSButton {
     enum Style {
-        case plain, prominent, checkbox
+        case plain, prominent
     }
 
     var menuItem: NSMenuItem?
@@ -2856,8 +2854,6 @@ final class PanelActionButton: NSButton {
                 layer?.backgroundColor = (hovered
                     ? NSColor.labelColor.withAlphaComponent(0.08)
                     : NSColor.clear).cgColor
-            case .checkbox:
-                layer?.backgroundColor = NSColor.clear.cgColor
             }
         }
     }
@@ -3169,6 +3165,17 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
 
     private let popover = NSPopover()
     private let contentController = NSViewController()
+    /// 悬停显示状态面板（Sources/PanelHover.swift）：面板体内首次点击回调（宿主复位 hover
+    /// 呈现标记，转固定常开语义）；图标点击不经此回调，由宿主 togglePanel 分派。
+    var onPanelBodyClick: (() -> Void)?
+    /// 悬停显示状态面板：菜单勾选态读取与运行时翻转都委托宿主（AppDelegate 持有
+    /// PanelHoverController）；未注入时按偏好存储默认（开启）展示。
+    var hoverPanelMenuStateProvider: (() -> Bool)?
+    var hoverPanelToggleHandler: (() -> Void)?
+    /// 开机自启（··· 菜单）：勾选态与翻转都委托宿主——plist 是真值、LaunchAgent 操作
+    /// 与显式关闭记忆都在宿主；未注入时按未勾选展示（真值只能在宿主解析）。
+    var loginItemMenuStateProvider: (() -> Bool)?
+    var loginItemToggleHandler: (() -> Void)?
     // effect/solid 暴露为 internal：--self-test 断言背景层 hidden/opacity 用，生产路径仍只经 applyBackgroundStyle() 驱动。
     let effect = NSVisualEffectView()
     let solid = PanelSolidBackgroundView()
@@ -3184,6 +3191,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
     private var localMonitor: Any?
     private var globalMonitor: Any?
     private weak var anchorButton: NSStatusBarButton?
+    /// 悬停显示状态面板用：面板内容视图（跨开合复用，NSTrackingArea 装一次即可）。
+    var hoverPanelView: NSView { contentController.view }
+    /// 悬停显示状态面板用：popover 窗口屏幕矩形（关闭时为 nil）。
+    var panelWindowFrameForHover: NSRect? { contentController.view.window?.frame }
     private static let maximumWidth: CGFloat = 330
     private var panelWidth = UsagePanelController.maximumWidth
 
@@ -3257,7 +3268,10 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         contentController.view = NSView(frame: NSRect(x: 0, y: 0, width: panelWidth, height: 320))
         configureContent()
         popover.contentViewController = contentController
-        popover.behavior = .transient
+        // 仅 --visual-preview-hover-test 离线回归进程改用 applicationDefined：避免测试期间的
+        // 真实鼠标点击（用户正在用机）把 transient Popover 关掉造成时序断言误报；生产与普通预览不变
+        popover.behavior = CommandLine.arguments.contains("--visual-preview-hover-test")
+            ? .applicationDefined : .transient
         popover.animates = false
         popover.delegate = self
         applyBackgroundStyle()
@@ -3823,7 +3837,7 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.wantsLayer = true
         button.layer?.cornerRadius = 6
-        button.alignment = style == .checkbox ? .left : .center
+        button.alignment = .center
         button.keyEquivalent = item.keyEquivalent
         button.keyEquivalentModifierMask = item.keyEquivalentModifierMask
         button.toolTip = item.toolTip
@@ -3836,25 +3850,18 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
             .font: NSFont.systemFont(ofSize: 12, weight: prominent ? .semibold : .regular),
             .foregroundColor: textColor
         ])
-        if style == .checkbox {
-            button.setButtonType(.switch)
-            button.isBordered = false
-            button.state = item.state
-            button.contentTintColor = PanelAccent.codex.color
-        } else {
-            button.setButtonType(.momentaryChange)
-            button.isBordered = false
-            (button.cell as? NSButtonCell)?.highlightsBy = []
-            button.cell?.wraps = true
-            button.cell?.lineBreakMode = .byWordWrapping
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
-        }
+        button.setButtonType(.momentaryChange)
+        button.isBordered = false
+        (button.cell as? NSButtonCell)?.highlightsBy = []
+        button.cell?.wraps = true
+        button.cell?.lineBreakMode = .byWordWrapping
+        button.heightAnchor.constraint(greaterThanOrEqualToConstant: style == .plain ? 26 : 30).isActive = true
         return button
     }
 
     @objc private func performAction(_ sender: PanelActionButton) {
         guard let item = sender.menuItem, let action = item.action else { return }
-        // 只有「退出」先收起面板；刷新/开机自启等保持面板打开，动作结果就地可见
+        // 只有「退出」先收起面板；刷新等保持面板打开，动作结果就地可见
         if action == #selector(AppDelegate.onQuit) { close() }
         DispatchQueue.main.async {
             _ = NSApp.sendAction(action, to: item.target, from: item)
@@ -4812,7 +4819,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         if isOpen { close() } else { show(anchoredTo: button) }
     }
 
-    private func show(anchoredTo button: NSStatusBarButton) {
+    /// 打开面板（internal：宿主 AppDelegate 悬停打开路径 openPanel(byHover:) 直调同一条全路径）。
+    func show(anchoredTo button: NSStatusBarButton) {
         guard let buttonWindow = button.window else { return }
         anchorButton = button
         if needsRebuild { rebuildContent(); needsRebuild = false }
@@ -4867,7 +4875,11 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
                 if event.keyCode == 53 { self.close(); return nil }
                 return event
             }
-            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window { return event }
+            if event.window === self.contentController.view.window || event.window === self.anchorButton?.window {
+                // 面板内点击即固定为常开（hover 呈现语义）；图标点击由宿主 togglePanel 分派
+                if event.window === self.contentController.view.window { self.onPanelBodyClick?() }
+                return event
+            }
             self.close()
             return event
         }
@@ -4922,8 +4934,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return menu
     }
 
-    /// 统一「···」面板设置菜单：卡片设置入口 + 背景样式子菜单（背景选择仍即时生效）。
-    /// 离线测试直接断言本返回值，不弹出真实 NSMenu。
+    /// 统一「···」面板设置菜单：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
+    /// （选择仍即时生效）。离线测试直接断言本返回值，不弹出真实 NSMenu。
     func makePanelSettingsMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -4931,11 +4943,26 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         cards.target = self
         cards.isEnabled = !showingCardSettings   // 设置页打开中禁用入口，避免重复进入
         menu.addItem(cards)
+        let hover = NSMenuItem(title: "悬停显示状态面板", action: #selector(toggleHoverPanel), keyEquivalent: "")
+        hover.target = self
+        hover.state = (hoverPanelMenuStateProvider?() ?? PanelHoverPreference.load()) ? .on : .off
+        menu.addItem(hover)
+        let login = NSMenuItem(title: "开机自启", action: #selector(toggleLoginItem), keyEquivalent: "")
+        login.target = self
+        login.state = (loginItemMenuStateProvider?() ?? false) ? .on : .off
+        menu.addItem(login)
         let background = NSMenuItem(title: "背景样式", action: nil, keyEquivalent: "")
         background.submenu = makeBackgroundStyleMenu()
         menu.addItem(background)
         return menu
     }
+
+    /// 「···」菜单悬停开关动作：翻转逻辑在宿主（控制器为准 + 生产落盘），控制器只承接菜单事件。
+    @objc private func toggleHoverPanel() { hoverPanelToggleHandler?() }
+
+    /// 「···」菜单自启开关动作：翻转逻辑在宿主（plist 真值 + opt-out 记忆 + launchctl），
+    /// 控制器只承接菜单事件；面板保持打开。
+    @objc private func toggleLoginItem() { loginItemToggleHandler?() }
 
     @objc private func showPanelSettingsMenu(_ sender: NSButton) {
         let menu = makePanelSettingsMenu()
@@ -5952,7 +5979,6 @@ private final class PanelFooterView: NSView {
         let refresh = buttonFactory(model.refreshItem, .prominent, nil)
         refresh.widthAnchor.constraint(equalToConstant: 76).isActive = true
         actions.addArrangedSubview(refresh)
-        actions.addArrangedSubview(buttonFactory(model.loginItem, .checkbox, nil))
         actions.addArrangedSubview(PanelUI.spacer())
         let quit = buttonFactory(model.quitItem, .plain, nil)
         quit.widthAnchor.constraint(equalToConstant: 40).isActive = true
@@ -5997,6 +6023,33 @@ final class PreviewBackdropView: NSView {
     }
 }
 
+/// 开机自启默认开决策（纯函数，--self-test 覆盖三态与托管签名表）。
+/// plist 始终是真值（update.sh AGENT_PREF 语义同源，脚本不改）：存在 → 永不动；
+/// 缺失且用户从未显式关闭 → 自动安装（默认开）；显式关闭过 → 尊重用户不重装。
+enum LoginItemDecision {
+    static let optedOutDefaultsKey = "login.item.optedOut"
+
+    static func autoInstallNeeded(plistExists: Bool, optedOut: Bool) -> Bool {
+        if plistExists { return false }
+        return !optedOut
+    }
+
+    /// 当前进程是否由本 LaunchAgent job 拉起（launchd 托管判定，纯函数便于 --self-test）。
+    /// 判定依据（2026-11-22 真机实测，部署实例与 `open -n` 探针进程对照）：
+    /// - LaunchAgent job 拉起（登录 RunAtLoad / bootstrap）：ppid=1 且
+    ///   XPC_SERVICE_NAME = job label 本名（"com.local.kimi-usage"）；
+    /// - Finder/open 经 LaunchServices 拉起：ppid 同样为 1（getppid()==1 两条路径
+    ///   无法区分，弃用），但 XPC_SERVICE_NAME = "application.<bundleid>.<实例号>"，
+    ///   与本 label 不同；
+    /// - 终端直启：无 XPC_SERVICE_NAME。
+    /// 故按 XPC_SERVICE_NAME == label 精确判定；键缺失或值不同一律视为非托管，
+    /// 调用方对非托管实例跳过 bootstrap——RunAtLoad 会让 bootstrap 立即 spawn 第二实例
+    /// （双定时器/双扫描/CredStore 并发写回），仅写 plist 留待下次登录生效。
+    static func isLaunchdManaged(xpcServiceName: String?, label: String) -> Bool {
+        xpcServiceName == label
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelController = UsagePanelController()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
@@ -6004,6 +6057,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewQuitCount = 0
     // 预览专用测试背板：--visual-preview-backdrop 时垫在面板后面，让透明/混合材质在截图中可辨；生产路径不创建。
     private var previewBackdropWindow: NSWindow?
+    // 悬停显示状态面板（Sources/PanelHover.swift）：panelPresentedByHover 仅在 hover 打开
+    // 且未 pin 时为真；点击图标、面板内点击、面板关闭任一者即复位
+    private var panelHoverController: PanelHoverController?
+    private var panelPresentedByHover = false
+    /// --self-test 用：悬停接线契约（面板回调与控制器实例），生产路径不读。
+    var panelHoverWiringForTest: (panel: UsagePanelController, hover: PanelHoverController?) {
+        (panelController, panelHoverController)
+    }
+    /// --self-test 用：自启接线契约（勾选态与 plist 真值同源），生产路径不读。
+    var loginItemWiringForTest: (menuState: Bool, plistExists: Bool) {
+        (panelController.loginItemMenuStateProvider?() ?? false, isLoginItemEnabled())
+    }
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var updateTimer: Timer?
@@ -6051,9 +6116,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.isVisible = true
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
+        installPanelHover()
         panelController.onCheckUpdate = { [weak self] in self?.manualUpdateCheck() }
         panelController.onConfirmUpdate = { [weak self] tag, notes in self?.startConfirmedUpdate(tag: tag, notes: notes) }
         if visualPreview { configureVisualPreview(); return }
+        autoInstallLoginItemIfNeeded()
         setupQuotaHistory()
         rebuildMenu()
         renderBar()
@@ -6346,13 +6413,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
     }
 
+    // MARK: 悬停显示状态面板（Sources/PanelHover.swift）
+
+    /// 悬停控制器安装：闭包注入 + 按环境决定初始开关。
+    /// preview 进程仅在 --visual-preview-hover-test 启用，其余 GUI 回归不受真实鼠标驻留干扰。
+    /// internal：--self-test 直调同一条装配路径断言接线契约（与 showCardSettings 同款约定）；
+    /// 自检环境无状态栏按钮，控制器降级安装（真实图标 tracking 只在 GUI 进程生效）。
+    func installPanelHover() {
+        panelHoverController = PanelHoverController(iconView: statusItem?.button)
+        guard let hover = panelHoverController else { return }
+        hover.isPanelShown = { [weak self] in self?.panelController.isOpen ?? false }
+        hover.presentedByHover = { [weak self] in self?.panelPresentedByHover ?? false }
+        hover.statusItemFrame = { [weak self] in self?.statusItemButtonScreenFrame() }
+        hover.panelFrame = { [weak self] in self?.panelController.panelWindowFrameForHover }
+        hover.panelView = { [weak self] in self?.panelController.hoverPanelView }
+        hover.performShow = { [weak self] in self?.openPanel(byHover: true) }
+        hover.performHide = { [weak self] in self?.panelController.close() }
+        // 面板内点击即固定为常开（hover 呈现语义）；图标点击由 togglePanel 分派
+        panelController.onPanelBodyClick = { [weak self] in self?.panelPresentedByHover = false }
+        // 面板关闭复位呈现标记并丢弃未决转换（popoverDidClose → onClose）
+        panelController.onClose = { [weak self] in
+            self?.panelPresentedByHover = false
+            self?.panelHoverController?.panelDidClose()
+        }
+        // 「···」菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
+        panelController.hoverPanelMenuStateProvider = { PanelHoverPreference.load() }
+        panelController.hoverPanelToggleHandler = { [weak self] in self?.toggleHoverPanel() }
+        // 「···」菜单自启项：勾选态与 plist 真值同源（preview 一律未勾选），
+        // 翻转走 onToggleLogin（plist 真值 + opt-out 记忆）；launchctl 操作绝不进测试进程
+        panelController.loginItemMenuStateProvider = { [weak self] in
+            guard let self else { return false }
+            return !self.visualPreview && self.isLoginItemEnabled()
+        }
+        panelController.loginItemToggleHandler = { [weak self] in self?.onToggleLogin() }
+        let enabled = visualPreview
+            ? CommandLine.arguments.contains("--visual-preview-hover-test")
+            : PanelHoverPreference.load()
+        if enabled { hover.setEnabled(true) }
+    }
+
+    /// 状态栏图标的屏幕矩形（悬停几何与点击判定的共用基准）；两行堆叠图宽度可变，必须实时取。
+    private func statusItemButtonScreenFrame() -> NSRect? {
+        guard let item = statusItem, let button = item.button, let window = button.window else { return nil }
+        let frame = window.convertToScreen(button.convert(button.bounds, to: nil))
+        return frame.width > 0 && frame.height > 0 ? frame : nil
+    }
+
     @objc private func togglePanel() {
+        if panelController.isOpen {
+            // hover 打开且未固定：首次点击转常开（pin，Status Trio 语义，防误关），不关闭
+            if panelPresentedByHover {
+                panelPresentedByHover = false
+                panelHoverController?.cancelPending()
+                return
+            }
+            panelController.close()
+            return
+        }
+        openPanel(byHover: false)
+    }
+
+    /// 打开面板。hover 打开与点击打开共用全路径（打开即最新、门控去重的刷新与更新检查），
+    /// 仅来源标记与 panelPresentedByHover 语义不同。
+    private func openPanel(byHover: Bool) {
         guard let button = statusItem.button else { return }
-        if !panelController.isOpen && !visualPreview {
+        panelPresentedByHover = byHover
+        if !visualPreview {
             refresh()
             checkForUpdate()
         }
-        panelController.toggle(anchoredTo: button)
+        panelController.show(anchoredTo: button)
+        panelHoverController?.installPanelTrackingIfNeeded()
+    }
+
+    /// 「···」菜单开关翻转：运行时状态以控制器为准；生产同步落盘偏好，
+    /// 所有 --visual-preview* 进程不写真实 UserDefaults（previewSuppressesPersistence 已统一置位）。
+    private func toggleHoverPanel() {
+        let next = !(panelHoverController?.isEnabled ?? PanelHoverPreference.load())
+        if !panelController.previewSuppressesPersistence { PanelHoverPreference.save(next) }
+        panelHoverController?.setEnabled(next)
     }
 
     // 过期判定：距最后成功超过阈值即过期；有数据但 lastOK 为 nil（异常情况）也视为过期。
@@ -6570,8 +6709,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         func item(_ title: String, _ selector: Selector, key: String = "") -> NSMenuItem {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: key); item.target = self; return item
         }
-        let login = item("开机自启", #selector(onToggleLogin))
-        login.state = (!visualPreview && isLoginItemEnabled()) ? .on : .off
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
         // v1.5 用量洞察：用量情况（合并 Work + API 客户端）+ 用量简析 + 工具明细，同一扫描快照
         // 覆盖口径：首轮扫描未完成时一切缺失日都不可证实，日图显示缺口、比较显示数据不足
@@ -6692,7 +6829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cache: cacheSection,
             history: historySnapshot,
             notices: [], lastAttempt: "最近尝试刷新 \(Fmt.time(lastAttemptAt))", version: "版本 \(BuildInfo.version.split(separator: "-").first.map(String.init) ?? BuildInfo.version)",
-            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), loginItem: login, quitItem: item("退出", #selector(onQuit), key: "q")))
+            refreshItem: item("立即刷新", #selector(onRefresh), key: "r"), quitItem: item("退出", #selector(onQuit), key: "q")))
     }
 
     private func configureVisualPreview() {
@@ -6884,6 +7021,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             self.panelController.toggle(anchoredTo: button)
+            if args.contains("--visual-preview-hover-test") {
+                // 必须用 Timer 而非 dispatch 调度：本块处于 didFinishLaunching 的主队列 drain
+                // 链中，测试内的 RunLoop.run(until:) 嵌套运行不会服务被外层 dispatch 块占住
+                // （latch）的主队列，asyncAfter 的 show/hide 定时会饿死；Timer 是 run loop
+                // callout，嵌套 run 期间主队列空闲、定时可正常触发。.common 模式对齐菜单跟踪测试先例。
+                let hoverTimer = Timer(timeInterval: 0.8, repeats: false) { [weak self] _ in
+                    self?.testHoverPresentation()
+                }
+                RunLoop.main.add(hoverTimer, forMode: .common)
+                return
+            }
             if args.contains("--visual-preview-background-menu-test") {
                 self.runPreviewBackgroundMenuTest()
                 return
@@ -7068,7 +7216,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let defaultsKey = PanelBackgroundStyle.defaultsKey
         let storedBefore = UserDefaults.standard.string(forKey: defaultsKey)
-        // 统一菜单：0=卡片显示与排序… 1=背景样式（子菜单）；子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
+        // 统一菜单：0=卡片显示与排序… 1=悬停显示状态面板 2=开机自启 3=背景样式（子菜单）；
+        // 子菜单顺序固定 0=纯色 1=液态玻璃 2=经典毛玻璃
         let plan: [(index: Int, style: PanelBackgroundStyle)] = [(1, .liquidGlass), (2, .classicMaterial)]
         var step = 0
         func scheduleSelection() {
@@ -7078,8 +7227,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     fputs("KimiUsage background menu test: FAIL: panel settings menu was not tracking\n", stderr)
                     exit(1)
                 }
-                guard menu.items.count == 2, menu.items[0].title == "卡片显示与排序…",
-                      menu.items[1].title == "背景样式", let submenu = menu.items[1].submenu else {
+                guard menu.items.count == 4, menu.items[0].title == "卡片显示与排序…",
+                      menu.items[1].title == "悬停显示状态面板", menu.items[2].title == "开机自启",
+                      menu.items[3].title == "背景样式", let submenu = menu.items[3].submenu else {
                     fputs("KimiUsage background menu test: FAIL: panel menu structure changed\n", stderr)
                     exit(1)
                 }
@@ -7119,6 +7269,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             next()
         }
         next()
+    }
+
+    /// 悬停开合时序回归（--visual-preview-hover-test）：几何与指针位置全部注入固定值，
+    /// 不依赖真实鼠标/屏幕。真实 tracking 事件（鼠标划过图标/面板）仍可能扰动，
+    /// 测试须逐个运行、勿在菜单栏上移动鼠标。第 8 步 toggleHoverPanel 的 setEnabled(true)
+    /// 会把真实图标 tracking 装回，步末已再次 detachTrackingForTesting 隔离第 9 步合成时序；
+    /// 面板 tracking 仍会在每次 openPanel 重装（真实光标压在面板上时可能扰动，同 GlmUsage 取舍）。
+    private func testHoverPresentation() {
+        func fail(_ message: String) -> Never { fputs("KimiUsage hover test: FAIL \(message)\n", stderr); exit(1) }
+        guard let hover = panelHoverController, hover.isEnabled else {
+            fail("hover controller missing or disabled")
+        }
+        // 断开真实 tracking：预览图标会真的出现在菜单栏，真实光标的 enter/exit 会取消合成时序
+        hover.detachTrackingForTesting()
+        let iconRect = NSRect(x: 1200, y: 1055, width: 40, height: 24)
+        let panelRect = NSRect(x: 1180, y: 640, width: 340, height: 400)
+        hover.statusItemFrame = { iconRect }
+        hover.panelFrame = { panelRect }
+        func wait(_ seconds: Double) { RunLoop.current.run(until: Date().addingTimeInterval(seconds)) }
+        func expectShown(_ shown: Bool, _ step: String) {
+            guard panelController.isOpen == shown else {
+                fail("\(step): expected shown=\(shown), actual=\(panelController.isOpen), hoverMarked=\(panelPresentedByHover), controllerEnabled=\(hover.isEnabled)")
+            }
+            print("KIMI_HOVER_TEST \(step): ok")
+        }
+        // 固定指针位置的便捷写法
+        func pointAt(_ x: CGFloat, _ y: CGFloat) { hover.pointerLocation = { NSPoint(x: x, y: y) } }
+
+        // 起始态：自动开面板（点击语义）先关掉，从关闭态起跑
+        if panelController.isOpen { togglePanel() }
+        wait(0.3)
+        expectShown(false, "initial-close")
+
+        // 1. 图标驻留 0.2s 才打开；0.1s 不开
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.1)
+        guard !panelController.isOpen else { fail("dwell 0.1s must not open") }
+        wait(0.5)
+        expectShown(true, "dwell-opens")
+        guard panelPresentedByHover else { fail("hover-open must mark presentedByHover") }
+
+        // 2. 图标→面板跨桥区：先排 hide 后被面板 enter 取消，保持打开
+        pointAt(panelRect.midX, panelRect.midY)
+        hover.iconExited()
+        wait(0.05)
+        hover.panelEntered()
+        wait(0.6)
+        expectShown(true, "icon-to-panel-keeps-open")
+
+        // 3. 离开面板（远离）→ 0.3s 收起
+        pointAt(200, 300)
+        hover.panelExited()
+        wait(0.15)
+        guard panelController.isOpen else { fail("0.15s after leave must still be open") }
+        wait(0.45)
+        expectShown(false, "leave-closes")
+        guard !panelPresentedByHover else { fail("close must reset presentedByHover") }
+
+        // 4. 驻留未满即离开 → 取消打开（控制器层 iconExited 对未决 .show 的 cancelPending；
+        //    幽灵自开最典型事故点：纯逻辑 token 取消之外的真实时序覆盖）
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.05)
+        hover.iconExited()
+        wait(0.5)
+        expectShown(false, "dwell-cancel-on-early-exit")
+
+        // 5. 重新悬停打开 → 首次点击=pin（不关闭）；pin 后离开图标不收
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        expectShown(true, "reopens-by-dwell")
+        togglePanel()
+        guard panelController.isOpen, !panelPresentedByHover else { fail("first click on hover-open panel must pin") }
+        print("KIMI_HOVER_TEST click-pins: ok")
+        hover.iconExited()
+        wait(0.6)
+        expectShown(true, "pinned-survives-icon-exit")
+
+        // 6. pin 后再点 → 关闭
+        togglePanel()
+        expectShown(false, "second-click-closes")
+
+        // 7. 面板内点击=pin：走真实链路——合成 mouseDown 的 window 为面板窗口，经面板
+        //    local monitor 命中 onPanelBodyClick 由宿主复位（与 key-test 的 NSApp.sendEvent
+        //    合成先例同款，同步派发、确定性通过）。落点取窗口左缘背景区（x=2pt，在卡片
+        //    16pt 边距之外的空槽），无控件接管、无关闭副作用。断言同时区分两条失败路径：
+        //    monitor 误判外点关面板（isOpen=false）与宿主接线断裂（flag 未复位）。
+        pointAt(iconRect.midX, iconRect.midY)
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelPresentedByHover else { fail("reopens-by-dwell again") }
+        guard let panelWindow = panelController.keyWindowForPreview(),
+              let panelDown = NSEvent.mouseEvent(with: .leftMouseDown,
+                  location: NSPoint(x: 2, y: panelWindow.frame.height / 2), modifierFlags: [],
+                  timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panelWindow.windowNumber,
+                  context: nil, eventNumber: 0, clickCount: 1, pressure: 1),
+              let panelUp = NSEvent.mouseEvent(with: .leftMouseUp,
+                  location: NSPoint(x: 2, y: panelWindow.frame.height / 2), modifierFlags: [],
+                  timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: panelWindow.windowNumber,
+                  context: nil, eventNumber: 0, clickCount: 1, pressure: 0) else {
+            fail("panel window or synthetic mouse event missing")
+        }
+        NSApp.sendEvent(panelDown)
+        NSApp.sendEvent(panelUp)
+        guard panelController.isOpen, !panelPresentedByHover else {
+            fail("panel-body click must pin via local monitor onPanelBodyClick (isOpen=\(panelController.isOpen), hoverMarked=\(panelPresentedByHover))")
+        }
+        print("KIMI_HOVER_TEST panel-click-pin-via-monitor: ok")
+        hover.panelExited()
+        wait(0.6)
+        expectShown(true, "panel-click-pinned-survives-exit")
+        togglePanel()
+        expectShown(false, "close-after-panel-pin")
+
+        // 8. 「···」菜单开关：运行时即时生效（preview 不落盘，断言只验证翻转本身）。
+        //    第二次翻转 setEnabled(true) 会装回真实图标 tracking：步末必须再次断离，
+        //    否则第 9 步的合成驻留会被真实光标划过菜单栏触发 iconExited 取消而假 FAIL。
+        let menu = panelController.makePanelSettingsMenu()
+        let hoverItem = menu.items.first { $0.title == "悬停显示状态面板" }
+        guard let hoverItem else { fail("settings menu missing hover item") }
+        let expectedState: NSControl.StateValue = PanelHoverPreference.load() ? .on : .off
+        guard hoverItem.state == expectedState else { fail("menu item state mismatch") }
+        let wasEnabled = panelHoverController?.isEnabled == true
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == !wasEnabled else { fail("toggle must flip runtime state") }
+        toggleHoverPanel()
+        guard panelHoverController?.isEnabled == wasEnabled else { fail("second toggle must restore") }
+        hover.detachTrackingForTesting()
+        print("KIMI_HOVER_TEST settings-toggle: ok")
+
+        // 9. 关闭开关时仍处 hover 呈现的面板应收起（toggleHoverPanel 委托的控制器行为）；
+        //    直接调控制器以隔离 preview 下「偏好值≠arg 启用态」的分叉
+        hover.iconEntered()
+        wait(0.6)
+        guard panelController.isOpen, panelPresentedByHover else { fail("reopen for disable test") }
+        hover.setEnabled(false)
+        wait(0.2)
+        expectShown(false, "disable-while-hover-open-closes")
+        hover.setEnabled(true)
+
+        print("KimiUsage hover test: PASS")
+        exit(0)
     }
 
     // The fake transport lets overlapping checks complete through the normal main-queue path.
@@ -7266,59 +7560,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var launchAgentDomain: String { "gui/\(getuid())" }
 
+    /// 首次生产启动自动开启自启（默认开，用户决策）：按 LoginItemDecision 三态执行。
+    /// 只在真实生产启动路径运行——--self-test 与所有 --visual-preview* 绝不触碰 LaunchAgent
+    /// （沿用 onToggleLogin 既有约定）。plist 缺失且从未显式关闭时走与显式 ON 相同的
+    /// installLoginItem(notifyPanel: false)：启动时面板未开，面板提示不可见，失败仅
+    /// NSLog（含解析出的 exec 路径，便于瞬态排查）；plist 写失败下次启动自然重试，
+    /// bootstrap 失败/非托管跳过则 plist 已写入、下次登录 launchd 加载生效。
+    private func autoInstallLoginItemIfNeeded() {
+        guard !visualPreview else { return }
+        let optedOut = UserDefaults.standard.bool(forKey: LoginItemDecision.optedOutDefaultsKey)
+        guard LoginItemDecision.autoInstallNeeded(plistExists: isLoginItemEnabled(), optedOut: optedOut) else { return }
+        NSLog("[KimiUsage] plist missing without opt-out: auto-enabling login item (default on), exec=%@",
+              Bundle.main.executablePath ?? "(nil)")
+        installLoginItem(notifyPanel: false)
+    }
+
+    /// 显式开关自启（唯一入口：「···」面板设置菜单，经 loginItemToggleHandler 闭包注入）。
+    /// 显式 OFF 置 login.item.optedOut（自动安装此后不再重装），ON 清除标记恢复默认开语义；
+    /// plist 真值优先于标记（判定在 LoginItemDecision），标记不一致无副作用。
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
-        do {
-            if isLoginItemEnabled() {
-                // 关：加载态决定 bootout。job 未加载属幂等正常态，直接删 plist 不报错；
-                // bootout 失败要报错（KeepAlive 会在重启前继续复活进程），plist 仍删除
-                // （偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
-                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-                if launchctlSucceeded(["print", jobSpecifier]),
-                   !launchctlSucceeded(["bootout", jobSpecifier]) {
-                    panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
-                    NSLog("[KimiUsage] LaunchAgent bootout failed")
-                }
-                try FileManager.default.removeItem(atPath: launchAgentPath)
-            } else {
-                // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
-                // launchd 静默忽略，开机自启失效且用户无感知
-                let exec = Bundle.main.executablePath ?? ""
-                // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
-                let plist: [String: Any] = [
-                    "Label": launchAgentLabel,
-                    "ProgramArguments": [exec],
-                    "RunAtLoad": true,
-                    "KeepAlive": ["SuccessfulExit": false]
-                ]
-                let data = try PropertyListSerialization.data(fromPropertyList: plist,
-                    format: .xml, options: 0)
-                // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
-                try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
-                // 开：先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
-                // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
-                // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
-                // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
-                // job 未加载 → 直接 bootstrap。失败明确报错不静默，plist 保留（下次登录
-                // 仍生效，与既有语义一致）。
-                let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-                if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
-                    if loadedProgram != exec,
-                       !(launchctlSucceeded(["bootout", jobSpecifier])
-                         && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
-                        panelController.setUpdateMessage("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）", dismissAfter: 5)
-                        NSLog("[KimiUsage] LaunchAgent reload correction failed")
-                    }
-                } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
-                    panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
-                    NSLog("[KimiUsage] LaunchAgent bootstrap failed")
-                }
-            }
-        } catch {
-            panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
-            NSLog("[KimiUsage] LaunchAgent toggle failed: %@", error.localizedDescription)
+        if isLoginItemEnabled() {
+            // 先置 opt-out 标记再删 plist：两步之间被杀的最坏态收敛为「plist 在 + 标记在」，
+            // plist 真值胜出（LoginItemDecision 不会自动重装，最多残留一个无害标记）；
+            // 反序的话被杀会留下「plist 缺失 + 无标记」，显式 OFF 被下次启动静默自动重装回滚。
+            UserDefaults.standard.set(true, forKey: LoginItemDecision.optedOutDefaultsKey)
+            removeLoginItem()
+        } else {
+            installLoginItem()
+            UserDefaults.standard.removeObject(forKey: LoginItemDecision.optedOutDefaultsKey)
         }
         updateUI()
+    }
+
+    /// 安装 LaunchAgent plist + 加载态校正 bootstrap：显式 ON 与自动安装共用。
+    /// 失败明确报错不静默：显式开关路径 NSLog + 面板提示（用户在面板前，提示可见）；
+    /// 自动安装路径（notifyPanel=false）仅 NSLog——启动时面板未开，5s 面板提示形同虚设。
+    /// plist 写失败下次启动重跑决策自然重试；bootstrap 失败/非托管跳过 → 下次登录生效。
+    private func installLoginItem(notifyPanel: Bool = true) {
+        func report(_ message: String, _ log: String) {
+            if notifyPanel { panelController.setUpdateMessage(message, dismissAfter: 5) }
+            NSLog("[KimiUsage] %@", log)
+        }
+        do {
+            // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
+            // launchd 静默忽略，开机自启失效且用户无感知
+            let exec = Bundle.main.executablePath ?? ""
+            // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
+            let plist: [String: Any] = [
+                "Label": launchAgentLabel,
+                "ProgramArguments": [exec],
+                "RunAtLoad": true,
+                "KeepAlive": ["SuccessfulExit": false]
+            ]
+            let data = try PropertyListSerialization.data(fromPropertyList: plist,
+                format: .xml, options: 0)
+            // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
+            try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
+            // 先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
+            // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
+            // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
+            // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
+            // job 未加载时 bootstrap 带 RunAtLoad 会立即 spawn 第二实例，仅当当前进程
+            // 确为本 job 的 launchd 托管实例（罕见：job 已加载而 print 瞬时失败的中间态）
+            // 才允许尝试，否则跳过、留待下次登录生效。失败明确报错不静默，plist 保留。
+            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+            if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
+                if loadedProgram != exec,
+                   !(launchctlSucceeded(["bootout", jobSpecifier])
+                     && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
+                    report("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）",
+                           "LaunchAgent reload correction failed")
+                }
+            } else if !LoginItemDecision.isLaunchdManaged(
+                    xpcServiceName: ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"],
+                    label: launchAgentLabel) {
+                // 手动启动（Finder/open/update.sh open -n/终端直启）：launchd 不认识当前
+                // 进程，bootstrap 会经 RunAtLoad 立即再 spawn 一个全新实例造成双开；
+                // 仅写 plist 留待下次登录 launchd 加载生效（与自动安装同语义）。
+                report("开机自启已写入，下次登录生效",
+                       "LaunchAgent bootstrap skipped: current process not launchd-managed, plist effective at next login")
+            } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
+                report("开机自启已写入，但服务加载失败（下次登录仍会生效）",
+                       "LaunchAgent bootstrap failed")
+            }
+        } catch {
+            report("开机自启设置失败：\(error.localizedDescription)",
+                   "LaunchAgent install failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// 移除 LaunchAgent：显式 OFF 共用。加载态决定 bootout，job 未加载属幂等正常态，
+    /// 直接删 plist 不报错；bootout 失败要报错（KeepAlive 会在重启前继续复活进程），
+    /// plist 仍删除（偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
+    private func removeLoginItem() {
+        do {
+            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
+            if launchctlSucceeded(["print", jobSpecifier]),
+               !launchctlSucceeded(["bootout", jobSpecifier]) {
+                panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
+                NSLog("[KimiUsage] LaunchAgent bootout failed")
+            }
+            try FileManager.default.removeItem(atPath: launchAgentPath)
+        } catch {
+            panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
+            NSLog("[KimiUsage] LaunchAgent remove failed: %@", error.localizedDescription)
+        }
     }
 
     @objc private func onRefresh() { if visualPreview { previewRefreshCount += 1 } else { refresh(manual: true) } }
@@ -7547,7 +7894,6 @@ enum KimiOfflineRegression {
                 history: QuotaCycleSnapshot.inactive,
                 notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                 refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                 quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")))
             // 隔离真实无障碍状态：显式给定 reduce=false，机器开启「降低透明度」也不影响判定。
             styleController.previewReduceTransparencyOverride = false
@@ -7603,7 +7949,6 @@ enum KimiOfflineRegression {
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: "")),
                     settingsTarget: geometryTarget, settingsAction: geometryAction)
             }
@@ -7748,7 +8093,6 @@ enum KimiOfflineRegression {
                     history: QuotaCycleSnapshot.inactive,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
             }
             let skipController = UsagePanelController()
@@ -7830,7 +8174,6 @@ enum KimiOfflineRegression {
                     history: history,
                     notices: [], lastAttempt: "最近尝试刷新 --", version: "版本 --",
                     refreshItem: NSMenuItem(title: "刷新", action: nil, keyEquivalent: ""),
-                    loginItem: NSMenuItem(title: "登录项", action: nil, keyEquivalent: ""),
                     quitItem: NSMenuItem(title: "退出", action: nil, keyEquivalent: ""))
             }
             let historyController = UsagePanelController()
@@ -8021,18 +8364,29 @@ enum KimiOfflineRegression {
                        "panel layout store round trip failed")
             try expect(KimiPanelLayoutStore.hasValueForTest, "panel layout store did not persist value")
 
-            // 统一「···」菜单结构：卡片设置入口 + 背景样式子菜单（背景选择仍即时生效）
+            // 统一「···」菜单结构：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
+            // 悬停偏好启用内存 backend：菜单勾选态断言不读写真实偏好，缺省态（无存储值）确定为开
+            let endHoverBackend = PanelHoverPreference.beginMemoryOverride()
+            defer { endHoverBackend() }
             _ = KimiPanelLayoutStore.beginMemoryOverride()   // 重置 backend：设置页会话从干净状态开始
             let settingsController = UsagePanelController()
             settingsController.previewReduceTransparencyOverride = false
             settingsController.previewSuppressesPersistence = true
             let panelMenu = settingsController.makePanelSettingsMenu()
-            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "背景样式"],
+            try expect(panelMenu.items.map(\.title) == ["卡片显示与排序…", "悬停显示状态面板", "开机自启", "背景样式"],
                        "panel settings menu structure changed: \(panelMenu.items.map(\.title))")
             try expect(panelMenu.items[0].target != nil && panelMenu.items[0].action != nil
                        && panelMenu.items[0].isEnabled,
                        "card settings entry missing target/action or wrongly disabled")
-            try expect(panelMenu.items[1].submenu?.items.count == PanelBackgroundStyle.allCases.count,
+            try expect(panelMenu.items[1].target != nil && panelMenu.items[1].action != nil,
+                       "hover toggle missing target/action")
+            try expect(panelMenu.items[1].state == .on,
+                       "hover toggle must default to on (no stored value)")
+            try expect(panelMenu.items[2].target != nil && panelMenu.items[2].action != nil,
+                       "login toggle missing target/action")
+            try expect(panelMenu.items[2].state == .off,
+                       "login toggle must default to off (no provider on isolated controller)")
+            try expect(panelMenu.items[3].submenu?.items.count == PanelBackgroundStyle.allCases.count,
                        "background submenu lost styles")
 
             // 原位设置页（离线可断言部分）：编辑器结构、排序按钮、进出与布局应用。
@@ -9754,7 +10108,125 @@ enum KimiOfflineRegression {
             try expect(applied == 1 && uiSnapshot.loaded == true && uiSnapshot.current == nil,
                        "the current generation's snapshot must apply normally after the stale one is dropped")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture)")
+            // 悬停面板纯逻辑（Sources/PanelHover.swift）：几何判定（含边缘 inclusive 与桥区）、
+            // 转换 token、点击决策、偏好默认值；偏好走内存 backend，绝不读写真实用户偏好
+            let hoverIcon = NSRect(x: 100, y: 760, width: 40, height: 24)
+            let hoverPanel = NSRect(x: 100, y: 400, width: 320, height: 340)
+            let hoverGeo = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [hoverPanel])
+            try expect(!hoverIcon.contains(NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "对照：NSRect.contains 为半开（右/上边缘不在内）")
+            try expect(PanelHoverGeometry.containsInclusive(hoverIcon, NSPoint(x: hoverIcon.maxX, y: hoverIcon.maxY)),
+                       "inclusive 判定必须含右/上边缘像素（菜单栏图标常在边缘悬停/点击）")
+            try expect(hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.minX, y: hoverIcon.minY)),
+                       "图标判定含左/下边缘")
+            try expect(!hoverGeo.containsStatusItem(NSPoint(x: hoverIcon.maxX + 1, y: hoverIcon.midY)),
+                       "图标判定不外扩")
+            try expect(hoverGeo.containsPanel(NSPoint(x: hoverPanel.maxX, y: hoverPanel.maxY)),
+                       "面板判定含右/上边缘")
+            try expect(hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 4)),
+                       "图标-面板桥区计入保持区")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: hoverIcon.midX, y: hoverPanel.maxY + 10)),
+                       "桥区外不保持（面板桥 8pt 与图标桥 8pt 之间的死区）")
+            try expect(!hoverGeo.isWithinHoverArea(NSPoint(x: 0, y: 0)), "远离区域不保持")
+            let hoverGeoNoPanel = PanelHoverGeometry(statusItemFrame: hoverIcon, panelFrames: [])
+            try expect(hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 5, y: hoverIcon.midY)),
+                       "无面板时图标周围桥区仍保持")
+            try expect(!hoverGeoNoPanel.isWithinHoverArea(NSPoint(x: hoverIcon.minX - 20, y: hoverIcon.midY)),
+                       "无面板时远离图标不保持")
+            try expect(PanelHoverGeometry(statusItemFrame: nil, panelFrames: []).isWithinHoverArea(NSPoint(x: 0, y: 0)) == false,
+                       "无图标无面板时处处不保持")
+
+            var hoverIntent = PanelHoverIntent()
+            let hoverToken1 = hoverIntent.begin(.show)
+            try expect(hoverIntent.consume(hoverToken1), "首次触发应生效")
+            try expect(!hoverIntent.consume(hoverToken1), "同 token 二次触发须被丢弃")
+            let hoverToken2 = hoverIntent.begin(.hide)
+            hoverIntent.cancel()
+            try expect(!hoverIntent.consume(hoverToken2), "取消后的触发须被丢弃")
+            let hoverToken3 = hoverIntent.begin(.show)
+            _ = hoverIntent.begin(.hide)
+            try expect(!hoverIntent.consume(hoverToken3), "被新转换顶替的旧 token 须失效")
+
+            try expect(panelHoverClickOutcome(isShown: false, presentedByHover: false) == .present, "未打开点击=打开")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: false) == .close, "普通常开点击=关闭")
+            try expect(panelHoverClickOutcome(isShown: true, presentedByHover: true) == .pin, "hover 打开首次点击=固定常开")
+
+            // 菜单段已启用内存 backend；此处重置为干净内存态后验证缺省/落盘语义
+            _ = PanelHoverPreference.beginMemoryOverride()
+            try expect(PanelHoverPreference.load(), "悬停偏好缺省必须为开")
+            try expect(!PanelHoverPreference.hasValueForTest, "悬停偏好缺省态不应有存储值")
+            PanelHoverPreference.save(false)
+            try expect(!PanelHoverPreference.load(), "悬停偏好写入后须如实读取")
+            try expect(PanelHoverPreference.hasValueForTest, "悬停偏好保存后应有存储值")
+
+            // 悬停接线契约：与生产 applicationDidFinishLaunching 直调同一 installPanelHover，
+            // 离线断言装配齐全与翻转落盘——误删任一闭包赋值（面板内点击 pin / 关闭复位 /
+            // 菜单勾选态 / 菜单翻转）在此失败。重新置干净内存态保证「缺省开 → 生产缺省启用」。
+            // 真实 monitor → onPanelBodyClick 链路由 --visual-preview-hover-test 第 7 步
+            // （合成面板内 mouseDown 走 NSApp.sendEvent）端到端覆盖。
+            _ = PanelHoverPreference.beginMemoryOverride()
+            let hoverDelegate = AppDelegate()
+            hoverDelegate.installPanelHover()
+            try expect(hoverDelegate.panelHoverWiringForTest.hover != nil
+                       && hoverDelegate.panelHoverWiringForTest.hover?.isEnabled == true,
+                       "悬停控制器装配缺失或缺省（无存储值）未启用")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.onPanelBodyClick != nil,
+                       "面板内点击 pin 接线缺失")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.onClose != nil,
+                       "面板关闭复位接线缺失")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.hoverPanelMenuStateProvider?() == true,
+                       "菜单勾选态接线缺失或缺省非开")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.hoverPanelToggleHandler != nil,
+                       "菜单翻转接线缺失")
+            // 翻转契约：走生产 toggleHoverPanel（控制器为准 + 内存 backend 落盘），二次翻转恢复
+            hoverDelegate.panelHoverWiringForTest.panel.hoverPanelToggleHandler?()
+            try expect(hoverDelegate.panelHoverWiringForTest.hover?.isEnabled == false
+                       && !PanelHoverPreference.load(),
+                       "开关翻转未生效或未落盘")
+            hoverDelegate.panelHoverWiringForTest.panel.hoverPanelToggleHandler?()
+            try expect(hoverDelegate.panelHoverWiringForTest.hover?.isEnabled == true
+                       && PanelHoverPreference.load(),
+                       "二次翻转未恢复")
+
+            // 开机自启默认开（plist 真值 + 显式关闭记忆）：纯决策三态，不触碰真实 LaunchAgent
+            try expect(LoginItemDecision.optedOutDefaultsKey == "login.item.optedOut", "自启 opt-out 键名锁定")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: true, optedOut: false),
+                       "plist 已存在不得重装")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: true, optedOut: true),
+                       "plist 存在时 opt-out 不参与判定")
+            try expect(LoginItemDecision.autoInstallNeeded(plistExists: false, optedOut: false),
+                       "缺失且从未显式关闭 → 自动安装（默认开）")
+            try expect(!LoginItemDecision.autoInstallNeeded(plistExists: false, optedOut: true),
+                       "显式关闭过 → 尊重用户不重装")
+
+            // launchd 托管判定签名表（2026-11-22 真机实测：部署 agent 实例与 open -n 探针
+            // 进程对照；ppid 两条路径同为 1 不可区分，故按 XPC_SERVICE_NAME 精确判定）
+            try expect(LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "com.local.kimi-usage", label: "com.local.kimi-usage"),
+                   "agent job 拉起签名（XPC_SERVICE_NAME=label）必须判为托管")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "application.com.local.kimi-usage.232905464.232905469.8319514A-0EC2-446B-B2C3-34116E9E36C7",
+                   label: "com.local.kimi-usage"),
+                   "LaunchServices（open/Finder）拉起签名不得判为托管（防 bootstrap 双开）")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: nil, label: "com.local.kimi-usage"),
+                   "终端直启（无 XPC_SERVICE_NAME）不得判为托管")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "application.com.local.other.1", label: "com.local.kimi-usage"),
+                   "其他应用的 LaunchServices 签名不得判为托管")
+
+            // 自启接线契约：··· 菜单勾选态与 plist 真值同源（只锁同源不锁开合，测试不依赖
+            // 机器自启状态）；翻转闭包接生产 onToggleLogin——launchctl/plist 操作绝不进
+            // 测试，翻转行为正确性留人工验收，这里只断言装配存在。
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.loginItemMenuStateProvider != nil,
+                       "面板设置菜单自启勾选态接线缺失")
+            try expect(hoverDelegate.panelHoverWiringForTest.panel.loginItemToggleHandler != nil,
+                       "面板设置菜单自启翻转接线缺失")
+            let loginWiring = hoverDelegate.loginItemWiringForTest
+            try expect(loginWiring.menuState == loginWiring.plistExists,
+                       "自启菜单勾选态必须与 plist 真值同源")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference/wiring, login item default-on decision/wiring)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

@@ -4934,8 +4934,8 @@ final class UsagePanelController: NSObject, NSPopoverDelegate {
         return menu
     }
 
-    /// 统一「···」面板设置菜单：卡片设置入口 + 悬停显示开关 + 背景样式子菜单（选择仍即时生效）。
-    /// 离线测试直接断言本返回值，不弹出真实 NSMenu。
+    /// 统一「···」面板设置菜单：卡片设置入口 + 悬停显示开关 + 开机自启开关 + 背景样式子菜单
+    /// （选择仍即时生效）。离线测试直接断言本返回值，不弹出真实 NSMenu。
     func makePanelSettingsMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -6023,7 +6023,7 @@ final class PreviewBackdropView: NSView {
     }
 }
 
-/// 开机自启默认开决策（纯函数，--self-test 覆盖三态）。
+/// 开机自启默认开决策（纯函数，--self-test 覆盖三态与托管签名表）。
 /// plist 始终是真值（update.sh AGENT_PREF 语义同源，脚本不改）：存在 → 永不动；
 /// 缺失且用户从未显式关闭 → 自动安装（默认开）；显式关闭过 → 尊重用户不重装。
 enum LoginItemDecision {
@@ -6032,6 +6032,21 @@ enum LoginItemDecision {
     static func autoInstallNeeded(plistExists: Bool, optedOut: Bool) -> Bool {
         if plistExists { return false }
         return !optedOut
+    }
+
+    /// 当前进程是否由本 LaunchAgent job 拉起（launchd 托管判定，纯函数便于 --self-test）。
+    /// 判定依据（2026-11-22 真机实测，部署实例与 `open -n` 探针进程对照）：
+    /// - LaunchAgent job 拉起（登录 RunAtLoad / bootstrap）：ppid=1 且
+    ///   XPC_SERVICE_NAME = job label 本名（"com.local.kimi-usage"）；
+    /// - Finder/open 经 LaunchServices 拉起：ppid 同样为 1（getppid()==1 两条路径
+    ///   无法区分，弃用），但 XPC_SERVICE_NAME = "application.<bundleid>.<实例号>"，
+    ///   与本 label 不同；
+    /// - 终端直启：无 XPC_SERVICE_NAME。
+    /// 故按 XPC_SERVICE_NAME == label 精确判定；键缺失或值不同一律视为非托管，
+    /// 调用方对非托管实例跳过 bootstrap——RunAtLoad 会让 bootstrap 立即 spawn 第二实例
+    /// （双定时器/双扫描/CredStore 并发写回），仅写 plist 留待下次登录生效。
+    static func isLaunchdManaged(xpcServiceName: String?, label: String) -> Bool {
+        xpcServiceName == label
     }
 }
 
@@ -6424,7 +6439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 「···」菜单开关：勾选态读偏好，翻转走宿主（控制器为准，生产落盘）
         panelController.hoverPanelMenuStateProvider = { PanelHoverPreference.load() }
         panelController.hoverPanelToggleHandler = { [weak self] in self?.toggleHoverPanel() }
-        // 「···」菜单自启项：勾选态与状态菜单同源（真实 plist 真值 + preview 一律未勾选），
+        // 「···」菜单自启项：勾选态与 plist 真值同源（preview 一律未勾选），
         // 翻转走 onToggleLogin（plist 真值 + opt-out 记忆）；launchctl 操作绝不进测试进程
         panelController.loginItemMenuStateProvider = { [weak self] in
             guard let self else { return false }
@@ -7548,13 +7563,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 首次生产启动自动开启自启（默认开，用户决策）：按 LoginItemDecision 三态执行。
     /// 只在真实生产启动路径运行——--self-test 与所有 --visual-preview* 绝不触碰 LaunchAgent
     /// （沿用 onToggleLogin 既有约定）。plist 缺失且从未显式关闭时走与显式 ON 相同的
-    /// installLoginItem()；失败仅 NSLog + 面板提示，不崩，下次启动自然重试。
+    /// installLoginItem(notifyPanel: false)：启动时面板未开，面板提示不可见，失败仅
+    /// NSLog（含解析出的 exec 路径，便于瞬态排查）；plist 写失败下次启动自然重试，
+    /// bootstrap 失败/非托管跳过则 plist 已写入、下次登录 launchd 加载生效。
     private func autoInstallLoginItemIfNeeded() {
         guard !visualPreview else { return }
         let optedOut = UserDefaults.standard.bool(forKey: LoginItemDecision.optedOutDefaultsKey)
         guard LoginItemDecision.autoInstallNeeded(plistExists: isLoginItemEnabled(), optedOut: optedOut) else { return }
-        NSLog("[KimiUsage] plist missing without opt-out: auto-enabling login item (default on)")
-        installLoginItem()
+        NSLog("[KimiUsage] plist missing without opt-out: auto-enabling login item (default on), exec=%@",
+              Bundle.main.executablePath ?? "(nil)")
+        installLoginItem(notifyPanel: false)
     }
 
     /// 显式开关自启（唯一入口：「···」面板设置菜单，经 loginItemToggleHandler 闭包注入）。
@@ -7563,8 +7581,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func onToggleLogin() {
         guard !visualPreview else { return }
         if isLoginItemEnabled() {
-            removeLoginItem()
+            // 先置 opt-out 标记再删 plist：两步之间被杀的最坏态收敛为「plist 在 + 标记在」，
+            // plist 真值胜出（LoginItemDecision 不会自动重装，最多残留一个无害标记）；
+            // 反序的话被杀会留下「plist 缺失 + 无标记」，显式 OFF 被下次启动静默自动重装回滚。
             UserDefaults.standard.set(true, forKey: LoginItemDecision.optedOutDefaultsKey)
+            removeLoginItem()
         } else {
             installLoginItem()
             UserDefaults.standard.removeObject(forKey: LoginItemDecision.optedOutDefaultsKey)
@@ -7573,8 +7594,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 安装 LaunchAgent plist + 加载态校正 bootstrap：显式 ON 与自动安装共用。
-    /// 失败明确报错不静默（NSLog + 面板提示），plist 保留（下次登录仍生效），不崩。
-    private func installLoginItem() {
+    /// 失败明确报错不静默：显式开关路径 NSLog + 面板提示（用户在面板前，提示可见）；
+    /// 自动安装路径（notifyPanel=false）仅 NSLog——启动时面板未开，5s 面板提示形同虚设。
+    /// plist 写失败下次启动重跑决策自然重试；bootstrap 失败/非托管跳过 → 下次登录生效。
+    private func installLoginItem(notifyPanel: Bool = true) {
+        func report(_ message: String, _ log: String) {
+            if notifyPanel { panelController.setUpdateMessage(message, dismissAfter: 5) }
+            NSLog("[KimiUsage] %@", log)
+        }
         do {
             // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
             // launchd 静默忽略，开机自启失效且用户无感知
@@ -7594,23 +7621,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
             // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
             // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
-            // job 未加载 → 直接 bootstrap。失败明确报错不静默，plist 保留（下次登录
-            // 仍生效，与既有语义一致）。
+            // job 未加载时 bootstrap 带 RunAtLoad 会立即 spawn 第二实例，仅当当前进程
+            // 确为本 job 的 launchd 托管实例（罕见：job 已加载而 print 瞬时失败的中间态）
+            // 才允许尝试，否则跳过、留待下次登录生效。失败明确报错不静默，plist 保留。
             let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
             if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
                 if loadedProgram != exec,
                    !(launchctlSucceeded(["bootout", jobSpecifier])
                      && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
-                    panelController.setUpdateMessage("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）", dismissAfter: 5)
-                    NSLog("[KimiUsage] LaunchAgent reload correction failed")
+                    report("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）",
+                           "LaunchAgent reload correction failed")
                 }
+            } else if !LoginItemDecision.isLaunchdManaged(
+                    xpcServiceName: ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"],
+                    label: launchAgentLabel) {
+                // 手动启动（Finder/open/update.sh open -n/终端直启）：launchd 不认识当前
+                // 进程，bootstrap 会经 RunAtLoad 立即再 spawn 一个全新实例造成双开；
+                // 仅写 plist 留待下次登录 launchd 加载生效（与自动安装同语义）。
+                report("开机自启已写入，下次登录生效",
+                       "LaunchAgent bootstrap skipped: current process not launchd-managed, plist effective at next login")
             } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
-                panelController.setUpdateMessage("开机自启已写入，但服务加载失败（下次登录仍会生效）", dismissAfter: 5)
-                NSLog("[KimiUsage] LaunchAgent bootstrap failed")
+                report("开机自启已写入，但服务加载失败（下次登录仍会生效）",
+                       "LaunchAgent bootstrap failed")
             }
         } catch {
-            panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
-            NSLog("[KimiUsage] LaunchAgent install failed: %@", error.localizedDescription)
+            report("开机自启设置失败：\(error.localizedDescription)",
+                   "LaunchAgent install failed: \(error.localizedDescription)")
         }
     }
 
@@ -10162,6 +10198,22 @@ enum KimiOfflineRegression {
                        "缺失且从未显式关闭 → 自动安装（默认开）")
             try expect(!LoginItemDecision.autoInstallNeeded(plistExists: false, optedOut: true),
                        "显式关闭过 → 尊重用户不重装")
+
+            // launchd 托管判定签名表（2026-11-22 真机实测：部署 agent 实例与 open -n 探针
+            // 进程对照；ppid 两条路径同为 1 不可区分，故按 XPC_SERVICE_NAME 精确判定）
+            try expect(LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "com.local.kimi-usage", label: "com.local.kimi-usage"),
+                   "agent job 拉起签名（XPC_SERVICE_NAME=label）必须判为托管")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "application.com.local.kimi-usage.232905464.232905469.8319514A-0EC2-446B-B2C3-34116E9E36C7",
+                   label: "com.local.kimi-usage"),
+                   "LaunchServices（open/Finder）拉起签名不得判为托管（防 bootstrap 双开）")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: nil, label: "com.local.kimi-usage"),
+                   "终端直启（无 XPC_SERVICE_NAME）不得判为托管")
+            try expect(!LoginItemDecision.isLaunchdManaged(
+                   xpcServiceName: "application.com.local.other.1", label: "com.local.kimi-usage"),
+                   "其他应用的 LaunchServices 签名不得判为托管")
 
             // 自启接线契约：··· 菜单勾选态与 plist 真值同源（只锁同源不锁开合，测试不依赖
             // 机器自启状态）；翻转闭包接生产 onToggleLogin——launchctl/plist 操作绝不进

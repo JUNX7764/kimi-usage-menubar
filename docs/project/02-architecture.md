@@ -75,7 +75,7 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 ### 开机自启（LaunchAgent）
 
-真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在「···」面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 置 optedOut、ON 清除，plist 真值优先于标记。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；失败仅 NSLog + 面板提示，下次启动自然重试。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
+真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在「···」面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 先置 optedOut 再删 plist（两步间被杀最坏态收敛为「plist 在 + 标记在」，真值胜出）、ON 清除。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；bootstrap 前以纯函数 `LoginItemDecision.isLaunchdManaged`（XPC_SERVICE_NAME == job label；真机实测 open/Finder 的 LaunchServices 拉起签名为 `application.<bundleid>` 前缀且 ppid 与 agent 拉起同为 1 不可区分，终端直启无该键）判定当前进程是否本 job 托管实例，非托管跳过 bootstrap 防 RunAtLoad 立即 spawn 第二实例双开、plist 留待下次登录生效。失败两种模式分开：plist 写失败 → 下次启动重跑决策自然重试；bootstrap 失败或非托管跳过 → plist 已写入、下次登录 launchd 加载生效。生产启动的自动安装失败仅 NSLog（含 exec 路径；面板未开提示不可见），显式开关失败用面板提示。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
 
 ## 4. 信任边界
 

@@ -47,8 +47,15 @@ class ScriptTest(unittest.TestCase):
         self._write_mocks()
         self.bash_env = self.base / "bash_env"
         self.bash_env.write_text(
-            'kill() { if [ "${MOCK_KILL_INEFFECTIVE:-0}" = 1 ]; then return 0; fi;'
-            ' echo "kill $*" >> "$MOCK_LOG"; rm -f "$MOCK_STATE"; }\n')
+            'kill() {\n'
+            '    if [ "${MOCK_KILL_INEFFECTIVE:-0}" = 1 ]; then return 0; fi\n'
+            '    echo "kill $*" >> "$MOCK_LOG"\n'
+            '    if [ "${MOCK_EXIT_AFTER_PS_CHECKS:-0}" -gt 0 ]; then\n'
+            '        printf "%s\\n" "$MOCK_EXIT_AFTER_PS_CHECKS" > "$MOCK_EXIT_COUNTER"\n'
+            '    else\n'
+            '        rm -f "$MOCK_STATE"\n'
+            '    fi\n'
+            '}\n')
         zip_url = f"https://github.com/{REPO}/releases/download/v2.0.0/{EXECUTABLE}.zip"
         releases = [{
             "tag_name": "v2.0.0", "draft": False, "prerelease": False,
@@ -140,7 +147,9 @@ case "$1" in
     print) [ "${MOCK_AGENT_ACTIVE:-0}" = 1 ] || exit 1; printf "\tprogram = %s\n" "${MOCK_LOADED_BINARY:-$MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE}" ;;
     bootout)
         if [ "${MOCK_BOOTOUT_FAIL:-0}" = 1 ]; then exit 42; fi
-        [ "${MOCK_KILL_INEFFECTIVE:-0}" = 1 ] || rm -f "$MOCK_STATE"
+        if [ "${MOCK_KILL_INEFFECTIVE:-0}" != 1 ] && [ "${MOCK_EXIT_AFTER_PS_CHECKS:-0}" = 0 ]; then
+            rm -f "$MOCK_STATE"
+        fi
         ;;
     bootstrap)
         if [ "${MOCK_BOOTSTRAP_FAIL:-0}" = 1 ]; then exit 49; fi
@@ -158,12 +167,23 @@ if [ "$1" = "-R" ]; then exit 0; fi
 : > "$MOCK_STATE"
 ''')
         self._mock("ps", r'''
-if [ -e "$MOCK_STATE" ]; then echo "99999 $MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE"; fi
+if [ -e "$MOCK_STATE" ]; then
+    echo "99999 $MOCK_TARGET/Contents/MacOS/$MOCK_EXECUTABLE"
+    if [ -n "${MOCK_EXIT_COUNTER:-}" ] && [ -f "$MOCK_EXIT_COUNTER" ]; then
+        rem="$(cat "$MOCK_EXIT_COUNTER")"
+        rem=$((rem - 1))
+        if [ "$rem" -le 0 ]; then
+            rm -f "$MOCK_STATE" "$MOCK_EXIT_COUNTER"
+        else
+            printf '%s\n' "$rem" > "$MOCK_EXIT_COUNTER"
+        fi
+    fi
+fi
 if [ "${MOCK_OTHER_COPY:-0}" = 1 ]; then echo "99998 /other/${MOCK_APP_NAME}/Contents/MacOS/$MOCK_EXECUTABLE"; fi
 ''')
         self._mock("pgrep", '[ -e "$MOCK_STATE" ]\n')
         self._mock("pkill", 'echo "pkill $*" >> "$MOCK_LOG"\nrm -f "$MOCK_STATE"\n')
-        self._mock("sleep", "exit 0\n")
+        self._mock("sleep", 'if [ "${MOCK_LOG_SLEEP:-0}" = 1 ]; then echo "sleep $*" >> "$MOCK_LOG"; fi\nexit 0\n')
         self._mock("cp", r'''
 echo "cp $*" >> "$MOCK_LOG"
 if [ "${MOCK_CP_FAIL:-0}" = 1 ]; then
@@ -516,6 +536,20 @@ exit 0
         self.assertEqual(self.marker(installed), "old")
         self.assertTrue(installed.exists())
 
+    def test_stop_target_polling_succeeds_after_delayed_exit(self):
+        installed = self.prepare_update()
+        counter = self.base / "exit.counter"
+        result = self.run_update(
+            MOCK_EXIT_AFTER_PS_CHECKS="2",
+            MOCK_EXIT_COUNTER=str(counter),
+            MOCK_LOG_SLEEP="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(self.marker(installed), "new")
+        self.assertTrue(self.state.exists())
+        poll_sleeps = [line for line in self.log_lines() if line == "sleep 0.2"]
+        self.assertEqual(poll_sleeps, ["sleep 0.2", "sleep 0.2"])
+
     def test_unparseable_current_version_reports_instead_of_misleading(self):
         installed = self.prepare_update()
         info_path = installed / "Contents" / "Info.plist"
@@ -528,6 +562,8 @@ exit 0
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("版本号不可比较", result.stdout)
         self.assertNotIn("目标版本必须高于当前应用", result.stdout)
+        self.assertFalse(any(line.startswith("curl") for line in self.log_lines()))
+        self.assertFalse(any(line.startswith("mktemp") for line in self.log_lines()))
 
     def test_wrong_payload_version_is_rejected(self):
         installed = self.prepare_update()
@@ -545,15 +581,23 @@ exit 0
         installed = self.prepare_update()
         info_path = installed / "Contents" / "Info.plist"
         with info_path.open("rb") as f: info = plistlib.load(f)
-        info["CUBuildVersion"] = "v3.0.0"
-        with info_path.open("wb") as f: plistlib.dump(info, f)
-        result = self.run_update()
-        self.assertNotEqual(result.returncode, 0, result.stdout)
+        for blocked_version in ("v2.0.0", "v3.0.0"):
+            self.log.write_text("")
+            info["CUBuildVersion"] = blocked_version
+            with info_path.open("wb") as f: plistlib.dump(info, f)
+            result = self.run_update()
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("目标版本必须高于当前应用", result.stdout)
+            self.assertFalse(any(line.startswith("curl") for line in self.log_lines()))
+            self.assertFalse(any(line.startswith("mktemp") for line in self.log_lines()))
+        self.log.write_text("")
         info["CUBuildVersion"] = "v1.0.0"
         with info_path.open("wb") as f: plistlib.dump(info, f)
         result = self.run_update(MOCK_OTHER_COPY="1")
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
+        self.assertFalse(any(line.startswith("curl") for line in self.log_lines()))
+        self.assertFalse(any(line.startswith("mktemp") for line in self.log_lines()))
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
     def test_loaded_agent_mismatch_rejected_even_when_plist_matches(self):
@@ -562,6 +606,8 @@ exit 0
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.marker(installed), "old")
         self.assertIn("已加载的 LaunchAgent", result.stdout)
+        self.assertFalse(any(line.startswith("curl") for line in self.log_lines()))
+        self.assertFalse(any(line.startswith("mktemp") for line in self.log_lines()))
         self.assertFalse(any("bootout" in line for line in self.log_lines()))
 
     def test_loaded_job_without_plist_updates_without_bootstrap(self):

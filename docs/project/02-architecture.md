@@ -1,6 +1,6 @@
 # KimiUsage 当前架构概览
 
-> 状态：当前架构摘要。最后核对：2026-11-12。
+> 状态：当前架构摘要。最后核对：2026-11-25。
 > 本文解释模块与边界，函数级行为以源码和测试为准。
 
 ## 1. 应用形态
@@ -39,7 +39,7 @@ KimiUsage 是 macOS 13+、Apple Silicon 的原生 AppKit 菜单栏应用，无 S
 
 Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度与错误合并 → Popover 和诊断状态。
 
-401 续期是当前配置写回路径。写回必须保留客户端并发轮换结果、原子替换和仅所有者权限；认证字段不得写入日志、缓存、测试或提交。
+401 续期是当前配置写回路径。写回必须保留客户端并发轮换结果、原子替换和仅所有者权限；认证字段不得写入日志、缓存、测试或提交。月度正源失败而 Kimi Code 新格式响应带有效备援值（`monthUsedFallback`）时，同步推进 `lastMonthSuccessAt`。ISO 时间解析（`ISO.parse`）加锁互斥，按日分桶键基于线程安全的公历 `Calendar`。快轮刷新缓存面板模型以跳过无变化重建，`status.json` 通过单趟指纹剔除 `lastAttemptAt` 控制写盘节奏。
 
 ### 额度周期历史
 
@@ -49,13 +49,13 @@ Kimi 桌面端配置 → 内存认证状态 → Kimi 远程接口 → 新鲜度�
 
 本地 JSONL / SQLite → 只读扫描与来源去重 → `scan-state-v6.json` → 今日、近 7 日、近 30 日及模型明细。
 
-JSONL 增量扫描按「offset + scanRevision + mtime + inode」四重身份指纹判定跳过与重扫：macOS 13.3+（`fileIdentifier` 可得）同 inode 变大走追加增量快路，inode 变化或等长原地改写清零重扫；13.0-13.2 回退为 mtime 整体复位（替换必重扫，接受追加全量重扫），正确性两分支一致。自检经 gate override 在同一二进制内双分支执行锁定。
+JSONL 增量扫描按「offset + scanRevision + mtime + inode」四重身份指纹判定跳过与重扫：macOS 13.3+（`fileIdentifier` 可得）同 inode 变大走追加增量快路，inode 变化或等长原地改写清零重扫；13.0-13.2 回退为 mtime 整体复位（替换必重扫，接受追加全量重扫），正确性两分支一致。自检经 gate override 在同一二进制内双分支执行锁定。`TokenAggregator` 对各文件与来源执行原地单趟聚合，并在汇总时裁剪窗口外过期日期（含未变化缓存文件与卸载后 Hermes 的 `rowCacheDays`）。
 
 原始会话与数据库只读。缺少模型名、来源不可读、重复日志和 SQLite 中途失败必须按既定边界降级，不能将部分结果当成完整成功。
 
 ### 自动更新
 
-GitHub Release → 可安装版本与说明同时选择 → 面板内查看说明并确认 → ZIP / SHA256 下载 → 身份、版本、签名与离线自检 → 暂存 → 停止目标进程 → 换包 → 健康检查 → 成功清理或失败回滚。
+GitHub Release → 可安装版本与说明同时选择 → 面板内查看说明并确认 → 下载前快速校验（当前版本可比较性与升级方向、多副本冲突、LaunchAgent 已加载路径）→ ZIP / SHA256 下载 → 身份、版本、签名与离线自检 → 暂存 → 停止目标进程（短间隔轮询等待退出，最多 25 × 0.2s）→ 换包 → 健康检查 → 成功清理或失败回滚。
 
 更新器只处理当前应用路径和 `com.local.kimi-usage`，不得按名称模糊终止其他进程。
 
@@ -77,7 +77,7 @@ GitHub Release → 可安装版本与说明同时选择 → 面板内查看说�
 
 ### 开机自启（LaunchAgent）
 
-真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在 ⚙ 面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 先置 optedOut 再删 plist（两步间被杀最坏态收敛为「plist 在 + 标记在」，真值胜出）、ON 清除。安装 = XML plist 原子写（KeepAlive 仅非正常退出重启）+ 加载态校正 bootstrap；bootstrap 前以纯函数 `LoginItemDecision.isLaunchdManaged`（XPC_SERVICE_NAME == job label；真机实测 open/Finder 的 LaunchServices 拉起签名为 `application.<bundleid>` 前缀且 ppid 与 agent 拉起同为 1 不可区分，终端直启无该键）判定当前进程是否本 job 托管实例，非托管跳过 bootstrap 防 RunAtLoad 立即 spawn 第二实例双开、plist 留待下次登录生效。失败两种模式分开：plist 写失败 → 下次启动重跑决策自然重试；bootstrap 失败或非托管跳过 → plist 已写入、下次登录 launchd 加载生效。生产启动的自动安装失败仅 NSLog（含 exec 路径；面板未开提示不可见），显式开关失败用面板提示。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
+真值 = `~/Library/LaunchAgents/com.local.kimi-usage.plist` 存在与否，与 `update.sh` 的 AGENT_PREF 语义同源（换包时 plist 存在且指向本副本则 bootstrap 保活，缺失视为 OFF），脚本不改。默认开（v1.7.13 起）：首次生产启动经纯决策 `LoginItemDecision.autoInstallNeeded(plistExists:optedOut:)`——plist 存在 → 不动；缺失且 UserDefaults `login.item.optedOut` 无标记 → 自动安装；有标记 → 尊重用户。安装/移除抽为 `installLoginItem()` / `removeLoginItem()`，显式开关唯一入口在 ⚙ 面板设置菜单（旧的状态菜单勾选与面板底部 checkbox 已移除），经闭包注入宿主共用 `onToggleLogin`：OFF 先置 optedOut 再删 plist（两步间被杀最坏态收敛为「plist 在 + 标记在」，真值胜出）、ON 清除。安装 = 确保 `~/Library/LaunchAgents` 目录存在 + XML plist 原子写（KeepAlive 仅非正常退出重启）+ 后台串行队列调用 `launchctl` 执行加载态校正 bootstrap（bootout 同样走后台串行队列，不阻塞主线程）；bootstrap 前以纯函数 `LoginItemDecision.isLaunchdManaged`（XPC_SERVICE_NAME == job label；真机实测 open/Finder 的 LaunchServices 拉起签名为 `application.<bundleid>` 前缀且 ppid 与 agent 拉起同为 1 不可区分，终端直启无该键）判定当前进程是否本 job 托管实例，非托管跳过 bootstrap 防 RunAtLoad 立即 spawn 第二实例双开、plist 留待下次登录生效。失败两种模式分开：plist 写失败 → 下次启动重跑决策自然重试；bootstrap 失败或非托管跳过 → plist 已写入、下次登录 launchd 加载生效。生产启动的自动安装失败仅 NSLog（含 exec 路径；面板未开提示不可见），显式开关失败用面板提示。`--self-test` 与所有 `--visual-preview*` 绝不触碰 LaunchAgent，自动安装只在真实生产启动路径执行；launchctl 行为不进任何自动化测试。
 
 ## 4. 信任边界
 

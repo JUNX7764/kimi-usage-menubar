@@ -61,7 +61,6 @@ BINARY="${INSTALLED}/Contents/MacOS/${EXECUTABLE}"
 case "$INSTALLED" in
     *"/AppTranslocation/"*) echo "!! ${APP_NAME} 正在从临时位置运行（App Translocation），无法原地更新。请退出应用，把它拖入「应用程序」文件夹后重新打开再更新"; exit 1 ;;
 esac
-TMP="$(mktemp -d)" || { echo "!! 无法创建下载临时目录，已中止"; exit 1; }
 
 # 仅匹配实际可执行路径；遇到同名的其他副本时中止，绝不按名称杀进程。
 processes() { ps -axo pid=,comm=; }
@@ -95,6 +94,42 @@ function run(a) {
 }
 JXA
 }
+
+# 偏好与加载态解耦：
+# - JOB_LOADED（加载态）：print 成功且 program 是本副本 → 停旧阶段按它 bootout；program
+#   不是本副本仍中止（安全校验保留）。
+# - AGENT_PREF（偏好）：plist 存在且 ProgramArguments 指向本副本 → 启动/回滚阶段按它
+#   bootstrap 保活。plist 缺失或指向别处时视为 OFF：不中止、不 bootstrap、不动别人的
+#   plist；「job 已加载但 plist 缺失」不再永久阻断更新（App 侧开关 bootout 后遗留的
+#   中间态可正常推进，回滚后按偏好重新 bootstrap 旧版保活）。
+inspect_launch_agent() {
+    JOB_LOADED=0
+    AGENT_PREF=0
+    if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
+        LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
+        [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
+        JOB_LOADED=1
+    fi
+    if [ -f "$AGENT_PLIST" ]; then
+        AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
+        if [ "$AGENT_BINARY" = "$BINARY" ]; then
+            AGENT_PREF=1
+        fi
+    fi
+}
+
+# 联网前快速失败校验：在创建临时目录与下载 Release 之前拦截版本不可比较、降级、多副本冲突与 LaunchAgent 指向异常。
+OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
+# 非 tag 构建（git describe 失败产物 unknown / 短 hash）无法比较版本，报错要可操作而不是误导
+[[ "$OLD_VERSION" =~ ^v?[0-9]+(\.[0-9]+)+(-.+)?$ ]] || { echo "!! 当前应用版本号不可比较（非 tag 构建：${OLD_VERSION}），请重新安装 Release 后再更新"; exit 1; }
+[ "$(version_newer "$TARGET_TAG" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
+if other_copy_running; then
+    echo "!! 检测到另一应用副本正在运行，已中止"
+    exit 1
+fi
+inspect_launch_agent
+
+TMP="$(mktemp -d)" || { echo "!! 无法创建下载临时目录，已中止"; exit 1; }
 
 start_and_wait() {
     if [ "$AGENT_PREF" = 1 ]; then
@@ -252,9 +287,6 @@ if ! NEW_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${NEW_AP
     exit 1
 fi
 [ "$NEW_VERSION" = "$TARGET_TAG" ] || { echo "!! 发布包构建版本与目标不符"; exit 1; }
-OLD_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CUBuildVersion' "${INSTALLED}/Contents/Info.plist")" || { echo "!! 当前应用缺少构建版本"; exit 1; }
-# 非 tag 构建（git describe 失败产物 unknown / 短 hash）无法比较版本，报错要可操作而不是误导
-[[ "$OLD_VERSION" =~ ^v?[0-9]+(\.[0-9]+)+(-.+)?$ ]] || { echo "!! 当前应用版本号不可比较（非 tag 构建：${OLD_VERSION}），请重新安装 Release 后再更新"; exit 1; }
 [ "$(version_newer "$NEW_VERSION" "$OLD_VERSION")" = yes ] || { echo "!! 目标版本必须高于当前应用"; exit 1; }
 if ! codesign --verify --deep --strict "$NEW_APP"; then
     echo "!! 新版本签名校验未通过，已中止"
@@ -265,26 +297,12 @@ if ! "$NEW_BINARY" --self-test; then
     exit 1
 fi
 
+# 下载耗时期间状态可能变化：进入暂存前再次复核多副本冲突与 LaunchAgent 状态。
 if other_copy_running; then
     echo "!! 检测到另一应用副本正在运行，已中止"
     exit 1
 fi
-# 偏好与加载态解耦：
-# - JOB_LOADED（加载态）：print 成功且 program 是本副本 → 停旧阶段按它 bootout；program
-#   不是本副本仍中止（安全校验保留）。
-# - AGENT_PREF（偏好）：plist 存在且 ProgramArguments 指向本副本 → 启动/回滚阶段按它
-#   bootstrap 保活。plist 缺失或指向别处时视为 OFF：不中止、不 bootstrap、不动别人的
-#   plist；「job 已加载但 plist 缺失」不再永久阻断更新（App 侧开关 bootout 后遗留的
-#   中间态可正常推进，回滚后按偏好重新 bootstrap 旧版保活）。
-if JOB_INFO="$(launchctl print "gui/${MYUID}/${LABEL}" 2>/dev/null)"; then
-    LOADED_BINARY="$(printf '%s\n' "$JOB_INFO" | awk '/^[[:space:]]*program = / { sub(/^[[:space:]]*program = /, ""); print; exit }')"
-    [ "$LOADED_BINARY" = "$BINARY" ] || { echo "!! 已加载的 LaunchAgent 指向另一副本或无法确认，已中止"; exit 1; }
-    JOB_LOADED=1
-fi
-if [ -f "$AGENT_PLIST" ]; then
-    AGENT_BINARY="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$AGENT_PLIST" 2>/dev/null || true)"
-    [ "$AGENT_BINARY" = "$BINARY" ] && AGENT_PREF=1
-fi
+inspect_launch_agent
 
 echo "==> 3/5 在安装位置旁暂存新版本"
 WORK="$(mktemp -d "$(dirname "$INSTALLED")/.${APP_NAME}.update.XXXXXX")" || { echo "!! 无法在应用旁创建暂存目录（磁盘空间或位置权限不足），已中止"; exit 1; }
@@ -304,7 +322,10 @@ if [ "$JOB_LOADED" = 1 ]; then
 fi
 STOPPED=1
 stop_target
-sleep 1
+for ((i=0; i<25; i++)); do
+    [ -z "$(target_pids)" ] && break
+    sleep 0.2
+done
 if [ -n "$(target_pids)" ]; then
     echo "!! 旧进程仍未退出，取消换包"
     exit 1

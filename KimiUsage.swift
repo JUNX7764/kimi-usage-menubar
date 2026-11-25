@@ -107,6 +107,23 @@ enum DataFreshness {
     }
 }
 
+/// 月度备援收尾合并与新鲜度更新（纯函数，--self-test 覆盖）。
+/// 当月度正源失败（含 code 回调晚到的竞态）或无网页登录态，而本轮 code 响应带回
+/// `limit_month_total` 备援时，先补位月度值并清除 monthError，再推进 lastMonthSuccessAt——
+/// 避免 UI 展示备援数值的同时成功时间停滞、10 分钟后误标过期。
+enum MonthFallbackPolicy {
+    static func resolve(_ data: inout UsageData, previousSuccessAt: Date?, at completedAt: Date) -> Date? {
+        if data.monthUsed == nil, let fallbackUsed = data.monthUsedFallback {
+            data.monthUsed = fallbackUsed
+            data.monthReset = data.monthResetFallback
+            data.monthError = nil
+        }
+        return DataFreshness.updated(previousSuccessAt,
+                                     succeeded: data.monthError == nil && data.monthUsed != nil,
+                                     at: completedAt)
+    }
+}
+
 /// 日图覆盖口径：有记录的日期恒为已覆盖；缺键日只有在首轮扫描完成、本轮无失败来源
 /// 且无个别文件失败时才可证为真实 0，否则缺失占位（数据不足），绝不补零伪装趋势。
 /// 单文件失败不置错误、推进成功时间，但统计可能偏少，覆盖仍不完全。
@@ -427,6 +444,11 @@ enum TokenAggregator {
             }
             return result
         }
+        /// 裁剪窗口外日贡献与平行缓存明细，保留行累计快照（重装后可继续差分）。
+        mutating func pruneDays(cutoffKey: String) {
+            rowDays = rowDays.mapValues { $0.filter { $0.key >= cutoffKey } }
+            rowCacheDays = rowCacheDays.mapValues { $0.filter { $0.key >= cutoffKey } }
+        }
     }
 
     // v6：增加按天按模型聚合并重建文件缓存；保留旧 Hermes / ZCode 快照。
@@ -463,11 +485,14 @@ enum TokenAggregator {
         return false
     }
 
-    static let dayFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"   // 本地时区，与旧逻辑 Calendar.current 一致
-        return f
-    }()
+    /// 纯函数、线程安全且不受非公历日历（如佛历/和历）影响的日键（yyyy-MM-dd）；
+    /// 始终采用传入日历的实时时区（默认当前系统时区），保证字典序可与 cutoffKey 直接比较。
+    static func dayString(from date: Date, calendar: Calendar = .current) -> String {
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = calendar.timeZone
+        let c = gregorian.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
 
     /// Claude SDK / ZCode 可混接多家 API，按 model 字段甄别 Kimi。
     /// 缺失模型默认不归属；可信 Kimi Code 目录的旧格式由调用方单独放行。
@@ -566,12 +591,13 @@ enum TokenAggregator {
                 zcodeOK = false
             }
         }
-        let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
+        let aggNow = Date()
+        let cutoffKey = dayString(from: aggNow.addingTimeInterval(-retainSeconds))
         st.zcodeDays = st.zcodeDays?.filter { $0.key >= cutoffKey }
         st.zcodeModelDays = st.zcodeModelDays?.filter { $0.key >= cutoffKey }
         if !hermesInstalled, var hermesSnapshot = st.hermes {
-            // 卸载后不再扫描：行累计快照保留（重装可续差分），过期日贡献随窗口裁剪
-            hermesSnapshot.rowDays = hermesSnapshot.rowDays.mapValues { $0.filter { $0.key >= cutoffKey } }
+            // 卸载后不再扫描：行累计快照保留（重装可续差分），过期日贡献与缓存明细随窗口裁剪
+            hermesSnapshot.pruneDays(cutoffKey: cutoffKey)
             st.hermes = hermesSnapshot
         }
         state = st
@@ -580,12 +606,29 @@ enum TokenAggregator {
         let zcodeModels = st.zcodeModelDays ?? (st.zcodeDays ?? [:]).mapValues { ["未知模型": $0] }
         let hermesModelDays = st.hermes?.modelDays ?? [:]
         let extraModels = mergeSourceModelDays(hermesModelDays, zcodeModels)
+        // 单趟分区：work / cli 各自只扫一遍文件字典，同时产出逐工具 modelDays、cacheDays 与全量窗口输入。
+        let workPartition = partitionFileDays(st.work, partitions: [
+            (id: .work, roots: [sessionsRoot])
+        ])
+        let cliPartition = partitionFileDays(st.cli, partitions: [
+            (id: .cli, roots: [apiSessionsRoots[0]]),
+            (id: .proma, roots: Array(apiSessionsRoots[1...2])),
+            (id: .claude, roots: [apiSessionsRoots[3]])
+        ])
+        let workToolModelDays = workPartition.toolModelDays[.work] ?? [:]
+        let workToolCacheDays = workPartition.toolCacheDays[.work] ?? [:]
+        let cliToolModelDays = cliPartition.toolModelDays[.cli] ?? [:]
+        let cliToolCacheDays = cliPartition.toolCacheDays[.cli] ?? [:]
+        let promaToolModelDays = cliPartition.toolModelDays[.proma] ?? [:]
+        let promaToolCacheDays = cliPartition.toolCacheDays[.proma] ?? [:]
+        let claudeToolModelDays = cliPartition.toolModelDays[.claude] ?? [:]
+        let claudeToolCacheDays = cliPartition.toolCacheDays[.claude] ?? [:]
         // v1.5 用量洞察：逐工具贡献（Work + 5 类 API 客户端），与上方窗口同一扫描快照。
         var tools: [ToolStats] = [
-            fileToolStats(id: .work, roots: [sessionsRoot], okRoots: workScan.okRoots, files: st.work),
-            fileToolStats(id: .cli, roots: [apiSessionsRoots[0]], okRoots: cliScan.okRoots, files: st.cli),
-            fileToolStats(id: .proma, roots: Array(apiSessionsRoots[1...2]), okRoots: cliScan.okRoots, files: st.cli),
-            fileToolStats(id: .claude, roots: [apiSessionsRoots[3]], okRoots: cliScan.okRoots, files: st.cli)
+            fileToolStats(id: .work, roots: [sessionsRoot], okRoots: workScan.okRoots, modelDays: workToolModelDays),
+            fileToolStats(id: .cli, roots: [apiSessionsRoots[0]], okRoots: cliScan.okRoots, modelDays: cliToolModelDays),
+            fileToolStats(id: .proma, roots: Array(apiSessionsRoots[1...2]), okRoots: cliScan.okRoots, modelDays: promaToolModelDays),
+            fileToolStats(id: .claude, roots: [apiSessionsRoots[3]], okRoots: cliScan.okRoots, modelDays: claudeToolModelDays)
         ]
         if hermesOK != nil {
             tools.append(ToolStats(id: .hermes, modelDays: hermesModelDays,
@@ -599,20 +642,16 @@ enum TokenAggregator {
             tools.append(cached)
         }
         var mergedDays: ModelDays = [:]
-        for tool in tools { mergedDays = mergeSourceModelDays(mergedDays, tool.modelDays) }
+        for tool in tools { mergeModelDays(into: &mergedDays, from: tool.modelDays) }
         // 缓存命中卡 v2（六源各自成对）：文件源按 root 分区（与 fileToolStats 同款前缀规则），
         // 分子 cacheDays 与分母 modelDays 同区拆，防来源行分子分母错位；Hermes 来自同一段行
         // 快照；ZCode 缓存读取失败 → 该源 (input, cache) 同退（整体缺席，不静默造 0）。
         // 「整体」= 保留源合并，数学与 v1 全源合并一致（self-test 有 parity 断言）。
-        func cachePair(id: ToolID, roots: [String], files: [String: FileScanState]) -> CacheSnapshot.SourcePair {
-            CacheSnapshot.SourcePair(id: id, modelDays: toolModelDays(files, under: roots),
-                                     cacheDays: toolCacheDays(files, under: roots))
-        }
         var cacheSources: [CacheSnapshot.SourcePair] = [
-            cachePair(id: .work, roots: [sessionsRoot], files: st.work),
-            cachePair(id: .cli, roots: [apiSessionsRoots[0]], files: st.cli),
-            cachePair(id: .proma, roots: Array(apiSessionsRoots[1...2]), files: st.cli),
-            cachePair(id: .claude, roots: [apiSessionsRoots[3]], files: st.cli),
+            CacheSnapshot.SourcePair(id: .work, modelDays: workToolModelDays, cacheDays: workToolCacheDays),
+            CacheSnapshot.SourcePair(id: .cli, modelDays: cliToolModelDays, cacheDays: cliToolCacheDays),
+            CacheSnapshot.SourcePair(id: .proma, modelDays: promaToolModelDays, cacheDays: promaToolCacheDays),
+            CacheSnapshot.SourcePair(id: .claude, modelDays: claudeToolModelDays, cacheDays: claudeToolCacheDays),
             CacheSnapshot.SourcePair(id: .hermes, modelDays: hermesModelDays,
                                      cacheDays: st.hermes?.cacheModelDays ?? [:])
         ]
@@ -621,62 +660,84 @@ enum TokenAggregator {
                                                          cacheDays: zcodeCacheDays))
         }
         let cacheSnapshot = assembleCacheSnapshot(sources: cacheSources)
+        var cliAllModelDays = cliPartition.allModelDays
+        mergeModelDays(into: &cliAllModelDays, from: extraModels)
         return BothStats(
-            work: buckets(st.work), cli: buckets(st.cli, extraModelDays: extraModels),
+            work: statWindows(workPartition.allModelDays, now: aggNow),
+            cli: statWindows(cliAllModelDays, now: aggNow),
             workError: sourceError(installed: workScan.installed, enumerated: workScan.enumerated, hermesOK: nil),
             cliError: sourceError(installed: cliScan.installed, enumerated: cliScan.enumerated,
                                   hermesOK: hermesOK, zcodeOK: zcodeOK),
             workFailedFiles: workScan.failedFiles,
             cliFailedFiles: cliScan.failedFiles,
-            merged: statWindows(mergedDays),
+            merged: statWindows(mergedDays, now: aggNow),
             daily: dailyTotals(mergedDays),
             tools: tools,
             cache: cacheSnapshot)
     }
 
-    static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
-        // 在聚合边界归一，也兼容旧缓存里的提供商前缀，不必重建 API 来源。
-        var result: ModelDays = [:]
-        for source in [first, second] {
-            for (day, models) in source {
-                for (rawModel, value) in models {
-                    let model = normalizedModel(rawModel)
-                    var total = result[day]?[model] ?? [0, 0]
-                    total[0] += value[0]; total[1] += value[1]
-                    result[day, default: [:]][model] = total
+    static func mergeModelDays(into target: inout ModelDays, from source: ModelDays) {
+        // 在聚合边界归一，也兼容旧缓存里的提供商前缀，不必重建 API 来源；
+        // removeValue 移出内层字典避免 Swift Dictionary Copy-on-Write 重复拷贝。
+        for (day, models) in source {
+            guard !models.isEmpty else { continue }
+            var dayBucket = target.removeValue(forKey: day) ?? [:]
+            for (rawModel, value) in models {
+                let model = normalizedModel(rawModel)
+                if dayBucket[model] != nil {
+                    dayBucket[model]![0] += value[0]
+                    dayBucket[model]![1] += value[1]
+                } else {
+                    dayBucket[model] = [value[0], value[1]]
                 }
             }
+            target[day] = dayBucket
         }
+    }
+
+    static func mergeCacheDays(into target: inout CacheDays, from source: CacheDays) {
+        for (day, models) in source {
+            guard !models.isEmpty else { continue }
+            var dayBucket = target.removeValue(forKey: day) ?? [:]
+            for (rawModel, value) in models {
+                let model = normalizedModel(rawModel)
+                if dayBucket[model] != nil {
+                    dayBucket[model]![0] += value[0]
+                    dayBucket[model]![1] += value[1]
+                } else {
+                    dayBucket[model] = [value[0], value[1]]
+                }
+            }
+            target[day] = dayBucket
+        }
+    }
+
+    static func mergeSourceModelDays(_ first: ModelDays, _ second: ModelDays) -> ModelDays {
+        var result: ModelDays = [:]
+        mergeModelDays(into: &result, from: first)
+        mergeModelDays(into: &result, from: second)
         return result
     }
 
     /// 缓存明细合并（镜像 mergeSourceModelDays）：多来源同模型同日 cache 求和，模型名同边界归一。
     static func mergeSourceCacheDays(_ first: CacheDays, _ second: CacheDays) -> CacheDays {
         var result: CacheDays = [:]
-        for source in [first, second] {
-            for (day, models) in source {
-                for (rawModel, value) in models {
-                    let model = normalizedModel(rawModel)
-                    var total = result[day]?[model] ?? [0, 0]
-                    total[0] += value[0]; total[1] += value[1]
-                    result[day, default: [:]][model] = total
-                }
-            }
-        }
+        mergeCacheDays(into: &result, from: first)
+        mergeCacheDays(into: &result, from: second)
         return result
     }
 
     /// 文件状态字典的按日 × 模型聚合（buckets 的模型维度拆分，供缓存卡分母复用同源 input）。
     static func modelDays(from files: [String: FileScanState]) -> ModelDays {
         var result: ModelDays = [:]
-        for (_, st) in files { result = mergeSourceModelDays(result, st.modelDays) }
+        for (_, st) in files { mergeModelDays(into: &result, from: st.modelDays) }
         return result
     }
 
     /// 文件状态字典的平行缓存明细聚合（与 modelDays(from:) 逐文件同源配对）。
     static func cacheDays(from files: [String: FileScanState]) -> CacheDays {
         var result: CacheDays = [:]
-        for (_, st) in files { result = mergeSourceCacheDays(result, st.cacheDays) }
+        for (_, st) in files { mergeCacheDays(into: &result, from: st.cacheDays) }
         return result
     }
 
@@ -694,12 +755,13 @@ enum TokenAggregator {
         return nil
     }
 
-    /// 本地日历日键（yyyy-MM-dd）：与 dayFmt 同口径，但支持注入 Calendar 以便测试 DST/跨月。
+    /// 本地日历日键（yyyy-MM-dd）：日偏移与格式化统一使用公历 + 传入时区，支持注入 Calendar 以便测试 DST/跨月/非公历。
     static func dayKey(_ offset: Int, from now: Date, calendar: Calendar = .current) -> String {
-        let date = calendar.date(byAdding: .day, value: offset, to: now)
+        var gregorian = Calendar(identifier: .gregorian)
+        gregorian.timeZone = calendar.timeZone
+        let date = gregorian.date(byAdding: .day, value: offset, to: now)
             ?? now.addingTimeInterval(Double(offset) * 86400)
-        let c = calendar.dateComponents([.year, .month, .day], from: date)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+        return dayString(from: date, calendar: gregorian)
     }
 
     /// 日键（yyyy-MM-dd）的展示标签 MM/DD；异常键原样返回。比较条区间与日图刻度共用。
@@ -731,7 +793,7 @@ enum TokenAggregator {
                      into files: inout [String: FileScanState]) -> (installed: Int, enumerated: Int, okRoots: [String], failedFiles: Int) {
         let now = Date()
         let cutoff = now.addingTimeInterval(-retainSeconds)
-        let cutoffKey = dayFmt.string(from: cutoff)
+        let cutoffKey = dayString(from: cutoff)
         var seen = Set<String>()
         var enumedRoots: [String] = []
         var installed = 0
@@ -778,7 +840,17 @@ enum TokenAggregator {
                 // （绝大多数文件走这里）；同 offset 的整文件替换（等长换内容）靠 mtime 识别，
                 // mtime 相同但 inode 变化（cp -p 保mtime 替换）靠 inode 识别
                 if st.offset == sizeU && st.scanRevision == revision && st.mtime == mtime && st.inode == inode {
-                    files[path] = st; continue
+                    // 未变文件也需随日期滑动裁剪超出保留窗的旧日键；无过期键时不回写字典，保持 writeIfChanged 零写盘。
+                    let hasStale = st.days.keys.contains(where: { $0 < cutoffKey })
+                        || st.modelDays.keys.contains(where: { $0 < cutoffKey })
+                        || st.cacheDays.keys.contains(where: { $0 < cutoffKey })
+                    if hasStale {
+                        st.days = st.days.filter { $0.key >= cutoffKey }
+                        st.modelDays = st.modelDays.filter { $0.key >= cutoffKey }
+                        st.cacheDays = st.cacheDays.filter { $0.key >= cutoffKey }
+                        files[path] = st
+                    }
+                    continue
                 }
                 // 首次见到且 31 天未修改：不可能贡献近 30 天数据，记录大小与身份指纹后跳过
                 if st.offset == 0, st.days.isEmpty, st.modelDays.isEmpty, st.cacheDays.isEmpty,
@@ -874,7 +946,7 @@ enum TokenAggregator {
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
 
-        let cutoffKey = dayFmt.string(from: Date().addingTimeInterval(-retainSeconds))
+        let cutoffKey = dayString(from: Date().addingTimeInterval(-retainSeconds))
         var hs = st.hermes ?? HermesState()
         var alive = Set<String>()
         while true {
@@ -904,9 +976,11 @@ enum TokenAggregator {
             var dCacheRead = cumCacheRead - oldCache[0], dCacheWrite = cumCacheWrite - oldCache[1]
             if dCacheRead < 0 || dCacheWrite < 0 { dCacheRead = max(dCacheRead, 0); dCacheWrite = max(dCacheWrite, 0) }
             hs.rowCache[key] = [cumCacheRead, cumCacheWrite]
+            let rowDayKey = (dIn > 0 || dOut > 0 || dCacheRead > 0 || dCacheWrite > 0) && lastSeen > 0
+                ? dayString(from: Date(timeIntervalSince1970: lastSeen))
+                : nil
             var days = hs.rowDays[key] ?? [:]
-            if (dIn > 0 || dOut > 0), lastSeen > 0 {
-                let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+            if (dIn > 0 || dOut > 0), let dayKey = rowDayKey {
                 if dayKey >= cutoffKey {
                     var day = days[dayKey] ?? [0, 0]
                     day[0] += dIn; day[1] += dOut
@@ -915,8 +989,7 @@ enum TokenAggregator {
             }
             hs.rowDays[key] = days.filter { $0.key >= cutoffKey }
             var cacheDays = hs.rowCacheDays[key] ?? [:]
-            if (dCacheRead > 0 || dCacheWrite > 0), lastSeen > 0 {
-                let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: lastSeen))
+            if (dCacheRead > 0 || dCacheWrite > 0), let dayKey = rowDayKey {
                 if dayKey >= cutoffKey {
                     var day = cacheDays[dayKey] ?? [0, 0]
                     day[0] += dCacheRead; day[1] += dCacheWrite
@@ -991,7 +1064,7 @@ enum TokenAggregator {
         defer { sqlite3_finalize(stmt) }
         let cutoff = now.addingTimeInterval(-retainSeconds)
         sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
-        let cutoffKey = dayFmt.string(from: cutoff)
+        let cutoffKey = dayString(from: cutoff)
         var days: ModelDays = [:]
         while true {
             let rc = sqlite3_step(stmt)
@@ -1001,7 +1074,7 @@ enum TokenAggregator {
             guard isKimiModel(model) else { continue }
             let startedAt = sqlite3_column_double(stmt, 3)
             guard startedAt > 0 else { continue }
-            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: startedAt / 1000))
+            let dayKey = dayString(from: Date(timeIntervalSince1970: startedAt / 1000))
             guard dayKey >= cutoffKey else { continue }
             var value = days[dayKey]?[model] ?? [0, 0]
             value[0] += sqlite3_column_double(stmt, 1)
@@ -1047,7 +1120,7 @@ enum TokenAggregator {
         defer { sqlite3_finalize(stmt) }
         let cutoff = now.addingTimeInterval(-retainSeconds)
         sqlite3_bind_int64(stmt, 1, Int64(cutoff.timeIntervalSince1970 * 1000))
-        let cutoffKey = dayFmt.string(from: cutoff)
+        let cutoffKey = dayString(from: cutoff)
         var days: CacheDays = [:]
         while true {
             let rc = sqlite3_step(stmt)
@@ -1057,7 +1130,7 @@ enum TokenAggregator {
             guard isKimiModel(model) else { continue }
             let startedAt = sqlite3_column_double(stmt, 4)
             guard startedAt > 0 else { continue }
-            let dayKey = dayFmt.string(from: Date(timeIntervalSince1970: startedAt / 1000))
+            let dayKey = dayString(from: Date(timeIntervalSince1970: startedAt / 1000))
             guard dayKey >= cutoffKey else { continue }
             var value = days[dayKey]?[model] ?? [0, 0]
             value[0] += sqlite3_column_double(stmt, 2)
@@ -1092,8 +1165,8 @@ enum TokenAggregator {
         var modelDays: ModelDays = [:]
         var cacheDays: CacheDays = [:]
         for source in sources {
-            modelDays = mergeSourceModelDays(modelDays, source.modelDays)
-            cacheDays = mergeSourceCacheDays(cacheDays, source.cacheDays)
+            mergeModelDays(into: &modelDays, from: source.modelDays)
+            mergeCacheDays(into: &cacheDays, from: source.cacheDays)
         }
         snapshot.modelDays = modelDays
         snapshot.cacheDays = cacheDays
@@ -1309,7 +1382,7 @@ enum TokenAggregator {
             else if let v = usage[k] as? Int { cacheCreation += Double(v) }
         }
 
-        let dayKey = dayFmt.string(from: t)
+        let dayKey = dayString(from: t)
         if dayKey >= cutoffKey {
             var day = st.days[dayKey] ?? [0, 0]
             day[0] += input
@@ -1332,7 +1405,7 @@ enum TokenAggregator {
     /// 模型名须已归一；各模型之和等于周期总量；日图与周期共用同一份数据。
     static func statWindows(_ days: ModelDays, now: Date = Date())
         -> (today: TokenStat, week: TokenStat, month: TokenStat) {
-        let todayKey = dayFmt.string(from: now)
+        let todayKey = dayString(from: now)
         let (d7Key, d30Key) = windowCutoffs(now: now)
         var today = TokenStat(), week = TokenStat(), month = TokenStat()
         func add(_ value: [Double], model: String, to stat: inout TokenStat) {
@@ -1355,7 +1428,7 @@ enum TokenAggregator {
     /// day→model→[cacheRead, cacheCreation] 求和，模型键与 modelDays 同为已归一名。
     static func cacheWindows(_ cacheDays: CacheDays, now: Date = Date())
         -> (today: [String: [Double]], week: [String: [Double]], month: [String: [Double]]) {
-        let todayKey = dayFmt.string(from: now)
+        let todayKey = dayString(from: now)
         let (d7Key, d30Key) = windowCutoffs(now: now)
         var today: [String: [Double]] = [:]
         var week: [String: [Double]] = [:]
@@ -1381,9 +1454,9 @@ enum TokenAggregator {
         -> (TokenStat, TokenStat, TokenStat) {
         var allDays: ModelDays = [:]
         for (_, st) in files {
-            allDays = mergeSourceModelDays(allDays, st.modelDays)
+            mergeModelDays(into: &allDays, from: st.modelDays)
         }
-        allDays = mergeSourceModelDays(allDays, extraModelDays)
+        mergeModelDays(into: &allDays, from: extraModelDays)
         return statWindows(allDays)
     }
 
@@ -1513,13 +1586,16 @@ enum TokenAggregator {
     /// 从文件状态字典聚合单个工具的按日 × 模型贡献。
     static func toolModelDays(_ files: [String: FileScanState],
                               under roots: [String] = []) -> ModelDays {
-        let bases = roots.map { realPath($0) }   // realpath 提升到每根一次，不在逐文件循环内重复
+        let bases = roots.map { base -> (exact: String, prefix: String) in
+            let resolved = realPath(base)
+            return (resolved, resolved + "/")
+        }   // realpath 与前缀提升到每根一次，不在逐文件循环内重复
         var days: ModelDays = [:]
         for (path, st) in files {
-            if !bases.isEmpty && !bases.contains(where: { base in
-                path == base || path.hasPrefix(base + "/")
-            }) { continue }
-            days = mergeSourceModelDays(days, st.modelDays)
+            if !bases.isEmpty && !bases.contains(where: { path == $0.exact || path.hasPrefix($0.prefix) }) {
+                continue
+            }
+            mergeModelDays(into: &days, from: st.modelDays)
         }
         return days
     }
@@ -1528,21 +1604,62 @@ enum TokenAggregator {
     /// 缓存卡 v2 逐源拆分：cacheDays 与 modelDays 必须同区拆，防来源行分子分母错位）。
     static func toolCacheDays(_ files: [String: FileScanState],
                               under roots: [String] = []) -> CacheDays {
-        let bases = roots.map { realPath($0) }
+        let bases = roots.map { base -> (exact: String, prefix: String) in
+            let resolved = realPath(base)
+            return (resolved, resolved + "/")
+        }
         var days: CacheDays = [:]
         for (path, st) in files {
-            if !bases.isEmpty && !bases.contains(where: { base in
-                path == base || path.hasPrefix(base + "/")
-            }) { continue }
-            days = mergeSourceCacheDays(days, st.cacheDays)
+            if !bases.isEmpty && !bases.contains(where: { path == $0.exact || path.hasPrefix($0.prefix) }) {
+                continue
+            }
+            mergeCacheDays(into: &days, from: st.cacheDays)
         }
         return days
+    }
+
+    struct PartitionedFileDays {
+        var allModelDays: ModelDays = [:]
+        var toolModelDays: [ToolID: ModelDays] = [:]
+        var toolCacheDays: [ToolID: CacheDays] = [:]
+    }
+
+    /// 单趟遍历文件状态字典，同时产出全量 modelDays 与各工具分区的 (modelDays, cacheDays)，
+    /// 避免在 aggregateBothDetailed 中对同一文件字典反复扫描。
+    static func partitionFileDays(_ files: [String: FileScanState],
+                                  partitions: [(id: ToolID, roots: [String])]) -> PartitionedFileDays {
+        let resolved = partitions.map { partition in
+            (id: partition.id, bases: partition.roots.map { root -> (exact: String, prefix: String) in
+                let real = realPath(root)
+                return (real, real + "/")
+            })
+        }
+        var allModelDays: ModelDays = [:]
+        var partModels = Array(repeating: ModelDays(), count: resolved.count)
+        var partCaches = Array(repeating: CacheDays(), count: resolved.count)
+        for (path, st) in files {
+            mergeModelDays(into: &allModelDays, from: st.modelDays)
+            for idx in resolved.indices {
+                let bases = resolved[idx].bases
+                if !bases.isEmpty && !bases.contains(where: { path == $0.exact || path.hasPrefix($0.prefix) }) {
+                    continue
+                }
+                mergeModelDays(into: &partModels[idx], from: st.modelDays)
+                mergeCacheDays(into: &partCaches[idx], from: st.cacheDays)
+            }
+        }
+        var result = PartitionedFileDays(allModelDays: allModelDays)
+        for idx in resolved.indices {
+            result.toolModelDays[resolved[idx].id] = partModels[idx]
+            result.toolCacheDays[resolved[idx].id] = partCaches[idx]
+        }
+        return result
     }
 
     /// 组装逐工具贡献与安装/读取状态。okRoots 为本轮枚举成功的 realpath 集合；
     /// 失败 root 的旧快照贡献保留（工具明细标「部分记录 · 缓存」）。
     private static func fileToolStats(id: ToolID, roots: [String], okRoots: [String],
-                                      files: [String: FileScanState]) -> ToolStats {
+                                      modelDays: ModelDays) -> ToolStats {
         var installed = false
         var ok = true
         for root in roots {
@@ -1550,12 +1667,14 @@ enum TokenAggregator {
             installed = true
             if !okRoots.contains(realPath(root)) { ok = false }
         }
-        return ToolStats(id: id, modelDays: toolModelDays(files, under: roots), installed: installed, ok: ok)
+        return ToolStats(id: id, modelDays: modelDays, installed: installed, ok: ok)
     }
 }
 
 enum ISO {
-    // formatter 创建有开销，复用静态实例（旧实现每次调用新建，全量扫描时是热点）
+    // formatter 创建有开销，复用静态实例（旧实现每次调用新建，全量扫描时是热点）；
+    // URLSession 回调与 TokenAggregator 后台扫描可并发调用，需以锁保护非线程安全的 ISO8601DateFormatter。
+    private static let lock = NSLock()
     private static let frac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1568,6 +1687,7 @@ enum ISO {
     }()
     static func parse(_ s: String?) -> Date? {
         guard let s = s else { return nil }
+        lock.lock(); defer { lock.unlock() }
         return frac.date(from: s) ?? plain.date(from: s)
     }
 }
@@ -2029,6 +2149,8 @@ final class UpdateProgressController: NSObject {
         phase == .installing ? "应用将自动退出并重启，无需手动操作" : nil
     }
 
+    private static let progressPercentRegex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#)
+
     private var timer: Timer?
     private var directory: URL?
 
@@ -2096,7 +2218,7 @@ final class UpdateProgressController: NSObject {
         else if log.contains("下载 v") {
             var value: Double?
             if let text = try? String(contentsOf: dir.appendingPathComponent("progress"), encoding: .utf8),
-               let regex = try? NSRegularExpression(pattern: #"([0-9]+(?:\.[0-9]+)?)%"#),
+               let regex = Self.progressPercentRegex,
                let match = regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).last,
                let range = Range(match.range(at: 1), in: text) {
                 value = Double(text[range])
@@ -2474,8 +2596,8 @@ struct UsagePanelModel: Equatable {
             var mergedModelDays: TokenAggregator.ModelDays = [:]
             var mergedCacheDays: TokenAggregator.CacheDays = [:]
             for source in sources {
-                mergedModelDays = TokenAggregator.mergeSourceModelDays(mergedModelDays, source.modelDays)
-                mergedCacheDays = TokenAggregator.mergeSourceCacheDays(mergedCacheDays, source.cacheDays)
+                TokenAggregator.mergeModelDays(into: &mergedModelDays, from: source.modelDays)
+                TokenAggregator.mergeCacheDays(into: &mergedCacheDays, from: source.cacheDays)
             }
             let mergedStats = TokenAggregator.statWindows(mergedModelDays, now: now)
             let mergedCaches = TokenAggregator.cacheWindows(mergedCacheDays, now: now)
@@ -2504,13 +2626,11 @@ struct UsagePanelModel: Equatable {
                 let models = stat.models.filter { $0.value.input > 0 }
                 guard !models.isEmpty else { return nil }
                 var totalInput = 0.0, totalRead = 0.0, totalCreation = 0.0
-                var anyEvidence = false
                 for (model, value) in models {
                     let cacheValue = cache[model] ?? [0, 0]
                     totalInput += value.input
                     totalRead += cacheValue[0]
                     totalCreation += cacheValue[1]
-                    anyEvidence = anyEvidence || cacheValue[0] > 0 || cacheValue[1] > 0
                 }
                 let overallHit = hitText(totalRead, totalCreation)
                     ?? "\(Int((totalRead / totalInput * 100).rounded()))% 命中"
@@ -2527,13 +2647,11 @@ struct UsagePanelModel: Equatable {
                 guard !models.isEmpty else { return nil }   // 零用量源不显示行
                 var modelRows: [CacheRow] = []
                 var totalInput = 0.0, totalRead = 0.0, totalCreation = 0.0
-                var anyEvidence = false
                 for (model, value) in models {
                     let cacheValue = window.cache[model] ?? [0, 0]
                     totalInput += value.input
                     totalRead += cacheValue[0]
                     totalCreation += cacheValue[1]
-                    anyEvidence = anyEvidence || cacheValue[0] > 0 || cacheValue[1] > 0
                     let modelHit = hitText(cacheValue[0], cacheValue[1])
                         ?? "\(Int((cacheValue[0] / value.input * 100).rounded()))% 命中"
                     modelRows.append(CacheRow(name: TokenAggregator.modelDisplayName(model),
@@ -6254,6 +6372,21 @@ enum LoginItemDecision {
     }
 }
 
+/// LaunchAgent plist 写入辅助（可离线测试父目录自动创建，不触碰真实 ~/Library/LaunchAgents）。
+enum LaunchAgentFiles {
+    static func ensureParentDirectory(forFilePath path: String) throws {
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    static func writePlist(_ plist: [String: Any], to path: String) throws {
+        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+        try ensureParentDirectory(forFilePath: path)
+        // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
+        try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let panelController = UsagePanelController()
     private let visualPreview = CommandLine.arguments.contains { $0.hasPrefix("--visual-preview") }
@@ -6279,15 +6412,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var usage = UsageData()
     private let refreshGate = RefreshGate()
     private let launchAgentLabel = "com.local.kimi-usage"
+    private let loginItemQueue = DispatchQueue(label: "KimiUsage.LoginItem", qos: .utility)
+    private let loginItemSeqLock = NSLock()
+    private var loginItemOpSeq = 0
     // 状态栏底色随全屏进出/深浅模式翻转时，KVO 触发按新外观重画（否则浅色栏上残留白色余量文字）；
     // setImage 也会再次触发 KVO 通知，用明暗主题快照去重防止 renderBar↔KVO 反馈循环。
     // 菜单栏可因深色壁纸、双屏或全屏而与 App 外观合法地不同，不能用 App 外观覆盖菜单栏。
     // 每 5s 对账，不一致时仅重建不缓存的动态颜色图片，不切换 isVisible、不钉死绘制外观。
     private var statusItemAppearanceObs: NSKeyValueObservation?
     private var barThemeDark: Bool?
+    private struct BarRenderKey: Equatable {
+        let label1: String
+        let value1: String
+        let remaining1: Int?
+        let label2: String
+        let value2: String
+        let remaining2: Int?
+        let dark: Bool
+    }
+    private var lastBarRenderKey: BarRenderKey?
     private var appearancePollTimer: Timer?
     private var updateProgressObserver: NSObjectProtocol?
     private var updateProgressWasActive = false
+    // 慢轮本地扫描产物派生缓存：10s 快轮不重扫 token，若快照代际、日历日键与覆盖状态均未变，
+    // 直接复用已构建的 brief / tools / cache 段，避免主线程每 10s 重复遍历日历与模型明细。
+    private struct TokenSectionsCacheKey: Equatable {
+        let version: Int
+        let dayKey: String
+        let coverageOK: Bool
+    }
+    private var tokenSnapshotVersion = 0
+    private var cachedTokenSections: (key: TokenSectionsCacheKey,
+                                      brief: UsagePanelModel.BriefSection,
+                                      tools: UsagePanelModel.ToolsSection,
+                                      cache: UsagePanelModel.CacheSection)?
     // status.json 内容指纹（剔除心跳时间）与心跳写盘策略：内容未变时跳过磁盘写与日志，
     // 仅按 60s 心跳降频写一次（渲染每 10s 一次，稳定状态多为重复内容）
     private var lastStatusContentPayload: String?
@@ -6578,25 +6736,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self = self else { return }
             let completedAt = Date()
             mergeLock.lock()
-            let mergedSnapshot = merged
+            var merged = merged
             mergeLock.unlock()
             self.lastFiveHourSuccessAt = DataFreshness.updated(self.lastFiveHourSuccessAt,
-                succeeded: mergedSnapshot.fiveHourUsed != nil, at: completedAt)
+                succeeded: merged.fiveHourUsed != nil, at: completedAt)
             self.lastSevenDaySuccessAt = DataFreshness.updated(self.lastSevenDaySuccessAt,
-                succeeded: mergedSnapshot.sevenDayUsed != nil, at: completedAt)
-            if includeSlow {
-                self.lastMonthSuccessAt = DataFreshness.updated(self.lastMonthSuccessAt,
-                    succeeded: mergedSnapshot.monthError == nil && mergedSnapshot.monthUsed != nil, at: completedAt)
-                // 扫描失败面：已安装来源全部不可读时不推进成功时间，30 分钟后 ⚠️ 自动亮起
-                self.workTokensLastSuccessAt = DataFreshness.updated(self.workTokensLastSuccessAt,
-                    succeeded: mergedSnapshot.workTokensError == nil, at: completedAt)
-                self.cliTokensLastSuccessAt = DataFreshness.updated(self.cliTokensLastSuccessAt,
-                    succeeded: mergedSnapshot.cliTokensError == nil, at: completedAt)
-            }
+                succeeded: merged.sevenDayUsed != nil, at: completedAt)
 
-            var merged = mergedSnapshot
             let old = self.usage
-            mergeLock.lock()
             if merged.fiveHourUsed == nil { merged.fiveHourUsed = old.fiveHourUsed; merged.fiveHourReset = old.fiveHourReset }
             if merged.sevenDayUsed == nil { merged.sevenDayUsed = old.sevenDayUsed; merged.sevenDayReset = old.sevenDayReset }
             if !includeSlow {
@@ -6614,13 +6761,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // 快轮不触发扫描：首轮完成状态沿旧值保留，扫描完成后不会退回未知态
                 merged.scanCompleted = old.scanCompleted
             } else {
-                // 月度备援收尾兜底：此处所有回调已汇合，若月度正源失败（含 code 回调晚到
-                // 的竞态、无登录态分支）而本轮备援可用，统一补位并清错误，避免数值+失败并存。
-                if merged.monthUsed == nil, let fallbackUsed = merged.monthUsedFallback {
-                    merged.monthUsed = fallbackUsed
-                    merged.monthReset = merged.monthResetFallback
-                    merged.monthError = nil
-                }
+                // 月度备援收尾兜底与新鲜度更新：先补位备援并清错误，再推进 lastMonthSuccessAt，
+                // 保证正源晚于/早于 code 返回或无登录态备援生效时，新鲜度与展示一致。
+                self.lastMonthSuccessAt = MonthFallbackPolicy.resolve(&merged,
+                    previousSuccessAt: self.lastMonthSuccessAt, at: completedAt)
+                // 扫描失败面：已安装来源全部不可读时不推进成功时间，30 分钟后 ⚠️ 自动亮起
+                self.workTokensLastSuccessAt = DataFreshness.updated(self.workTokensLastSuccessAt,
+                    succeeded: merged.workTokensError == nil, at: completedAt)
+                self.cliTokensLastSuccessAt = DataFreshness.updated(self.cliTokensLastSuccessAt,
+                    succeeded: merged.cliTokensError == nil, at: completedAt)
                 if merged.monthUsed == nil { merged.monthUsed = old.monthUsed; merged.monthReset = old.monthReset }
                 // 失败时保留旧套餐；明确退出登录则清空，避免显示上一账号的标签。
                 // 备援生效轮同样保留（备援不提供 planName，不清空也不虚构）。
@@ -6636,9 +6785,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     merged.accountName = old.accountName; merged.accountPhone = old.accountPhone
                 }
                 // 即使部分来源失败，也显示健康来源的新贡献和失败来源的缓存。
-
+                self.tokenSnapshotVersion += 1
             }
-            mergeLock.unlock()
             self.usage = merged
             self.updateUI()
             if self.refreshGate.finish() { self.performRefresh(includeSlow: true) }
@@ -6805,9 +6953,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let line2 = StackImage.Line(label: (sevenDayStale ? "⚠️ 7D" : "7D"),
                                     value: Fmt.pct(remaining(usage.sevenDayUsed)), remaining: sevenRemaining)
         let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
-        barThemeDark = isDark(appearance)
-        statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
-        statusItem.button?.title = ""
+        let dark = isDark(appearance)
+        barThemeDark = dark
+        let renderKey = BarRenderKey(
+            label1: line1.label, value1: line1.value, remaining1: line1.remaining,
+            label2: line2.label, value2: line2.value, remaining2: line2.remaining,
+            dark: dark
+        )
+        if renderKey != lastBarRenderKey || statusItem.button?.image == nil {
+            statusItem.button?.image = StackImage.make(line1: line1, line2: line2)
+            statusItem.button?.title = ""
+            lastBarRenderKey = renderKey
+        }
         // toolTip 显示最后成功时间而非渲染时间：断网时能直接看出数据有多旧
         statusItem.button?.toolTip = "Kimi 余额 · 5H成功 \(Fmt.lastOK(lastFiveHourSuccessAt)) · 7D成功 \(Fmt.lastOK(lastSevenDaySuccessAt))"
             + " · 月度成功 \(Fmt.lastOK(lastMonthSuccessAt)) · Work扫描成功 \(Fmt.lastOK(workTokensLastSuccessAt))"
@@ -6829,17 +6986,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // 自诊断：把渲染内容和状态项可见性写到本地，便于排查
     private func writeStatus(line1: String, line2: String) {
-        let dir = NSHomeDirectory() + "/Library/Application Support/KimiUsage"
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let monthStatus: [String: Any] = [
             "remaining": remaining(usage.monthUsed) ?? -1.0,
             "error": usage.monthError ?? "",
             "lastSuccessAt": lastMonthSuccessAt.map { Fmt.iso8601.string(from: $0) } ?? ""
         ]
-        var info: [String: Any] = [
+        // 先构造不含 lastAttemptAt 的内容字典并比对指纹；内容未变且心跳未到期时直接跳过全量序列化与写盘。
+        var contentInfo: [String: Any] = [
             "line1": line1,
             "line2": line2,
-            "lastAttemptAt": Fmt.iso8601.string(from: lastAttemptAt),
             "version": BuildInfo.version,
             "planName": usage.planName ?? "",
             "accountName": usage.accountName ?? "",
@@ -6877,44 +7032,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button, let win = button.window {
             let f = button.convert(button.bounds, to: nil)
             let sf = win.convertToScreen(f)
-            info["buttonScreenFrame"] = ["x": sf.origin.x, "y": sf.origin.y,
-                                         "w": sf.size.width, "h": sf.size.height]
-            info["windowVisible"] = win.isVisible
-            info["windowOnActiveSpace"] = win.isOnActiveSpace
+            contentInfo["buttonScreenFrame"] = ["x": sf.origin.x, "y": sf.origin.y,
+                                                "w": sf.size.width, "h": sf.size.height]
+            contentInfo["windowVisible"] = win.isVisible
+            contentInfo["windowOnActiveSpace"] = win.isOnActiveSpace
             var screens: [[String: Double]] = []
             for s in NSScreen.screens {
                 screens.append(["x": s.frame.origin.x, "y": s.frame.origin.y,
                                 "w": s.frame.size.width, "h": s.frame.size.height])
             }
-            info["screens"] = screens
+            contentInfo["screens"] = screens
         } else {
-            info["windowVisible"] = false
+            contentInfo["windowVisible"] = false
         }
-        if let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) {
-            // 内容指纹剔除 lastAttemptAt（每轮都变的心跳时间），稳定状态才能真正命中去重；
-            // 内容不变时按 StatusWritePolicy 的心跳间隔降频写盘，保留诊断活性。
-            var contentInfo = info
-            contentInfo["lastAttemptAt"] = nil
-            let contentPayload = (try? JSONSerialization.data(withJSONObject: contentInfo, options: [.prettyPrinted, .sortedKeys]))
-                .flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            let contentChanged = contentPayload != lastStatusContentPayload
-            let now = Date()
-            if statusWritePolicy.shouldWrite(contentChanged: contentChanged, now: now) {
-                do {
-                    // 0600 原子写：status.json 含账号昵称/打码手机号等 PII，避免 0644 可被其他本地用户读取与半写状态
-                    try AtomicJSONFile.replace(data, at: dir + "/status.json", mode: 0o600)
-                    // 只有写盘成功才推进心跳与内容指纹；失败时下轮仍会补写。
-                    statusWritePolicy.didWrite(at: now)
-                    if contentChanged {
-                        NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
-                        lastStatusContentPayload = contentPayload
-                    } else {
-                        NSLog("[KimiUsage] status heartbeat written")
-                    }
-                } catch {
-                    NSLog("[KimiUsage] status write failed: %@", error.localizedDescription)
-                }
+        guard let contentData = try? JSONSerialization.data(withJSONObject: contentInfo, options: [.prettyPrinted, .sortedKeys]),
+              let contentPayload = String(data: contentData, encoding: .utf8)
+        else { return }
+        let contentChanged = contentPayload != lastStatusContentPayload
+        let now = Date()
+        guard statusWritePolicy.shouldWrite(contentChanged: contentChanged, now: now) else { return }
+        var info = contentInfo
+        info["lastAttemptAt"] = Fmt.iso8601.string(from: lastAttemptAt)
+        guard let data = try? JSONSerialization.data(withJSONObject: info, options: [.prettyPrinted, .sortedKeys]) else { return }
+        let dir = NSHomeDirectory() + "/Library/Application Support/KimiUsage"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        do {
+            // 0600 原子写：status.json 含账号昵称/打码手机号等 PII，避免 0644 可被其他本地用户读取与半写状态
+            try AtomicJSONFile.replace(data, at: dir + "/status.json", mode: 0o600)
+            // 只有写盘成功才推进心跳与内容指纹；失败时下轮仍会补写。
+            statusWritePolicy.didWrite(at: now)
+            if contentChanged {
+                NSLog("[KimiUsage] rendered %@ / %@", line1, line2)
+                lastStatusContentPayload = contentPayload
+            } else {
+                NSLog("[KimiUsage] status heartbeat written")
             }
+        } catch {
+            NSLog("[KimiUsage] status write failed: %@", error.localizedDescription)
         }
     }
 
@@ -6949,6 +7103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let item = NSMenuItem(title: title, action: selector, keyEquivalent: key); item.target = self; return item
         }
         let update = UpdateChecker.shared.available ? item("⬆ 新版本可用，点击更新", #selector(onUpdateApp)) : nil
+        // 本帧统一时间快照：避免跨午夜时 brief / tools / cache 各自取 Date() 造成日界错位。
+        let now = Date()
         // v1.5 用量洞察：用量情况（合并 Work + API 客户端）+ 用量简析 + 工具明细，同一扫描快照
         // 覆盖口径：首轮扫描未完成时一切缺失日都不可证实，日图显示缺口、比较显示数据不足
         let coverageOK = DailyCoverage.missingDayCovered(scanCompleted: usage.scanCompleted,
@@ -6956,88 +7112,101 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                          cliError: usage.cliTokensError,
                                                          workFailedFiles: usage.workTokensFailedFiles,
                                                          cliFailedFiles: usage.cliTokensFailedFiles)
-        let comparison = TokenAggregator.comparisons(daily: usage.daily,
-                                                     staleTokensInWindow: usage.staleTokensInWindow,
-                                                     coverageProven: coverageOK)
-        func briefDay(_ offset: Int) -> UsagePanelModel.BriefDay {
-            let key = TokenAggregator.dayKey(offset, from: Date())
-            let label = TokenAggregator.dayLabel(key)
-            if let value = usage.daily[key] {
-                return UsagePanelModel.BriefDay(label: label, total: value[0] + value[1], input: value[0],
-                                                output: value[1], covered: true, isToday: offset == 0)
-            }
-            // 覆盖可证实时缺键 = 真实 0；否则缺失占位，不补零伪装趋势
-            return UsagePanelModel.BriefDay(label: label, total: 0, input: 0, output: 0, covered: coverageOK, isToday: offset == 0)
-        }
-        // 比较条架构与文案对齐 GLMUsage：日环比/7日环比、%+.1f%% 中性数值、新增带数值
-        func comparisonItem(_ label: String, _ value: TokenAggregator.Comparison.Value,
-                            _ detail: String) -> UsagePanelModel.BriefComparison {
-            switch value {
-            case .percent(let pct):
-                return UsagePanelModel.BriefComparison(label: label,
-                    text: String(format: "%+.1f%%", pct),
-                    direction: pct < 0 ? .down : .up, detail: detail)
-            case .flat:
-                return UsagePanelModel.BriefComparison(label: label, text: "持平", direction: .flat, detail: detail)
-            case .added(let total):
-                return UsagePanelModel.BriefComparison(label: label, text: "新增 \(Fmt.tokens(total))",
-                    direction: .up, detail: detail)
-            case .insufficient:
-                return UsagePanelModel.BriefComparison(label: label, text: "数据不足", direction: .flat, detail: detail)
-            }
-        }
-        let brief = UsagePanelModel.BriefSection(days: (-29...0).map(briefDay),
-            day: comparisonItem("日环比", comparison.day, comparison.dayDetail),
-            week: comparisonItem("7日环比", comparison.week, comparison.weekDetail),
-            notices: [])
-        func fixedOrder(_ id: TokenAggregator.ToolID) -> Int {
-            TokenAggregator.ToolID.allCases.firstIndex(of: id) ?? .max
-        }
-        let mergedTotals = [usage.mergedTokens?.today.total ?? 0,
-                            usage.mergedTokens?.week.total ?? 0,
-                            usage.mergedTokens?.month.total ?? 0]
-        // 预计算各工具三窗口一次：toolRows 三个周期共用，排序比较器内不再反复重建 statWindows
-        let toolWindows = usage.tools.map { (tool: $0, windows: $0.windows()) }
-        func toolRows(_ index: Int) -> [UsagePanelModel.ToolRow] {
-            // 该周期使用量为 0 的来源直接隐藏（用户 2026-11-07 要求）；
-            // 失败来源若有历史贡献（>0）仍保留行并标缓存，全部为零时显示「本周期暂无用量」空态
-            let active = toolWindows.filter { entry in
-                [entry.windows.today, entry.windows.week, entry.windows.month][index].total > 0
-            }
-            let sorted = active.sorted { lhs, rhs in
-                let lhsTotal = [lhs.windows.today.total, lhs.windows.week.total, lhs.windows.month.total][index]
-                let rhsTotal = [rhs.windows.today.total, rhs.windows.week.total, rhs.windows.month.total][index]
-                if lhsTotal != rhsTotal { return lhsTotal > rhsTotal }
-                return fixedOrder(lhs.tool.id) < fixedOrder(rhs.tool.id)
-            }
-            return sorted.compactMap { entry in
-                let tool = entry.tool
-                let stat = [entry.windows.today, entry.windows.week, entry.windows.month][index]
-                let denominator = mergedTotals[index]
-                let share = denominator > 0 ? stat.total / denominator : 0
-                let status: String
-                switch tool.id {
-                case .hermes:
-                    if !tool.installed { status = "标准路径未发现" }
-                    else if !tool.ok { status = "部分记录 · 缓存" }
-                    else { status = tool.modelDays.isEmpty ? "可读取 · 无记录" : "可读取 · 近似归日" }
-                case .work, .cli, .proma, .claude, .zcode:
-                    if !tool.installed { status = "标准路径未发现" }
-                    else if !tool.ok { status = "部分记录 · 缓存" }
-                    else if tool.modelDays.isEmpty { status = "可读取 · 无记录" }
-                    else { status = "可读取" }
+        let todayKey = TokenAggregator.dayString(from: now)
+        let tokenSectionsKey = TokenSectionsCacheKey(version: tokenSnapshotVersion, dayKey: todayKey, coverageOK: coverageOK)
+        let brief: UsagePanelModel.BriefSection
+        let toolsSection: UsagePanelModel.ToolsSection
+        let cacheSection: UsagePanelModel.CacheSection
+        if let cached = cachedTokenSections, cached.key == tokenSectionsKey {
+            brief = cached.brief
+            toolsSection = cached.tools
+            cacheSection = cached.cache
+        } else {
+            let comparison = TokenAggregator.comparisons(daily: usage.daily,
+                                                         staleTokensInWindow: usage.staleTokensInWindow,
+                                                         now: now,
+                                                         coverageProven: coverageOK)
+            func briefDay(_ offset: Int) -> UsagePanelModel.BriefDay {
+                let key = TokenAggregator.dayKey(offset, from: now)
+                let label = TokenAggregator.dayLabel(key)
+                if let value = usage.daily[key] {
+                    return UsagePanelModel.BriefDay(label: label, total: value[0] + value[1], input: value[0],
+                                                    output: value[1], covered: true, isToday: offset == 0)
                 }
-                let sharePct = Int((share * 100).rounded())
-                let detail = "\(status) · 输入 \(Fmt.tokens(stat.input)) · 输出 \(Fmt.tokens(stat.output)) · 占比 \(sharePct)%"
-                return UsagePanelModel.ToolRow(id: tool.id, name: tool.id.displayName, total: Fmt.tokens(stat.total),
-                    share: share, shareText: "\(sharePct)%", status: status, detail: detail)
+                // 覆盖可证实时缺键 = 真实 0；否则缺失占位，不补零伪装趋势
+                return UsagePanelModel.BriefDay(label: label, total: 0, input: 0, output: 0, covered: coverageOK, isToday: offset == 0)
             }
+            // 比较条架构与文案对齐 GLMUsage：日环比/7日环比、%+.1f%% 中性数值、新增带数值
+            func comparisonItem(_ label: String, _ value: TokenAggregator.Comparison.Value,
+                                _ detail: String) -> UsagePanelModel.BriefComparison {
+                switch value {
+                case .percent(let pct):
+                    return UsagePanelModel.BriefComparison(label: label,
+                        text: String(format: "%+.1f%%", pct),
+                        direction: pct < 0 ? .down : .up, detail: detail)
+                case .flat:
+                    return UsagePanelModel.BriefComparison(label: label, text: "持平", direction: .flat, detail: detail)
+                case .added(let total):
+                    return UsagePanelModel.BriefComparison(label: label, text: "新增 \(Fmt.tokens(total))",
+                        direction: .up, detail: detail)
+                case .insufficient:
+                    return UsagePanelModel.BriefComparison(label: label, text: "数据不足", direction: .flat, detail: detail)
+                }
+            }
+            brief = UsagePanelModel.BriefSection(days: (-29...0).map(briefDay),
+                day: comparisonItem("日环比", comparison.day, comparison.dayDetail),
+                week: comparisonItem("7日环比", comparison.week, comparison.weekDetail),
+                notices: [])
+            func fixedOrder(_ id: TokenAggregator.ToolID) -> Int {
+                TokenAggregator.ToolID.allCases.firstIndex(of: id) ?? .max
+            }
+            let mergedTotals = [usage.mergedTokens?.today.total ?? 0,
+                                usage.mergedTokens?.week.total ?? 0,
+                                usage.mergedTokens?.month.total ?? 0]
+            // 预计算各工具三窗口一次：toolRows 三个周期共用，排序比较器内不再反复重建 statWindows
+            let toolWindows = usage.tools.map { (tool: $0, windows: $0.windows(now: now)) }
+            func toolRows(_ index: Int) -> [UsagePanelModel.ToolRow] {
+                // 该周期使用量为 0 的来源直接隐藏（用户 2026-11-07 要求）；
+                // 失败来源若有历史贡献（>0）仍保留行并标缓存，全部为零时显示「本周期暂无用量」空态
+                let active = toolWindows.filter { entry in
+                    [entry.windows.today, entry.windows.week, entry.windows.month][index].total > 0
+                }
+                let sorted = active.sorted { lhs, rhs in
+                    let lhsTotal = [lhs.windows.today.total, lhs.windows.week.total, lhs.windows.month.total][index]
+                    let rhsTotal = [rhs.windows.today.total, rhs.windows.week.total, rhs.windows.month.total][index]
+                    if lhsTotal != rhsTotal { return lhsTotal > rhsTotal }
+                    return fixedOrder(lhs.tool.id) < fixedOrder(rhs.tool.id)
+                }
+                return sorted.compactMap { entry in
+                    let tool = entry.tool
+                    let stat = [entry.windows.today, entry.windows.week, entry.windows.month][index]
+                    let denominator = mergedTotals[index]
+                    let share = denominator > 0 ? stat.total / denominator : 0
+                    let status: String
+                    switch tool.id {
+                    case .hermes:
+                        if !tool.installed { status = "标准路径未发现" }
+                        else if !tool.ok { status = "部分记录 · 缓存" }
+                        else { status = tool.modelDays.isEmpty ? "可读取 · 无记录" : "可读取 · 近似归日" }
+                    case .work, .cli, .proma, .claude, .zcode:
+                        if !tool.installed { status = "标准路径未发现" }
+                        else if !tool.ok { status = "部分记录 · 缓存" }
+                        else if tool.modelDays.isEmpty { status = "可读取 · 无记录" }
+                        else { status = "可读取" }
+                    }
+                    let sharePct = Int((share * 100).rounded())
+                    let detail = "\(status) · 输入 \(Fmt.tokens(stat.input)) · 输出 \(Fmt.tokens(stat.output)) · 占比 \(sharePct)%"
+                    return UsagePanelModel.ToolRow(id: tool.id, name: tool.id.displayName, total: Fmt.tokens(stat.total),
+                        share: share, shareText: "\(sharePct)%", status: status, detail: detail)
+                }
+            }
+            toolsSection = UsagePanelModel.ToolsSection(periods: [toolRows(0), toolRows(1), toolRows(2)], notices: [])
+            // 缓存命中卡：分母复用现有聚合的各模型窗口 input（与「用量情况」同源），分子为平行缓存明细；
+            // 六源各自成对（v2 来源行结构），zcode 缓存读取失败 → 该源 (input, cache) 已在装配层
+            // 同退，此处不再感知来源失败面。
+            cacheSection = UsagePanelModel.CacheSection.building(sources: usage.cache?.sources ?? [], now: now)
+            cachedTokenSections = (key: tokenSectionsKey, brief: brief, tools: toolsSection, cache: cacheSection)
         }
-        let toolsSection = UsagePanelModel.ToolsSection(periods: [toolRows(0), toolRows(1), toolRows(2)], notices: [])
-        // 缓存命中卡：分母复用现有聚合的各模型窗口 input（与「用量情况」同源），分子为平行缓存明细；
-        // 六源各自成对（v2 来源行结构），zcode 缓存读取失败 → 该源 (input, cache) 已在装配层
-        // 同退，此处不再感知来源失败面。
-        let cacheSection = UsagePanelModel.CacheSection.building(sources: usage.cache?.sources ?? [])
         let usageSection = section("用量情况", .codex,
             [usage.mergedTokens?.today, usage.mergedTokens?.week, usage.mergedTokens?.month],
             usage.workTokensError ?? usage.cliTokensError,
@@ -7195,7 +7364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var allDays: TokenAggregator.ModelDays = [:]
             var dailyTotals: [String: [Double]] = [:]
             for tool in usage.tools {
-                allDays = TokenAggregator.mergeSourceModelDays(allDays, tool.modelDays)
+                TokenAggregator.mergeModelDays(into: &allDays, from: tool.modelDays)
                 for (key, models) in tool.modelDays {
                     var total = dailyTotals[key] ?? [0, 0]
                     for (_, value) in models { total[0] += value[0]; total[1] += value[1] }
@@ -7253,6 +7422,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             usage.fiveHourError = message; usage.sevenDayUsed = nil; usage.sevenDayError = "凭证已过期"; usage.monthError = "月度接口不可用"
             usage.workTokensError = message; usage.cliTokensError = "会话目录不可读"
         }
+        tokenSnapshotVersion += 1
         rebuildMenu(); renderBar()
         if args.contains("--visual-preview-update-notes") || args.contains("--visual-preview-update-notes-long") {
             let sample = "新增\n• 支持切换面板背景样式\n\n优化\n• 改善深色模式下的文字显示\n\n修复\n• 修复部分情况下的面板闪烁"
@@ -7844,78 +8014,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateUI()
     }
 
+    private func nextLoginItemOpSeq() -> Int {
+        loginItemSeqLock.lock(); defer { loginItemSeqLock.unlock() }
+        loginItemOpSeq += 1
+        return loginItemOpSeq
+    }
+
+    private func isLatestLoginItemOp(_ seq: Int) -> Bool {
+        loginItemSeqLock.lock(); defer { loginItemSeqLock.unlock() }
+        return loginItemOpSeq == seq
+    }
+
     /// 安装 LaunchAgent plist + 加载态校正 bootstrap：显式 ON 与自动安装共用。
+    /// plist 写入保持在主线程同步完成（确保 isLoginItemEnabled 与 optedOut 落盘顺序即时一致）；
+    /// launchctl 外部子进程放在私有串行队列异步执行，并按递增 opSeq 丢弃过期动作，防止快速连点乱序覆盖。
     /// 失败明确报错不静默：显式开关路径 NSLog + 面板提示（用户在面板前，提示可见）；
     /// 自动安装路径（notifyPanel=false）仅 NSLog——启动时面板未开，5s 面板提示形同虚设。
     /// plist 写失败下次启动重跑决策自然重试；bootstrap 失败/非托管跳过 → 下次登录生效。
     private func installLoginItem(notifyPanel: Bool = true) {
-        func report(_ message: String, _ log: String) {
+        let opSeq = nextLoginItemOpSeq()
+        func reportSync(_ message: String, _ log: String) {
             if notifyPanel { panelController.setUpdateMessage(message, dismissAfter: 5) }
             NSLog("[KimiUsage] %@", log)
         }
+        func reportAsync(_ message: String, _ log: String) {
+            NSLog("[KimiUsage] %@", log)
+            guard notifyPanel else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isLatestLoginItemOp(opSeq) else { return }
+                self.panelController.setUpdateMessage(message, dismissAfter: 5)
+            }
+        }
+        let exec = Bundle.main.executablePath ?? ""
+        let plistPath = launchAgentPath
+        let domain = launchAgentDomain
+        let label = launchAgentLabel
+        let xpcServiceName = ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"]
         do {
             // PropertyListSerialization 生成 XML：可执行路径含 & < > 等字符时字符串插值会产生非法 plist，
             // launchd 静默忽略，开机自启失效且用户无感知
-            let exec = Bundle.main.executablePath ?? ""
             // KeepAlive 仅在非正常退出（崩溃/被 kill）时重启：菜单「退出」走 exit 0，launchd 不再复活进程
             let plist: [String: Any] = [
-                "Label": launchAgentLabel,
+                "Label": label,
                 "ProgramArguments": [exec],
                 "RunAtLoad": true,
                 "KeepAlive": ["SuccessfulExit": false]
             ]
-            let data = try PropertyListSerialization.data(fromPropertyList: plist,
-                format: .xml, options: 0)
-            // 原子写：中断不留半截 XML（半截 plist 会让开机自启静默失效）
-            try data.write(to: URL(fileURLWithPath: launchAgentPath), options: .atomic)
-            // 先探测加载态再动作。job 已加载且指向当前副本 = 已生效（上次 OFF 时
-            // bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
-            // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径
-            // （app 被移动）→ bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；
-            // job 未加载时 bootstrap 带 RunAtLoad 会立即 spawn 第二实例，仅当当前进程
-            // 确为本 job 的 launchd 托管实例（罕见：job 已加载而 print 瞬时失败的中间态）
-            // 才允许尝试，否则跳过、留待下次登录生效。失败明确报错不静默，plist 保留。
-            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-            if let loadedProgram = launchctlLoadedProgram(jobSpecifier) {
-                if loadedProgram != exec,
-                   !(launchctlSucceeded(["bootout", jobSpecifier])
-                     && launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath])) {
-                    report("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）",
-                           "LaunchAgent reload correction failed")
+            try LaunchAgentFiles.writePlist(plist, to: plistPath)
+        } catch {
+            reportSync("开机自启设置失败：\(error.localizedDescription)",
+                       "LaunchAgent install failed: \(error.localizedDescription)")
+            return
+        }
+        // 先探测加载态再动作（后台串行队列，不阻塞主线程）。job 已加载且指向当前副本 = 已生效
+        // （上次 OFF 时 bootout 失败遗留的「plist 缺失 + job 在跑」中间态恢复）——对已加载 label
+        // 重复 bootstrap 必失败，报「服务加载失败」会与事实相反；job 指向旧路径（app 被移动）
+        // → bootout + bootstrap 校正，否则 KeepAlive 持续拉旧副本；job 未加载时 bootstrap 带
+        // RunAtLoad 会立即 spawn 第二实例，仅当当前进程确为本 job 的 launchd 托管实例才允许尝试，
+        // 否则跳过、留待下次登录生效。失败明确报错不静默，plist 保留。
+        let jobSpecifier = "\(domain)/\(label)"
+        loginItemQueue.async { [weak self] in
+            guard let self, self.isLatestLoginItemOp(opSeq) else { return }
+            if let loadedProgram = self.launchctlLoadedProgram(jobSpecifier) {
+                guard self.isLatestLoginItemOp(opSeq) else { return }
+                if loadedProgram != exec {
+                    let bootedOut = self.launchctlSucceeded(["bootout", jobSpecifier])
+                    guard self.isLatestLoginItemOp(opSeq) else { return }
+                    if !(bootedOut && self.launchctlSucceeded(["bootstrap", domain, plistPath])) {
+                        reportAsync("开机自启已写入，但已加载的旧服务未能校正（下次登录仍会生效）",
+                                    "LaunchAgent reload correction failed")
+                    }
                 }
-            } else if !LoginItemDecision.isLaunchdManaged(
-                    xpcServiceName: ProcessInfo.processInfo.environment["XPC_SERVICE_NAME"],
-                    label: launchAgentLabel) {
+            } else if !LoginItemDecision.isLaunchdManaged(xpcServiceName: xpcServiceName, label: label) {
                 // 手动启动（Finder/open/update.sh open -n/终端直启）：launchd 不认识当前
                 // 进程，bootstrap 会经 RunAtLoad 立即再 spawn 一个全新实例造成双开；
                 // 仅写 plist 留待下次登录 launchd 加载生效（与自动安装同语义）。
-                report("开机自启已写入，下次登录生效",
-                       "LaunchAgent bootstrap skipped: current process not launchd-managed, plist effective at next login")
-            } else if !launchctlSucceeded(["bootstrap", launchAgentDomain, launchAgentPath]) {
-                report("开机自启已写入，但服务加载失败（下次登录仍会生效）",
-                       "LaunchAgent bootstrap failed")
+                guard self.isLatestLoginItemOp(opSeq) else { return }
+                reportAsync("开机自启已写入，下次登录生效",
+                            "LaunchAgent bootstrap skipped: current process not launchd-managed, plist effective at next login")
+            } else {
+                guard self.isLatestLoginItemOp(opSeq) else { return }
+                if !self.launchctlSucceeded(["bootstrap", domain, plistPath]) {
+                    reportAsync("开机自启已写入，但服务加载失败（下次登录仍会生效）",
+                                "LaunchAgent bootstrap failed")
+                }
             }
-        } catch {
-            report("开机自启设置失败：\(error.localizedDescription)",
-                   "LaunchAgent install failed: \(error.localizedDescription)")
         }
     }
 
-    /// 移除 LaunchAgent：显式 OFF 共用。加载态决定 bootout，job 未加载属幂等正常态，
-    /// 直接删 plist 不报错；bootout 失败要报错（KeepAlive 会在重启前继续复活进程），
-    /// plist 仍删除（偏好 OFF 与 update.sh 的 AGENT_PREF 语义一致，该中间态已被更新脚本支持）。
+    /// 移除 LaunchAgent：显式 OFF 共用。plist 同步在主线程删除（承接 optedOut 先写再删的崩溃安全不变量，
+    /// 并让 isLoginItemEnabled 即刻生效）；加载态 bootout 在私有串行队列异步执行，job 未加载属幂等正常态，
+    /// bootout 失败明确报错（KeepAlive 会在重启前继续复活进程），plist 仍保持已删除。
     private func removeLoginItem() {
+        let opSeq = nextLoginItemOpSeq()
+        let plistPath = launchAgentPath
+        let domain = launchAgentDomain
+        let label = launchAgentLabel
         do {
-            let jobSpecifier = "\(launchAgentDomain)/\(launchAgentLabel)"
-            if launchctlSucceeded(["print", jobSpecifier]),
-               !launchctlSucceeded(["bootout", jobSpecifier]) {
-                panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
-                NSLog("[KimiUsage] LaunchAgent bootout failed")
-            }
-            try FileManager.default.removeItem(atPath: launchAgentPath)
+            try FileManager.default.removeItem(atPath: plistPath)
         } catch {
             panelController.setUpdateMessage("开机自启设置失败：\(error.localizedDescription)", dismissAfter: 5)
             NSLog("[KimiUsage] LaunchAgent remove failed: %@", error.localizedDescription)
+            return
+        }
+        let jobSpecifier = "\(domain)/\(label)"
+        loginItemQueue.async { [weak self] in
+            guard let self, self.isLatestLoginItemOp(opSeq) else { return }
+            guard self.launchctlSucceeded(["print", jobSpecifier]) else { return }
+            guard self.isLatestLoginItemOp(opSeq) else { return }
+            if !self.launchctlSucceeded(["bootout", jobSpecifier]) {
+                NSLog("[KimiUsage] LaunchAgent bootout failed")
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.isLatestLoginItemOp(opSeq) else { return }
+                    self.panelController.setUpdateMessage("开机自启已关闭，但已加载的服务未能退出（重启前可能继续驻留）", dismissAfter: 5)
+                }
+            }
         }
     }
 
@@ -9429,7 +9642,7 @@ enum KimiOfflineRegression {
                                            kimiOnly: false, cutoffKey: "0000-00-00",
                                            preferUsageRecord: true, into: &workMixed)
             try expect(totals(workMixed) == [35, 2], "Kimi Work record + loop mirror was double-counted")
-            let modelDayKey = TokenAggregator.dayFmt.string(from: Date())
+            let modelDayKey = TokenAggregator.dayString(from: Date())
             try expect(apiFile.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
                        && workMixed.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2]
                        && workFile.modelDays[modelDayKey]?["未知模型"] == [35, 2],
@@ -9610,7 +9823,7 @@ enum KimiOfflineRegression {
 
             // 三个窗口与模型明细共用数据源：今日 < 7 天 < 30 天，模型之和严格等于汇总。
             func offsetDay(_ days: Int) -> String {
-                TokenAggregator.dayFmt.string(from: Date().addingTimeInterval(TimeInterval(days * 86400)))
+                TokenAggregator.dayString(from: Date().addingTimeInterval(TimeInterval(days * 86400)))
             }
             var windowFile = TokenAggregator.FileScanState()
             windowFile.modelDays = [
@@ -9699,8 +9912,8 @@ enum KimiOfflineRegression {
             var legacyWork = workFiles
             for key in legacyWork.keys {
                 legacyWork[key]?.scanRevision = 2
-                legacyWork[key]?.days = [TokenAggregator.dayFmt.string(from: Date()): [999, 999]]
-                legacyWork[key]?.modelDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧模型": [999, 999]]]
+                legacyWork[key]?.days = [TokenAggregator.dayString(from: Date()): [999, 999]]
+                legacyWork[key]?.modelDays = [TokenAggregator.dayString(from: Date()): ["旧模型": [999, 999]]]
             }
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &legacyWork)
             try expect(legacyWork.values.first?.scanRevision == 5 && legacyWork.values.first.map(totals) == [35, 2]
@@ -9712,7 +9925,7 @@ enum KimiOfflineRegression {
             var bumpWork = workFiles
             for key in bumpWork.keys {
                 bumpWork[key]?.scanRevision = 4
-                bumpWork[key]?.cacheDays = [TokenAggregator.dayFmt.string(from: Date()): ["旧缓存": [999, 999]]]
+                bumpWork[key]?.cacheDays = [TokenAggregator.dayString(from: Date()): ["旧缓存": [999, 999]]]
             }
             _ = TokenAggregator.scan(roots: [workRoot], kimiOnly: false, into: &bumpWork)
             try expect(bumpWork.values.allSatisfy { $0.scanRevision == 5 && $0.cacheDays["旧缓存"] == nil }
@@ -10071,7 +10284,7 @@ enum KimiOfflineRegression {
             try exec("INSERT INTO model_usage VALUES ('k3.1-pro', 100, 5, \(nowMS)), ('glm-5.3', 1000, 50, \(nowMS)), (NULL, 500, 50, \(nowMS)), ('k3-256k', 7, 1, \(oldMS))")
             let zcodeDays = TokenAggregator.scanZCodeModelDays(at: sqlitePath, now: usageNow)
                 .map { TokenAggregator.days(from: $0) }
-            let todayKey = TokenAggregator.dayFmt.string(from: usageNow)
+            let todayKey = TokenAggregator.dayString(from: usageNow)
             try expect(zcodeDays != nil && zcodeDays?[todayKey] == [100, 5],
                        "ZCode model filtering, cache accounting, or retention is wrong")
             var zState = TokenAggregator.ScanState()
@@ -10108,7 +10321,7 @@ enum KimiOfflineRegression {
                 CREATE TABLE model_usage (model_id TEXT, input_tokens INTEGER, output_tokens INTEGER,
                     cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER, started_at INTEGER)
                 """)
-            let yesterdayKey = TokenAggregator.dayFmt.string(from: usageNow.addingTimeInterval(-86400))
+            let yesterdayKey = TokenAggregator.dayString(from: usageNow.addingTimeInterval(-86400))
             try execCache("""
                 INSERT INTO model_usage VALUES ('k3.1-pro', 1000, 50, 900, 80, \(nowMS)),
                     ('kimi-for-coding', 100, 5, 0, 0, \(nowMS)),
@@ -10538,7 +10751,166 @@ enum KimiOfflineRegression {
             try expect(loginWiring.menuState == loginWiring.plistExists,
                        "自启菜单勾选态必须与 plist 真值同源")
 
-            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference/wiring, login item default-on decision/wiring)")
+            // ===== 稳定性与性能优化回归（日期/并发/月度备援新鲜度/扫描裁剪/单趟分区/LaunchAgents目录）=====
+            // 1) dayString 非公历日历与时区感知 + 并发 dayString / ISO.parse 线程安全
+            let utcTZ = TimeZone(secondsFromGMT: 0)!
+            let shanghaiTZ = TimeZone(identifier: "Asia/Shanghai")!
+            var buddhistShanghai = Calendar(identifier: .buddhist)
+            buddhistShanghai.timeZone = shanghaiTZ
+            var japaneseUTC = Calendar(identifier: .japanese)
+            japaneseUTC.timeZone = utcTZ
+            // 2026-11-24T17:30:00Z = UTC 2026-11-24 / Asia/Shanghai 2026-11-25
+            let tzProbeDate = ISO.parse("2026-11-24T17:30:00Z")!
+            try expect(TokenAggregator.dayString(from: tzProbeDate, calendar: buddhistShanghai) == "2026-11-25",
+                       "Buddhist calendar must still emit canonical Gregorian yyyy-MM-dd in Shanghai timezone")
+            try expect(TokenAggregator.dayString(from: tzProbeDate, calendar: japaneseUTC) == "2026-11-24",
+                       "Japanese calendar must still emit canonical Gregorian yyyy-MM-dd in UTC timezone")
+            try expect(TokenAggregator.dayKey(0, from: tzProbeDate, calendar: buddhistShanghai) == "2026-11-25"
+                       && TokenAggregator.dayKey(-1, from: tzProbeDate, calendar: buddhistShanghai) == "2026-11-24",
+                       "dayKey must emit canonical Gregorian yyyy-MM-dd under non-Gregorian calendars")
+            let concLock = NSLock()
+            var concFailures = 0
+            DispatchQueue.concurrentPerform(iterations: 64) { i in
+                let parsedFrac = ISO.parse("2026-11-25T02:40:46.123Z")
+                let parsedPlain = ISO.parse("2026-11-24T17:30:00Z")
+                var calA = Calendar(identifier: .buddhist); calA.timeZone = shanghaiTZ
+                var calB = Calendar(identifier: .gregorian); calB.timeZone = utcTZ
+                let ok = parsedFrac != nil && parsedPlain != nil
+                    && TokenAggregator.dayString(from: parsedPlain!, calendar: calA) == "2026-11-25"
+                    && TokenAggregator.dayString(from: parsedPlain!, calendar: calB) == "2026-11-24"
+                    && (i % 2 == 0
+                        ? TokenAggregator.dayString(from: parsedFrac!, calendar: calB) == "2026-11-25"
+                        : TokenAggregator.dayKey(-1, from: parsedFrac!, calendar: calB) == "2026-11-24")
+                if !ok {
+                    concLock.lock(); concFailures += 1; concLock.unlock()
+                }
+            }
+            try expect(concFailures == 0, "concurrent ISO.parse / TokenAggregator.dayString failed \(concFailures) times")
+
+            // 2) monthUsedFallback 新鲜度修复：备援补位并清错误后再推进 lastMonthSuccessAt
+            let fbPrev = Date(timeIntervalSince1970: 1_800_000_000)
+            let fbNow = fbPrev.addingTimeInterval(900)
+            let fbReset = fbNow.addingTimeInterval(86400)
+            var fbPrimaryFailed = UsageData()
+            fbPrimaryFailed.monthError = "HTTP 500"
+            fbPrimaryFailed.monthUsedFallback = 0.42
+            fbPrimaryFailed.monthResetFallback = fbReset
+            let fbUpdatedA = MonthFallbackPolicy.resolve(&fbPrimaryFailed, previousSuccessAt: fbPrev, at: fbNow)
+            try expect(fbPrimaryFailed.monthUsed == 0.42
+                       && fbPrimaryFailed.monthReset == fbReset
+                       && fbPrimaryFailed.monthError == nil
+                       && fbUpdatedA == fbNow,
+                       "monthUsedFallback must clear error and advance lastMonthSuccessAt when primary fails")
+            var fbNoWebToken = UsageData()
+            fbNoWebToken.monthError = "未检测到 Kimi 网页登录态，请打开并登录 Kimi 桌面端"
+            fbNoWebToken.monthUsedFallback = 0.35
+            let fbUpdatedB = MonthFallbackPolicy.resolve(&fbNoWebToken, previousSuccessAt: nil, at: fbNow)
+            try expect(fbNoWebToken.monthUsed == 0.35
+                       && fbNoWebToken.monthError == nil
+                       && fbUpdatedB == fbNow,
+                       "monthUsedFallback must clear missing-webToken error and initialize lastMonthSuccessAt")
+            var fbBothFailed = UsageData()
+            fbBothFailed.monthError = "HTTP 500"
+            let fbUpdatedC = MonthFallbackPolicy.resolve(&fbBothFailed, previousSuccessAt: fbPrev, at: fbNow)
+            try expect(fbBothFailed.monthUsed == nil
+                       && fbBothFailed.monthError == "HTTP 500"
+                       && fbUpdatedC == fbPrev,
+                       "failed month refresh without fallback must not advance lastMonthSuccessAt")
+
+            // 3) 未变文件过期日键裁剪（含二次扫描零写盘）、Hermes 卸载后 rowCacheDays 裁剪与单趟分区等价性
+            let pruneRoot = root.appendingPathComponent("unchanged-prune").path
+            try FileManager.default.createDirectory(atPath: pruneRoot, withIntermediateDirectories: true)
+            let pruneFile = pruneRoot + "/session.jsonl"
+            try (try jsonLine(usageRecord) + "\n").write(toFile: pruneFile, atomically: true, encoding: .utf8)
+            var pruneScanState = TokenAggregator.ScanState()
+            _ = TokenAggregator.scan(roots: [pruneRoot], kimiOnly: true, into: &pruneScanState.cli)
+            let pruneKey = try {
+                guard let k = pruneScanState.cli.keys.first else {
+                    throw Failure(description: "prune fixture file was not scanned")
+                }
+                return k
+            }()
+            pruneScanState.cli[pruneKey]?.days["2020-01-01"] = [50, 5]
+            pruneScanState.cli[pruneKey]?.modelDays["2020-01-01"] = ["k3.1-pro": [50, 5]]
+            pruneScanState.cli[pruneKey]?.cacheDays["2020-01-01"] = ["k3.1-pro": [20, 1]]
+            _ = TokenAggregator.scan(roots: [pruneRoot], kimiOnly: true, into: &pruneScanState.cli)
+            try expect(pruneScanState.cli[pruneKey]?.days["2020-01-01"] == nil
+                       && pruneScanState.cli[pruneKey]?.modelDays["2020-01-01"] == nil
+                       && pruneScanState.cli[pruneKey]?.cacheDays["2020-01-01"] == nil
+                       && pruneScanState.cli[pruneKey]?.modelDays[modelDayKey]?["k3.1-pro"] == [35, 2],
+                       "unchanged-file fast path must prune stale days/modelDays/cacheDays while retaining live day")
+            let pruneCachePath = root.appendingPathComponent("prune-scan-state.json").path
+            let pruneWrite1 = try ScanStateFile.writeIfChanged(try ScanStateFile.encoded(pruneScanState), to: pruneCachePath)
+            try expect(pruneWrite1 == true, "initial prune scan state write should persist")
+            _ = TokenAggregator.scan(roots: [pruneRoot], kimiOnly: true, into: &pruneScanState.cli)
+            let pruneWrite2 = try ScanStateFile.writeIfChanged(try ScanStateFile.encoded(pruneScanState), to: pruneCachePath)
+            try expect(pruneWrite2 == false,
+                       "subsequent unchanged scan with no stale keys must keep writeIfChanged a zero-write no-op")
+
+            var uninstalledHermes = TokenAggregator.HermesState()
+            let hRowKey = "sess-1|kimi-code/k3.1-pro|kimi|https://api.kimi.com|coding|task"
+            uninstalledHermes.rows[hRowKey] = [100, 10]
+            uninstalledHermes.rowCache[hRowKey] = [60, 5]
+            uninstalledHermes.rowDays[hRowKey] = ["2020-01-01": [40, 4], modelDayKey: [60, 6]]
+            uninstalledHermes.rowCacheDays[hRowKey] = ["2020-01-01": [20, 2], modelDayKey: [40, 3]]
+            uninstalledHermes.pruneDays(cutoffKey: modelDayKey)
+            try expect(uninstalledHermes.rowDays[hRowKey]?["2020-01-01"] == nil
+                       && uninstalledHermes.rowCacheDays[hRowKey]?["2020-01-01"] == nil
+                       && uninstalledHermes.rowDays[hRowKey]?[modelDayKey] == [60, 6]
+                       && uninstalledHermes.rowCacheDays[hRowKey]?[modelDayKey] == [40, 3]
+                       && uninstalledHermes.cacheModelDays["2020-01-01"] == nil
+                       && uninstalledHermes.cacheModelDays[modelDayKey]?["k3.1-pro"] == [40, 3]
+                       && uninstalledHermes.rows[hRowKey] == [100, 10]
+                       && uninstalledHermes.rowCache[hRowKey] == [60, 5],
+                       "uninstalled Hermes pruning must drop expired rowDays and rowCacheDays while preserving cumulative rows")
+
+            let partRootA = root.appendingPathComponent("part-cli").path
+            let partRootB = root.appendingPathComponent("part-proma").path
+            try FileManager.default.createDirectory(atPath: partRootA, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(atPath: partRootB, withIntermediateDirectories: true)
+            let realPartA = TokenAggregator.realPath(partRootA)
+            let realPartB = TokenAggregator.realPath(partRootB)
+            var partFileA = TokenAggregator.FileScanState()
+            partFileA.modelDays = [modelDayKey: ["kimi-code/k3.1-pro": [100, 10], "k3-256k": [20, 2]]]
+            partFileA.cacheDays = [modelDayKey: ["kimi-code/k3.1-pro": [80, 5]]]
+            var partFileB = TokenAggregator.FileScanState()
+            partFileB.modelDays = [modelDayKey: ["k3.1-pro": [50, 5]]]
+            partFileB.cacheDays = [modelDayKey: ["k3.1-pro": [30, 3]]]
+            let partFiles: [String: TokenAggregator.FileScanState] = [
+                realPartA + "/a.jsonl": partFileA,
+                realPartB + "/b.jsonl": partFileB
+            ]
+            let partitioned = TokenAggregator.partitionFileDays(partFiles, partitions: [
+                (id: .cli, roots: [partRootA]),
+                (id: .proma, roots: [partRootB])
+            ])
+            try expect(partitioned.allModelDays == TokenAggregator.modelDays(from: partFiles)
+                       && partitioned.toolModelDays[.cli] == TokenAggregator.toolModelDays(partFiles, under: [partRootA])
+                       && partitioned.toolCacheDays[.cli] == TokenAggregator.toolCacheDays(partFiles, under: [partRootA])
+                       && partitioned.toolModelDays[.proma] == TokenAggregator.toolModelDays(partFiles, under: [partRootB])
+                       && partitioned.toolCacheDays[.proma] == TokenAggregator.toolCacheDays(partFiles, under: [partRootB]),
+                       "single-pass partitionFileDays must match toolModelDays / toolCacheDays / modelDays exactly")
+
+            // 4) LaunchAgents 父目录缺失时自动创建并原子写入有效 XML plist（仅使用临时路径）
+            let missingAgentDir = root.appendingPathComponent("missing-home/Library/LaunchAgents", isDirectory: true)
+            let tempAgentPlist = missingAgentDir.appendingPathComponent("com.local.kimi-usage.plist").path
+            try expect(!FileManager.default.fileExists(atPath: missingAgentDir.path),
+                       "temp LaunchAgents parent directory must not exist before test")
+            try LaunchAgentFiles.writePlist([
+                "Label": "com.local.kimi-usage",
+                "ProgramArguments": ["/tmp/fake-kimi-usage"],
+                "RunAtLoad": true,
+                "KeepAlive": ["SuccessfulExit": false]
+            ], to: tempAgentPlist)
+            try expect(FileManager.default.fileExists(atPath: tempAgentPlist),
+                       "LaunchAgentFiles.writePlist must create missing parent directory and write plist")
+            let writtenPlistData = try Data(contentsOf: URL(fileURLWithPath: tempAgentPlist))
+            let decodedPlist = try PropertyListSerialization.propertyList(from: writtenPlistData, format: nil) as? [String: Any]
+            try expect(decodedPlist?["Label"] as? String == "com.local.kimi-usage"
+                       && (decodedPlist?["ProgramArguments"] as? [String]) == ["/tmp/fake-kimi-usage"],
+                       "LaunchAgentFiles.writePlist output must decode as a valid property list")
+
+            print("KimiUsage --self-test: PASS (strict quota parsing, per-window partial success, Kimi Work/Kimi Code/Proma dedup, ZCode/Hermes sqlite accounting with uninstall cache retention, parallel cache-days aggregation for the cache hit card across Work/CLI/Proma/Claude/Hermes/ZCode with failure fallback, refresh gate/schedule, credential merge/permissions/failure, kimi account line parsing, cache no-op, update check release version compare/assets, status write dedup/heartbeat, first-scan daily coverage, menu bar 10pt pixel render, fetcher transport single-flight/401-retry-once, panel background style parse/persist/menu/degradation/reduce-force/no-rebuild, six-card layout registration/legacy migration/cache row building, quota history sample gate/coordinator scope/generation isolation/preview fixture, panel hover geometry/intent/click-outcome/preference/wiring, login item default-on decision/wiring, thread-safe dayString/ISO.parse, month fallback freshness, unchanged-file stale-day pruning, single-pass file partitioning, LaunchAgent parent-dir creation)")
             return 0
         } catch {
             fputs("KimiUsage --self-test: FAIL: \(error)\n", stderr)

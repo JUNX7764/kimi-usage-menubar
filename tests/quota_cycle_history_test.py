@@ -16,7 +16,8 @@ class QuotaCycleHistoryTest(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.runner = Path(cls._tmp.name) / "quota-cycle-history-runner"
         compile_result = subprocess.run(
-            ["swiftc", str(MODEL), str(STORE), str(COORDINATOR),
+            ["swiftc", "-target", "arm64-apple-macos13.0",
+             str(MODEL), str(STORE), str(COORDINATOR),
              str(FIXTURE), "-o", str(cls.runner)],
             capture_output=True, text=True)
         if compile_result.returncode != 0:
